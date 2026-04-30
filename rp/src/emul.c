@@ -26,6 +26,7 @@
 #include "ff.h"
 #include "gconfig.h"
 #include "gemdrive.h"
+#include "http_server.h"
 #include "memfunc.h"
 #include "network.h"
 #include "pico/stdlib.h"
@@ -405,7 +406,7 @@ static void __not_in_flash_func(menu)(void) {
           ? gemDriveFolder->value
           : "/devops";
   char *folderTail = right(folderValue, 24);
-  term_printString("  F[o]lder      : ");
+  term_printString("  F[o]lder    : ");
   term_printString((folderTail != NULL) ? folderTail : folderValue);
   if (folderTail != NULL) free(folderTail);
 
@@ -415,7 +416,7 @@ static void __not_in_flash_func(menu)(void) {
       (gemDriveDrive != NULL && gemDriveDrive->value[0] != '\0')
           ? gemDriveDrive->value
           : "C";
-  term_printString("\n  [D]rive       : ");
+  term_printString("\n  [D]rive     : ");
   term_printString(driveValue);
   term_printString(":");
 
@@ -426,9 +427,9 @@ static void __not_in_flash_func(menu)(void) {
   char relocLine[48];
   if (relocAddr == 0) {
     snprintf(relocLine, sizeof(relocLine),
-             "\n  [R]eloc addr  : auto (screen-8KB)");
+             "\n  [R]eloc addr: auto (screen-8KB)");
   } else {
-    snprintf(relocLine, sizeof(relocLine), "\n  [R]eloc addr  : 0x%06X",
+    snprintf(relocLine, sizeof(relocLine), "\n  [R]eloc addr: 0x%06X",
              (unsigned)relocAddr);
   }
   term_printString(relocLine);
@@ -439,13 +440,37 @@ static void __not_in_flash_func(menu)(void) {
   char memtopLine[48];
   if (memtop == 0) {
     snprintf(memtopLine, sizeof(memtopLine),
-             "\n  Mem[t]op      : auto (matches reloc)");
+             "\n  Mem[t]op    : auto (matches reloc)");
   } else {
-    snprintf(memtopLine, sizeof(memtopLine), "\n  Mem[t]op      : 0x%06X",
+    snprintf(memtopLine, sizeof(memtopLine), "\n  Mem[t]op    : 0x%06X",
              (unsigned)memtop);
   }
   term_printString(memtopLine);
+  term_printString("\n\n");
+
+  // Remote HTTP API endpoint (Epic 02). Show the leased IP and the
+  // mDNS hostname so the user can hit it from a PC without guessing.
+  ip_addr_t apiIp = network_getCurrentIp();
+  SettingsConfigEntry *hostnameEntry =
+      settings_find_entry(gconfig_getContext(), PARAM_HOSTNAME);
+  const char *hostname =
+      (hostnameEntry != NULL && hostnameEntry->value[0] != '\0')
+          ? hostnameEntry->value
+          : "sidecart";
+  char urlLine[80];
+  char ipLine[80];
+  snprintf(urlLine, sizeof(urlLine), "  URL         : http://%s.local/",
+           hostname);
+  if (apiIp.addr != 0) {
+    snprintf(ipLine, sizeof(ipLine), "  IP address  : %s",
+             ipaddr_ntoa(&apiIp));
+  } else {
+    snprintf(ipLine, sizeof(ipLine), "  IP address  : (no IP)");
+  }
+  term_printString("API Endpoint\n");
+  term_printString(urlLine);
   term_printString("\n");
+  term_printString(ipLine);
 
   vt52Cursor(TERM_SCREEN_SIZE_Y - 2, 0);
   term_printString("[E]xit (launch)   [X] Return to Booster");
@@ -542,8 +567,7 @@ void __not_in_flash_func(cmdGemdriveFolder)(const char *arg) {
         menu();
         return;
       }
-      status =
-          navigate_directory(false, true, key, foldersOnlyFilter, NULL);
+      status = navigate_directory(false, true, key, foldersOnlyFilter, NULL);
       break;
     }
     default:
@@ -559,8 +583,7 @@ void __not_in_flash_func(cmdGemdriveFolder)(const char *arg) {
       break;
     }
     case NAV_DIR_SELECTED: {
-      settings_put_string(aconfig_getContext(),
-                          ACONFIG_PARAM_GEMDRIVE_FOLDER,
+      settings_put_string(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER,
                           navState->folderPath);
       settings_save(aconfig_getContext(), true);
       term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
@@ -616,17 +639,16 @@ void cmdGemdriveRelocAddr(const char *arg) {
     value = 0;
   } else {
     char *end = NULL;
-    int base = (input[0] == '0' && (input[1] == 'x' || input[1] == 'X'))
-                   ? 16
-                   : 10;
+    int base =
+        (input[0] == '0' && (input[1] == 'x' || input[1] == 'X')) ? 16 : 10;
     value = strtol(input, &end, base);
     if ((end == input) || (value < 0)) {
       term_printString("Invalid address. Press SPACE to continue...\n");
       return;
     }
   }
-  settings_put_integer(aconfig_getContext(),
-                       ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR, (int)value);
+  settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR,
+                       (int)value);
   settings_save(aconfig_getContext(), true);
   menu();
 }
@@ -650,9 +672,8 @@ void cmdGemdriveMemtop(const char *arg) {
     value = 0;
   } else {
     char *end = NULL;
-    int base = (input[0] == '0' && (input[1] == 'x' || input[1] == 'X'))
-                   ? 16
-                   : 10;
+    int base =
+        (input[0] == '0' && (input[1] == 'x' || input[1] == 'X')) ? 16 : 10;
     value = strtol(input, &end, base);
     if ((end == input) || (value < 0)) {
       term_printString("Invalid memtop. Press SPACE to continue...\n");
@@ -1004,6 +1025,17 @@ void emul_start() {
           // Optionally, return an error code here.
         }
         network_setPollingCallback(NULL);
+
+        // Remote HTTP Management API (Epic 02). Started right after
+        // Wi-Fi association so it's reachable from the menu phase.
+        // Earlier builds deferred this to firmware launch because of
+        // an ST-side crash; that turned out to be RAM pressure (the
+        // per-conn pool was 47 KB of BSS, pushing the heap into the
+        // ROM-in-RAM region). After shrinking the pool to ~5 KB and
+        // moving every http_server function to RAM via
+        // __not_in_flash_func, running the server during the menu
+        // is safe. Idempotent — safe even if Wi-Fi connect timed out.
+        http_server_init();
       }
     } else {
       DPRINTF("WiFi mode is AP. No initializing.\n");
@@ -1044,14 +1076,25 @@ void emul_start() {
     // output, etc.).
     term_loop();
 
-    // Any keystroke (visible in the terminal input buffer before Enter is
-    // pressed) halts the autoboot countdown — matches md-drives-emulator.
-    if (!haltCountdown) {
-      char *input = term_getInputBuffer();
-      if ((input != NULL) && (input[0] != '\0')) {
-        haltCountdown = true;
-      }
+    // Any keystroke (bound OR unbound) halts the autoboot countdown,
+    // matching md-drives-emulator. Bound keys also trigger their
+    // command handler which sets haltCountdown = true on its own;
+    // for unbound keys the keystroke flag from term.c is the only
+    // signal, so we poll it here and set the flag.
+    if (!haltCountdown && term_consumeAnyKeyPressed()) {
+      haltCountdown = true;
     }
+
+    // When haltCountdown flips false → true repaint the bottom strip
+    // once with the "Countdown stopped" message — otherwise the strip
+    // would freeze on whatever counter value it last drew, since
+    // showCounter is only called inside the decrement branch below.
+    static bool lastHaltState = false;
+    if (haltCountdown && !lastHaltState) {
+      drawSetupInfoLine("Countdown stopped. Press [E] or [X] to continue.");
+      display_refresh();
+    }
+    lastHaltState = haltCountdown;
 
     if (!haltCountdown && menuScreenActive) {
       absolute_time_t now = get_absolute_time();

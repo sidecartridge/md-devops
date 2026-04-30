@@ -134,6 +134,11 @@ static char lastSingleKeyCommand = 0;
 // reentry mode handlers as part of paramString).
 static uint8_t lastInputScanCode = 0;
 
+// Set on every incoming keystroke; the main loop polls
+// term_consumeAnyKeyPressed() to halt the autoboot countdown on any
+// key — including unbound keys — matching md-drives-emulator.
+static volatile bool anyKeyPressedFlag = false;
+
 // Setter for commands and numCommands
 void term_setCommands(const Command *cmds, size_t count) {
   commands = cmds;
@@ -208,6 +213,12 @@ static size_t inputLength = 0;
 
 // Getter method for inputBuffer
 char *term_getInputBuffer(void) { return inputBuffer; }
+
+bool term_consumeAnyKeyPressed(void) {
+  bool was = anyKeyPressedFlag;
+  anyKeyPressedFlag = false;
+  return was;
+}
 
 // Clears entire screen buffer and resets cursor
 void term_clearScreen(void) {
@@ -723,6 +734,7 @@ void __not_in_flash_func(term_loop)() {
                   scanCode);
         }
         lastInputScanCode = scanCode;
+        anyKeyPressedFlag = true;
         termInputChar(keystroke, shiftKey > 0);
         break;
       }

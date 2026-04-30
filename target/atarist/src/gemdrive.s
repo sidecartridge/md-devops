@@ -323,10 +323,7 @@ diagnostic_entry:
 
 hello_msg:
 	dc.b	27,"E"
-	dc.b	"GEMDRIVE active.",13,10
-	dc.b	"  - Read/write file ops",13,10
-	dc.b	"  - Folder create/delete/rename",13,10
-	dc.b	"  - Pexec for PRG launch",13,10
+	dc.b	"Starting DevOps Microfirmware...",13,10
 	dc.b	0
 	even
 

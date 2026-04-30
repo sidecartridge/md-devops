@@ -30,6 +30,31 @@ The cartridge image is split via `target/atarist/src/userfw.ld` into two section
 
 Adding more modules follows the same `gemdrive.ld`-style pattern used by `md-drives-emulator`: place each new `.text` section in `userfw.ld`, mirror the offset with an `equ` in `main.s`, and add the `.o` target to `target/atarist/Makefile`.
 
+## Remote HTTP Management API
+
+Once the device joins Wi-Fi it advertises an HTTP/1.1 REST API on
+port 80 at `http://sidecart.local/` (mDNS hostname is the gconfig
+`PARAM_HOSTNAME`, default `sidecart`). The API lets you list, upload,
+download, rename, and delete files inside the GEMDRIVE folder (the
+`GEMDRIVE_FOLDER` aconfig param, default `/devops`) from any
+workstation on the same LAN.
+
+A single-file, stdlib-only Python CLI (`cli/sidecart.py`) wraps the
+endpoints with Unix-style verbs (`ls`, `get`, `put`, `rm`, `mv`,
+`mkdir`, `rmdir`, `mvdir`, `volume`, `ping`).
+
+```sh
+python3 cli/sidecart.py ls /
+python3 cli/sidecart.py put LOCAL.PRG -f
+python3 cli/sidecart.py get GAME.TOS -r
+```
+
+The full endpoint reference (curl + sidecart examples for every
+verb, error envelope, status codes) lives in
+[`docs/api.md`](docs/api.md). The API has **no authentication** —
+treat the network it's reachable on as trusted; don't expose it past
+your LAN.
+
 ## License
 
 The source code of the project is licensed under the GNU General Public License v3.0. The full license is accessible in the [LICENSE](LICENSE) file. 

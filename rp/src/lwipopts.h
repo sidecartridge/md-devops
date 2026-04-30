@@ -35,6 +35,8 @@
 #define LWIP_ETHERNET 1
 #define LWIP_ICMP 1
 #define LWIP_RAW 0
+// IGMP is required by the mDNS responder for multicast group membership.
+#define LWIP_IGMP 1
 #define TCP_MSS 1460
 #define TCP_WND (4 * TCP_MSS)
 #define TCP_SND_BUF (4 * TCP_MSS)
@@ -104,29 +106,22 @@
 #define LWIP_SOCKET \
   0  //  Not needed. Sequential API, and therefore for platforms with OSes only.
 
-#define LWIP_HTTPD 0
+// We do not use the lwIP `httpd` app — Epic 02 ships a custom HTTP/1.1
+// server on lwIP's raw TCP API (see rp/src/http_server.c). The
+// LWIP_HTTPD_* knobs and HTTPD_FSDATA_FILE are intentionally not set.
 
-#if LWIP_HTTPD == 1
-#define LWIP_HTTPD_SSI 1
-#define LWIP_HTTPD_CGI 1
-// don't include the tag comment - less work for the CPU, but may be harder to
-// debug
-#define LWIP_HTTPD_SSI_INCLUDE_TAG 0
-#define LWIP_HTTPD_SSI_MULTIPART 1
-#define LWIP_HTTPD_DYNAMIC_HEADERS 0
-#define LWIP_HTTPD_SUPPORT_POST 1
-#define LWIP_HTTPD_SUPPORT_11_KEEPALIVE 1
-
-#define LWIP_HTTPD_FS_ASYNC_READ 1
-#define HTTPD_POLL_INTERVAL 1
-#define HTTPD_PRECALCULATED_CHECKSUM 1
-#define HTTPD_USE_MEM_POOL 1
-#define MEMP_NUM_PARALLEL_HTTPD_CONNS 4
-#define MEMP_NUM_PARALLEL_HTTPD_SSI_CONNS 4
-#define LWIP_HTTPD_ABORT_ON_CLOSE_MEM_ERROR 1
-
-#define HTTPD_FSDATA_FILE "fsdata_srv.c"
-#endif
+// mDNS responder so the device is reachable at <hostname>.local. The
+// responder hangs per-netif data off LWIP_NUM_NETIF_CLIENT_DATA, which
+// must be ≥ 1 for mdns_resp_add_netif() to work.
+#define LWIP_MDNS_RESPONDER 1
+#define LWIP_NUM_NETIF_CLIENT_DATA 1
+#define MDNS_MAX_SERVICES 1
+#define MDNS_RESP_USENETIF_EXTCALLBACK 1
+// mDNS schedules several lwIP timers; default MEMP_NUM_SYS_TIMEOUT is
+// too small once the responder is on and we still have DHCP/etc.
+// Bumped to 32 to mirror md-browser, which runs the same combination
+// reliably.
+#define MEMP_NUM_SYS_TIMEOUT 32
 
 // Only plain HTTP client: keep ALTCP/TLS disabled to save memory.
 #define LWIP_ALTCP 0
