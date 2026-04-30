@@ -404,6 +404,80 @@ class FolderMutationTests(unittest.TestCase):
         self.assertIn("unprocessable", err)
 
 
+class FileMutationTests(unittest.TestCase):
+    """File delete / rename via rm / mv."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict | None) -> None:
+        body = json.dumps(payload).encode("utf-8") if payload is not None else b""
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+
+    # rm -------------------------------------------------------------
+
+    def test_rm_204(self) -> None:
+        self._set_response(204, None)
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "rm", "/foo.txt"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "DELETE")
+        self.assertEqual(self.server.state.last_path, "/api/v1/files/foo.txt")
+        self.assertIn("ok", out)
+
+    def test_rm_404_is_directory(self) -> None:
+        self._set_response(404, {"ok": False, "code": "is_directory",
+                                 "message": "Path is a directory"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "rm", "/sub"])
+        self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
+        self.assertIn("is_directory", err)
+
+    def test_rm_404_not_found(self) -> None:
+        self._set_response(404, {"ok": False, "code": "not_found",
+                                 "message": "File not found"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "rm", "/missing"])
+        self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
+        self.assertIn("not_found", err)
+
+    # mv -------------------------------------------------------------
+
+    def test_mv_200(self) -> None:
+        self._set_response(200, {"ok": True, "from": "/old.txt",
+                                 "to": "/new.txt"})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "mv", "/old.txt", "/new.txt"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path,
+                         "/api/v1/files/old.txt/rename")
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body, {"to": "/new.txt"})
+        self.assertEqual(
+            self.server.state.last_headers.get("Content-Type"),
+            "application/json")
+        self.assertIn("/old.txt -> /new.txt", out)
+
+    def test_mv_409_conflict(self) -> None:
+        self._set_response(409, {"ok": False, "code": "conflict",
+                                 "message": "Target already exists"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "mv", "/a.txt", "/b.txt"])
+        self.assertEqual(code, sidecart.EXIT_CONFLICT)
+        self.assertIn("conflict", err)
+
+    def test_mv_404_is_directory(self) -> None:
+        self._set_response(404, {"ok": False, "code": "is_directory",
+                                 "message": "Path is a directory"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "mv", "/sub", "/sub2"])
+        self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
+        self.assertIn("is_directory", err)
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:

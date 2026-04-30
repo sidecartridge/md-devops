@@ -1543,6 +1543,184 @@ static void __not_in_flash_func(handle_folder_rename)(http_conn_t *c, const char
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
+// --- File mutation handlers (S4) ---
+//
+// Mirror the folder routes but enforce that the resolved path is a
+// regular file. Cross-namespace responses (e.g. DELETE /files/<dir>)
+// return 404 with an `is_directory` code so the client can detect it
+// and switch namespace.
+
+static void __not_in_flash_func(handle_file_delete)(http_conn_t *c,
+                                                    const char *url_rel) {
+  char norm[HTTP_PATH_BUF_BYTES];
+  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  norm_status_t s = resolve_pair(url_rel, norm, sizeof(norm), abs_path,
+                                 sizeof(abs_path));
+  if (s != NORM_OK) {
+    write_path_error(c, s);
+    return;
+  }
+  if (strcmp(norm, "/") == 0) {
+    write_error(c, 404, "Not Found", "not_found", "Cannot delete root");
+    return;
+  }
+  FILINFO info;
+  FRESULT fr = f_stat(abs_path, &info);
+  if (fr == FR_NO_FILE || fr == FR_NO_PATH) {
+    write_error(c, 404, "Not Found", "not_found", "File not found");
+    return;
+  }
+  if (fr != FR_OK) {
+    write_error(c, 500, "Internal Server Error", "disk_error",
+                "f_stat failed");
+    return;
+  }
+  if (finfo_is_dir(&info)) {
+    write_error(c, 404, "Not Found", "is_directory",
+                "Path is a directory; use DELETE /api/v1/folders/<rel>");
+    return;
+  }
+  fr = f_unlink(abs_path);
+  if (fr != FR_OK) {
+    write_error(c, 500, "Internal Server Error", "disk_error",
+                "f_unlink failed");
+    return;
+  }
+  // 204 No Content.
+  write_response(c, 204, "No Content", "application/json", NULL, 0);
+}
+
+static void __not_in_flash_func(handle_file_rename)(http_conn_t *c,
+                                                    const char *url_rel) {
+  if (c->content_length == 0) {
+    write_error(c, 411, "Length Required", "length_required",
+                "JSON body required");
+    return;
+  }
+  if (!c->content_type_json) {
+    write_error(c, 415, "Unsupported Media Type", "unsupported_media",
+                "Content-Type must be application/json");
+    return;
+  }
+
+  char to_url[HTTP_PATH_BUF_BYTES];
+  json_status_t js = json_extract_string(c->body, c->body_received, "to",
+                                         to_url, sizeof(to_url));
+  if (js == JSON_BAD) {
+    write_error(c, 422, "Unprocessable Entity", "bad_json",
+                "Malformed JSON body");
+    return;
+  }
+  if (js != JSON_OK) {
+    write_error(c, 422, "Unprocessable Entity", "unprocessable",
+                "Missing or non-string `to` field");
+    return;
+  }
+
+  // Resolve source.
+  char src_norm[HTTP_PATH_BUF_BYTES];
+  char src_abs[HTTP_FAT_PATH_BUF_BYTES];
+  norm_status_t s = resolve_pair(url_rel, src_norm, sizeof(src_norm), src_abs,
+                                 sizeof(src_abs));
+  if (s != NORM_OK) {
+    write_path_error(c, s);
+    return;
+  }
+  if (strcmp(src_norm, "/") == 0) {
+    write_error(c, 404, "Not Found", "not_found", "Cannot rename root");
+    return;
+  }
+
+  // Resolve target. `to` was JSON-decoded already so we run it through
+  // normalize_rel directly (no URL-decoding needed).
+  char dst_norm[HTTP_PATH_BUF_BYTES];
+  s = normalize_rel(to_url, dst_norm, sizeof(dst_norm));
+  if (s != NORM_OK) {
+    write_path_error(c, s);
+    return;
+  }
+  char dst_abs[HTTP_FAT_PATH_BUF_BYTES];
+  s = resolve_jail(dst_norm, dst_abs, sizeof(dst_abs));
+  if (s != NORM_OK) {
+    write_path_error(c, s);
+    return;
+  }
+  if (strcmp(dst_norm, "/") == 0) {
+    write_error(c, 409, "Conflict", "conflict",
+                "Cannot rename onto root");
+    return;
+  }
+  norm_status_t v = validate_8_3_last(dst_norm);
+  if (v != NORM_OK) {
+    write_path_error(c, v);
+    return;
+  }
+
+  // Source must exist as a regular file.
+  FILINFO info;
+  FRESULT fr = f_stat(src_abs, &info);
+  if (fr == FR_NO_FILE || fr == FR_NO_PATH) {
+    write_error(c, 404, "Not Found", "not_found", "File not found");
+    return;
+  }
+  if (fr != FR_OK) {
+    write_error(c, 500, "Internal Server Error", "disk_error",
+                "f_stat failed");
+    return;
+  }
+  if (finfo_is_dir(&info)) {
+    write_error(c, 404, "Not Found", "is_directory",
+                "Path is a directory; use POST /api/v1/folders/<rel>/rename");
+    return;
+  }
+
+  // No-op rename.
+  if (strcmp(src_norm, dst_norm) == 0) {
+    char body[256];
+    int n = snprintf(body, sizeof(body),
+                     "{\"ok\":true,\"from\":\"%s\",\"to\":\"%s\"}\n", src_norm,
+                     dst_norm);
+    if (n < 0) n = 0;
+    write_response(c, 200, "OK", "application/json", body, (size_t)n);
+    return;
+  }
+
+  // Target must NOT exist.
+  fr = f_stat(dst_abs, &info);
+  if (fr == FR_OK) {
+    write_error(c, 409, "Conflict", "conflict", "Target already exists");
+    return;
+  }
+  if (fr != FR_NO_FILE && fr != FR_NO_PATH) {
+    write_error(c, 500, "Internal Server Error", "disk_error",
+                "f_stat failed (target)");
+    return;
+  }
+
+  fr = f_rename(src_abs, dst_abs);
+  if (fr == FR_NO_PATH) {
+    write_error(c, 404, "Not Found", "not_found",
+                "Target parent does not exist");
+    return;
+  }
+  if (fr == FR_EXIST) {
+    write_error(c, 409, "Conflict", "conflict", "Target already exists");
+    return;
+  }
+  if (fr != FR_OK) {
+    write_error(c, 500, "Internal Server Error", "disk_error",
+                "f_rename failed");
+    return;
+  }
+
+  char body[400];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"from\":\"%s\",\"to\":\"%s\"}\n", src_norm,
+                   dst_norm);
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
 // --- Route table ---
 
 #define M_GET (1u << HM_GET)
@@ -1652,6 +1830,37 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
       return;
     }
     write_405(c, "POST, DELETE");
+    return;
+  }
+
+  // Prefix routes: /api/v1/files/<rel> [+ /rename action]. The
+  // exact-match /api/v1/files (no trailing slash) is the listing
+  // endpoint and is handled by g_routes above; only the slash-prefixed
+  // form falls through here.
+  static const char files_prefix[] = "/api/v1/files/";
+  static const size_t files_prefix_len = sizeof(files_prefix) - 1;
+  if (strncmp(c->path, files_prefix, files_prefix_len) == 0) {
+    char *rel = c->path + files_prefix_len;
+    bool is_rename = strip_rename_action(rel);
+    if (rel[0] == '\0') {
+      write_error(c, 404, "Not Found", "not_found", "Route not found");
+      return;
+    }
+    if (is_rename) {
+      if (c->method == HM_POST) {
+        handle_file_rename(c, rel);
+        return;
+      }
+      write_405(c, "POST");
+      return;
+    }
+    // S5 will add GET (download) and S6 will add PUT (upload). For
+    // now, only DELETE is handled here.
+    if (c->method == HM_DELETE) {
+      handle_file_delete(c, rel);
+      return;
+    }
+    write_405(c, "DELETE");
     return;
   }
 

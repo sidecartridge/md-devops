@@ -208,6 +208,12 @@ def _folders_url(host: str, remote: str) -> str:
     return base_url(host) + "/api/v1/folders/" + encoded
 
 
+def _files_url(host: str, remote: str) -> str:
+    """Build /api/v1/files/<remote>, URL-encoding everything except '/'."""
+    encoded = urllib.parse.quote(remote.lstrip("/"), safe="/")
+    return base_url(host) + "/api/v1/files/" + encoded
+
+
 def _do_mutation(args: argparse.Namespace, method: str, url: str,
                  body: bytes | None,
                  headers: dict[str, str] | None) -> int:
@@ -257,6 +263,20 @@ def cmd_rmdir(args: argparse.Namespace) -> int:
 def cmd_mvdir(args: argparse.Namespace) -> int:
     """POST /api/v1/folders/<from>/rename body {'to': '<to>'}."""
     url = _folders_url(args.host, args.from_) + "/rename"
+    body = json.dumps({"to": args.to}, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    return _do_mutation(args, "POST", url, body=body, headers=headers)
+
+
+def cmd_rm(args: argparse.Namespace) -> int:
+    """DELETE /api/v1/files/<remote>."""
+    url = _files_url(args.host, args.remote)
+    return _do_mutation(args, "DELETE", url, body=None, headers=None)
+
+
+def cmd_mv(args: argparse.Namespace) -> int:
+    """POST /api/v1/files/<from>/rename body {'to': '<to>'}."""
+    url = _files_url(args.host, args.from_) + "/rename"
     body = json.dumps({"to": args.to}, separators=(",", ":")).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     return _do_mutation(args, "POST", url, body=body, headers=headers)
@@ -339,6 +359,11 @@ def build_parser() -> argparse.ArgumentParser:
     mvdir.add_argument("from_", metavar="FROM",
                        help="Source folder path.")
     mvdir.add_argument("to", help="Destination folder path.")
+    rm = sub.add_parser("rm", help="Delete a file.")
+    rm.add_argument("remote", help="File path on the SD card.")
+    mv = sub.add_parser("mv", help="Rename or move a file.")
+    mv.add_argument("from_", metavar="FROM", help="Source file path.")
+    mv.add_argument("to", help="Destination file path.")
     return p
 
 
@@ -354,6 +379,8 @@ def main(argv: list[str] | None = None) -> int:
         "mkdir": cmd_mkdir,
         "rmdir": cmd_rmdir,
         "mvdir": cmd_mvdir,
+        "rm": cmd_rm,
+        "mv": cmd_mv,
     }
     handler = handlers.get(args.cmd)
     if handler is None:
