@@ -31,6 +31,26 @@ static void __not_in_flash_func(runner_command_cb)(
       SEND_COMMAND_TO_DISPLAY(0);
       return;
     }
+    case RUNNER_CMD_DONE_CD: {
+      uint32_t raw = TPROTO_GET_PAYLOAD_PARAM32(payload);
+      int32_t errnum = (int32_t)raw;
+      uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+      DPRINTF("Runner: CD done, errno=%ld\n", (long)errnum);
+      emul_recordRunnerCdDone(errnum, now_ms);
+      SEND_COMMAND_TO_DISPLAY(0);
+      return;
+    }
+    case RUNNER_CMD_DONE_HELLO: {
+      DPRINTF("Runner: HELLO — clearing session state\n");
+      emul_resetRunnerSession();
+      // The runner is confirmed back on the air. Cancel any pending
+      // relaunch retry storm and clear the sentinel back to NOP so a
+      // late-firing CMD_START_RUNNER write doesn't get re-read by the
+      // m68k poll loop and re-enter runner_entry recursively.
+      emul_scheduleRunnerRelaunch(0);
+      SEND_COMMAND_TO_DISPLAY(0);
+      return;
+    }
     default:
       // Not ours — chandler dispatches to every registered callback.
       return;

@@ -59,8 +59,11 @@ CMD_NOP				equ 0
 APP_RUNNER			equ $0500
 RUNNER_CMD_RESET		equ ($01 + APP_RUNNER)	; cold reset
 RUNNER_CMD_EXECUTE		equ ($02 + APP_RUNNER)	; Pexec mode 0
+RUNNER_CMD_CD			equ ($03 + APP_RUNNER)	; Dsetpath
 ; m68k -> RP report commands (sent via send_sync from the Runner).
 RUNNER_CMD_DONE_EXECUTE		equ ($82 + APP_RUNNER)	; payload: i32 exit code
+RUNNER_CMD_DONE_CD		equ ($83 + APP_RUNNER)	; payload: i32 GEMDOS errno
+RUNNER_CMD_DONE_HELLO		equ ($84 + APP_RUNNER)	; no payload — runner entered loop
 
 ; Wait between the RUNNER_RESET sentinel sighting and the actual
 ; reset trampoline — gives any in-flight cartridge bus traffic time
@@ -84,6 +87,7 @@ _dskbufp			equ $4C6
 ; GEMDOS / XBIOS opcodes used here.
 GEMDOS_Cconws			equ 9
 GEMDOS_Dsetdrv			equ $E
+GEMDOS_Dsetpath			equ $3B
 GEMDOS_Pexec			equ $4B
 PE_LOAD_GO			equ 0	; Pexec mode 0: load + go, returns
 
@@ -141,6 +145,28 @@ runner_entry:
 	; protocol (send_sync with APP_RUNNER command IDs), where the
 	; RP-side runner_command_cb stashes it in RP RAM.
 
+	; --- Step 0: known cwd baseline. Whether we landed here from a
+	; cold boot, a runner reset, or the [U] menu pick, force the
+	; current drive onto the GEMDRIVE-emulated drive and Dsetpath the
+	; cwd back to root. The RP-side mirror clears its cwd on HELLO
+	; below, so relative `runner cd` / `runner run` always resolve
+	; from the same baseline on both sides. ---
+	move.l	DRIVE_NUMBER_ADDR, d3
+	move.w	d3, -(sp)
+	move.w	#GEMDOS_Dsetdrv, -(sp)
+	trap	#1
+	addq.l	#4, sp
+
+	pea	root_path(pc)
+	move.w	#GEMDOS_Dsetpath, -(sp)
+	trap	#1
+	addq.l	#6, sp
+
+	; Tell the RP a fresh Runner session just started so it clears
+	; any stale busy lock / cwd mirror that survived a physical or
+	; cold reset (where the RP itself didn't see the reset event).
+	runner_send_sync RUNNER_CMD_DONE_HELLO, 0
+
 	; --- Step 1: clear screen via VT52 ESC E ---
 	pea	vt52_clear(pc)
 	move.w	#GEMDOS_Cconws, -(sp)
@@ -162,6 +188,8 @@ runner_poll_loop:
 	beq	runner_reset
 	cmp.l	#RUNNER_CMD_EXECUTE, d6
 	beq	runner_execute
+	cmp.l	#RUNNER_CMD_CD, d6
+	beq	runner_cd
 	bra.s	runner_poll_loop
 
 ; RUNNER_CMD_EXECUTE handler. Reads RUNNER_PATH (NUL-terminated) and
@@ -232,6 +260,45 @@ runner_execute:
 	runner_send_sync RUNNER_CMD_DONE_EXECUTE, 4
 	bra	runner_poll_loop
 
+; RUNNER_CMD_CD handler. Reads RUNNER_PATH (NUL-terminated) and calls
+; GEMDOS Dsetpath ($3B). Returns the GEMDOS errno (0 on success,
+; negative on error) to the RP via RUNNER_CMD_DONE_CD. Pre-Dsetdrv
+; for the same reason as runner_execute (see DRIVE_NUMBER_ADDR
+; comment) — gemdrive's .Dsetpath dispatch checks the current drive
+; and chains to TOS native if it doesn't match the emulated drive.
+runner_cd:
+	; Trace: "[CD   ] - <path>\r\n"
+	pea	text_cd(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+	pea	RUNNER_PATH.l
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+	pea	text_crlf(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+
+	; Switch to the emulated drive first.
+	move.l	DRIVE_NUMBER_ADDR, d3
+	move.w	d3, -(sp)
+	move.w	#GEMDOS_Dsetdrv, -(sp)
+	trap	#1
+	addq.l	#4, sp
+
+	; GEMDOS Dsetpath(path) — d0 = errno.
+	move.l	#RUNNER_PATH, -(sp)
+	move.w	#GEMDOS_Dsetpath, -(sp)
+	trap	#1
+	addq.l	#6, sp
+
+	; Ship errno to the RP.
+	move.l	d0, d3
+	runner_send_sync RUNNER_CMD_DONE_CD, 4
+	bra	runner_poll_loop
+
 ; Cold reset — same sequence as main.s' .reset. Waits briefly,
 ; invalidates TOS' memory-system "valid" cookies (so the next boot
 ; rebuilds RAM tables instead of trusting stale ones), then jumps
@@ -264,6 +331,13 @@ vt52_clear:
 	dc.b	27, "E", 0
 	even
 
+; GEMDOS Dsetpath argument — the GEMDRIVE drive root. Backslash
+; written as a numeric byte ($5C) so vasm doesn't treat it as a
+; string-escape char.
+root_path:
+	dc.b	$5C, 0
+	even
+
 banner_text:
 	dc.b	13, 10
 	dc.b	"DevOps Runner ", 13, 10
@@ -283,6 +357,9 @@ text_run:
 	even
 text_exit:
 	dc.b	13, 10, "[EXIT ] - ", 0
+	even
+text_cd:
+	dc.b	13, 10, "[CD   ] - ", 0
 	even
 text_terminated:
 	dc.b	" terminated", 13, 10, 0

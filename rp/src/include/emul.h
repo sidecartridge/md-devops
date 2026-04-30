@@ -91,6 +91,56 @@ void emul_recordRunnerExecuteSubmit(const char *path, uint32_t now_ms);
 void emul_recordRunnerExecuteDone(int32_t exit_code, uint32_t now_ms);
 
 /**
+ * @brief Record a CD submission. Stores the requested target path
+ *        (used both as last_path and as the optimistic cwd while the
+ *        m68k Dsetpath is in flight) and marks busy=true.
+ */
+void emul_recordRunnerCdSubmit(const char *path, uint32_t now_ms);
+
+/**
+ * @brief Record a CD completion (RUNNER_CMD_DONE_CD). Stores the
+ *        GEMDOS errno; if errno != 0 reverts the cwd mirror to its
+ *        previous value (Dsetpath leaves the m68k cwd unchanged on
+ *        failure). Clears busy.
+ */
+void emul_recordRunnerCdDone(int32_t errnum, uint32_t now_ms);
+
+/**
+ * @brief Last-known Runner cwd. Empty string if no successful CD has
+ *        landed in this boot.
+ */
+const char *emul_getRunnerCwd(void);
+
+/**
+ * @brief Last CD errno, if available. Returns true and writes the
+ *        i32 into *out when a CD completion has been recorded; false
+ *        (and leaves *out untouched) if not.
+ */
+bool emul_getRunnerLastCdErrno(int32_t *out);
+
+/**
+ * @brief Wipe session-transient Runner state (busy lock, cwd mirror,
+ *        last cd-errno). Called when the m68k Runner reports it has
+ *        (re)entered its poll loop via RUNNER_CMD_DONE_HELLO — covers
+ *        physical/cold resets where the RP otherwise can't observe
+ *        the m68k restart. last_command/last_path are preserved so
+ *        the developer still has forensic visibility into what was
+ *        running before the reset.
+ */
+void emul_resetRunnerSession(void);
+
+/**
+ * @brief The m68k just ran gemdrive_init (CMD_GEMDRIVE_HELLO arrived).
+ *        That is the unambiguous "ST cold-booted" signal — true for
+ *        first power-on, `runner reset`, the ST's physical reset
+ *        button, and any other path that re-enters CA_INIT. If
+ *        Runner mode was active before the reset, this kicks the
+ *        relaunch ticker so the m68k jumps back into runner_entry
+ *        without operator intervention. No-op otherwise.
+ */
+void emul_onGemdriveHello(void);
+
+/**
  * @brief Schedule an automatic re-launch of Runner mode. After
  *        `runner reset` the ST cold-boots; once the m68k is back to
  *        its CA_INIT polling loop the main loop re-fires

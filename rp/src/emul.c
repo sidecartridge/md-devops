@@ -115,6 +115,14 @@ static int32_t runnerLastExitCode = 0;
 static uint32_t runnerLastStartedMs = 0;
 static uint32_t runnerLastFinishedMs = 0;
 static uint32_t runnerRelaunchAtMs = 0;  // 0 = no pending relaunch
+// Mirror of the m68k Runner's cwd. Updated optimistically on
+// emul_recordRunnerCdSubmit (so a subsequent runner status during the
+// brief in-flight window reflects the *intent*) and reverted in
+// emul_recordRunnerCdDone if the m68k Dsetpath returned non-zero.
+static char runnerCwd[RUNNER_CWD_LEN] = {0};
+static char runnerCwdPrev[RUNNER_CWD_LEN] = {0};
+static bool runnerLastHasCdErrno = false;
+static int32_t runnerLastCdErrno = 0;
 
 bool emul_isRunnerActive(void) { return runnerActive; }
 bool emul_isRunnerBusy(void) { return runnerBusy; }
@@ -142,6 +150,19 @@ void emul_recordRunnerCommand(runner_last_command_t cmd, uint32_t now_ms) {
   runnerLastHasExitCode = false;
   runnerLastExitCode = 0;
   runnerLastPath[0] = '\0';
+  if (cmd == RUNNER_LAST_RESET) {
+    // The cold reset wipes the m68k TOS process cwd back to root —
+    // clear our mirror so subsequent relative commands resolve from
+    // the same baseline. Also forcibly clear the busy lock: the
+    // program that was running owned the cartridge bus and never got
+    // to send DONE; without this, status keeps reporting busy=true
+    // forever and POST /run / /cd return 503.
+    runnerBusy = false;
+    runnerCwd[0] = '\0';
+    runnerCwdPrev[0] = '\0';
+    runnerLastHasCdErrno = false;
+    runnerLastCdErrno = 0;
+  }
 }
 
 void emul_recordRunnerExecuteSubmit(const char *path, uint32_t now_ms) {
@@ -166,6 +187,83 @@ void emul_recordRunnerExecuteDone(int32_t exit_code, uint32_t now_ms) {
   runnerLastHasExitCode = true;
   runnerLastFinishedMs = now_ms;
   runnerBusy = false;
+}
+
+void emul_recordRunnerCdSubmit(const char *path, uint32_t now_ms) {
+  runnerLastCommand = RUNNER_LAST_CD;
+  runnerLastStartedMs = now_ms;
+  runnerLastFinishedMs = 0;
+  runnerLastHasCdErrno = false;
+  runnerLastCdErrno = 0;
+  if (path != NULL) {
+    size_t n = strlen(path);
+    if (n >= sizeof(runnerLastPath)) n = sizeof(runnerLastPath) - 1;
+    memcpy(runnerLastPath, path, n);
+    runnerLastPath[n] = '\0';
+    // Snapshot the prior cwd so we can revert if the m68k Dsetpath
+    // fails — TOS leaves the active path unchanged on error.
+    memcpy(runnerCwdPrev, runnerCwd, sizeof(runnerCwdPrev));
+    n = strlen(path);
+    if (n >= sizeof(runnerCwd)) n = sizeof(runnerCwd) - 1;
+    memcpy(runnerCwd, path, n);
+    runnerCwd[n] = '\0';
+  } else {
+    runnerLastPath[0] = '\0';
+  }
+  runnerBusy = true;
+}
+
+void emul_recordRunnerCdDone(int32_t errnum, uint32_t now_ms) {
+  runnerLastCdErrno = errnum;
+  runnerLastHasCdErrno = true;
+  runnerLastFinishedMs = now_ms;
+  runnerBusy = false;
+  if (errnum != 0) {
+    // Dsetpath failed — m68k cwd is unchanged. Revert our optimistic
+    // mirror.
+    memcpy(runnerCwd, runnerCwdPrev, sizeof(runnerCwd));
+  }
+}
+
+const char *emul_getRunnerCwd(void) { return runnerCwd; }
+
+bool emul_getRunnerLastCdErrno(int32_t *out) {
+  if (runnerLastHasCdErrno && out != NULL) {
+    *out = runnerLastCdErrno;
+  }
+  return runnerLastHasCdErrno;
+}
+
+void emul_resetRunnerSession(void) {
+  runnerBusy = false;
+  runnerCwd[0] = '\0';
+  runnerCwdPrev[0] = '\0';
+  runnerLastHasCdErrno = false;
+  runnerLastCdErrno = 0;
+}
+
+void emul_onGemdriveHello(void) {
+  if (!runnerActive) return;
+  // The m68k just cold-booted (HELLO is sent from gemdrive_init,
+  // which only runs at CA_INIT). If we were in Runner mode before,
+  // schedule the relaunch ticker NOW so the print loop finds the
+  // CMD_START_RUNNER sentinel within the next 500 ms. The ticker
+  // re-fires until the Runner sends its own HELLO and cancels it.
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  // 200 ms slack lets the m68k finish gemdrive_init + relocate +
+  // reach the print loop before the first sentinel write lands.
+  runnerRelaunchAtMs = now_ms + 200;
+  // Also clear stuck busy/cwd here — physical reset never went
+  // through handle_runner_reset, so emul_recordRunnerCommand never
+  // ran and runnerBusy may still be true from the program that was
+  // running when the user hit reset.
+  runnerBusy = false;
+  runnerCwd[0] = '\0';
+  runnerCwdPrev[0] = '\0';
+  runnerLastHasCdErrno = false;
+  runnerLastCdErrno = 0;
+  DPRINTF("emul: GEMDRIVE HELLO observed with runnerActive=true → "
+          "scheduling relaunch\n");
 }
 
 void emul_scheduleRunnerRelaunch(uint32_t at_ms) {
@@ -1183,21 +1281,24 @@ void emul_start() {
     // output, etc.).
     term_loop();
 
-    // Runner-mode auto-relaunch. After a `runner reset` (or any other
-    // path that schedules a relaunch), once the ST has had time to
-    // cold-boot back to its CA_INIT polling loop we re-fire
-    // DISPLAY_COMMAND_START_RUNNER so the m68k jumps straight back
-    // into the Runner without the user having to press [U] again.
-    // The active flag stays true for the lifetime of the RP power
-    // cycle — power-cycling the Pico W resets the stickiness.
-    if (runnerRelaunchAtMs != 0) {
+    // Runner-mode auto-relaunch. Single-shot ticker firing once at
+    // +3 s after `runner reset` was racy — if the ST hadn't yet
+    // reached its check_commands poll loop the sentinel write was
+    // missed (or got overwritten by a still-in-flight RUNNER_CMD_RESET
+    // dispatch). Replaced with a self-correcting retry: while
+    // runnerRelaunchAtMs is non-zero we re-fire
+    // DISPLAY_COMMAND_START_RUNNER every ~500 ms until the m68k
+    // Runner's RUNNER_CMD_DONE_HELLO callback (runner.c) lands and
+    // calls emul_scheduleRunnerRelaunch(0) to cancel us. Idempotent —
+    // writing 5 to the sentinel multiple times is harmless because
+    // check_commands only reads it. Stops as soon as the runner is
+    // confirmed back on the air.
+    if (runnerRelaunchAtMs != 0 && runnerActive) {
       uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
       if ((int32_t)(now_ms - runnerRelaunchAtMs) >= 0) {
-        runnerRelaunchAtMs = 0;
-        if (runnerActive) {
-          DPRINTF("emul: auto-relaunching Runner after reset\n");
-          SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START_RUNNER);
-        }
+        DPRINTF("emul: relaunch tick — firing DISPLAY_COMMAND_START_RUNNER\n");
+        SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START_RUNNER);
+        runnerRelaunchAtMs = now_ms + 500;  // try again in 500 ms
       }
     }
 

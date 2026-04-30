@@ -787,6 +787,57 @@ class RunnerRunTests(unittest.TestCase):
         self.assertIn("not_found", err)
 
 
+class RunnerCdTests(unittest.TestCase):
+    """Epic 03 / S4 — `sidecart runner cd`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_cd_202(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "cd", "/GAMES"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path,
+                         "/api/v1/runner/cd")
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body["path"], "/GAMES")
+        self.assertNotIn("cmdline", body)
+        self.assertIn("CD", out)
+
+    def test_runner_cd_404_not_found(self) -> None:
+        self._set_response(404, {"ok": False, "code": "not_found",
+                                 "message": "Directory not found"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "cd", "/NOPE"])
+        self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
+        self.assertIn("not_found", err)
+
+    def test_runner_cd_400_not_a_directory(self) -> None:
+        self._set_response(400, {"ok": False, "code": "bad_path",
+                                 "message": "Path is not a directory"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "cd", "/PROG.TOS"])
+        self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
+        self.assertIn("bad_path", err)
+
+    def test_runner_cd_409_runner_inactive(self) -> None:
+        self._set_response(409, {"ok": False, "code": "runner_inactive",
+                                 "message": "Runner not active"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "cd", "/GAMES"])
+        self.assertIn("runner_inactive", err)
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:

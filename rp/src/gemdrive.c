@@ -21,6 +21,7 @@
 #include "aconfig.h"
 #include "chandler.h"
 #include "debug.h"
+#include "emul.h"
 #include "ff.h"
 #include "memfunc.h"
 #include "settings.h"
@@ -1394,6 +1395,14 @@ void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
       (unsigned long)effectiveMemtop,
       (memtopOverride != 0) ? "override" : "auto",
       letter, (unsigned)driveNumber);
+
+  // GEMDRIVE HELLO is the unambiguous "ST cold-booted" signal — the
+  // m68k only sends it from gemdrive_init at CA_INIT bit 27. Notify
+  // emul.c so it can re-fire DISPLAY_COMMAND_START_RUNNER when the
+  // user pressed the ST's physical reset button (which never goes
+  // through handle_runner_reset and would otherwise leave the m68k
+  // stuck in the print loop with no relaunch ticker scheduled).
+  emul_onGemdriveHello();
 }
 
 void gemdrive_init(void) {

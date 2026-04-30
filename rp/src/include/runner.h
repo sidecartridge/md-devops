@@ -45,13 +45,20 @@
 // (CHANDLER_CMD_SENTINEL_OFFSET) to dispatch a command; the Runner's
 // poll loop reads and acts on it.
 #define APP_RUNNER 0x0500
-#define RUNNER_CMD_RESET (APP_RUNNER + 0x01)  // cold reset
+#define RUNNER_CMD_RESET (APP_RUNNER + 0x01)    // cold reset
 #define RUNNER_CMD_EXECUTE (APP_RUNNER + 0x02)  // Pexec mode 0
+#define RUNNER_CMD_CD (APP_RUNNER + 0x03)       // Dsetpath
 
 // m68k -> RP report commands (sent via send_sync from the Runner).
 // High bit set so they don't collide with the RP -> m68k sentinel
 // command IDs above.
 #define RUNNER_CMD_DONE_EXECUTE (APP_RUNNER + 0x82)  // payload: i32 exit code
+#define RUNNER_CMD_DONE_CD (APP_RUNNER + 0x83)       // payload: i32 GEMDOS errno
+// Sent unconditionally from runner_entry every time the Runner
+// (re)enters its poll loop — covers physical reset, cold reset, and
+// menu re-entry. RP clears the session-transient state (busy, cwd
+// mirror) so a status query right after a reset reflects "idle".
+#define RUNNER_CMD_DONE_HELLO (APP_RUNNER + 0x84)    // no payload
 
 // RP-side state machine mirror. cmdRunner sets ACTIVE; per-command
 // handlers update last_command. Used by GET /api/v1/runner.
@@ -59,7 +66,7 @@ typedef enum {
   RUNNER_LAST_NONE = 0,
   RUNNER_LAST_RESET = 1,
   RUNNER_LAST_EXECUTE = 2,
-  // S4: RUNNER_LAST_CD.
+  RUNNER_LAST_CD = 3,
 } runner_last_command_t;
 
 /**
