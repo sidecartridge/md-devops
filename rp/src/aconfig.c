@@ -1,9 +1,18 @@
 #include "include/aconfig.h"
 
-// We don't have any variables because this is the placeholder app
 static SettingsConfigEntry defaultEntries[] = {
     {ACONFIG_PARAM_FOLDER, SETTINGS_TYPE_STRING, "/test"},
     {ACONFIG_PARAM_MODE, SETTINGS_TYPE_INT, "255"},  // 255: Menu mode
+    // GEMDRIVE — Epic 01. RELOC_ADDR / DEVOPS_MEMTOP "0" = auto
+    // (screen_base - 8 KB, computed from the screen_base the m68k
+    // publishes at boot). DEVOPS_MEMTOP is a microfirmware-global
+    // setting (any future app feature reserving resident RAM shares
+    // it); RELOC_ADDR is GEMDRIVE-specific.
+    {ACONFIG_PARAM_GEMDRIVE_ENABLED, SETTINGS_TYPE_BOOL, "true"},
+    {ACONFIG_PARAM_GEMDRIVE_FOLDER, SETTINGS_TYPE_STRING, "/devops"},
+    {ACONFIG_PARAM_GEMDRIVE_DRIVE, SETTINGS_TYPE_STRING, "C"},
+    {ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR, SETTINGS_TYPE_INT, "0"},
+    {ACONFIG_PARAM_DEVOPS_MEMTOP, SETTINGS_TYPE_INT, "0"},
 };
 
 // Create a global context for our settings

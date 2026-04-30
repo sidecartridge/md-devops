@@ -32,6 +32,21 @@ typedef enum {
 #define NUM_BYTES_PER_SECTOR 512
 #define SDCARD_MEGABYTE 1048576
 
+// File/dir entry list browsable — must match md-drives-emulator/sdcard.h
+// so the directory pager that the app ports can be reused as-is.
+#include "settings.h"
+#define MAX_ENTRIES_DIR 256
+#define MAX_FILENAME_LENGTH (SETTINGS_MAX_VALUE_LENGTH - 1)
+
+typedef struct {
+  char name[MAX_FILENAME_LENGTH + 1];
+  bool is_dir;
+} DirEntry;
+
+// Optional filter callback for directory listing. Return true to include
+// the entry, false to skip it.
+typedef bool (*EntryFilterFn)(const char *name, BYTE attr);
+
 /**
  * @brief Mount filesystem using FatFS library.
  *
@@ -130,6 +145,19 @@ bool sdcard_isMounted(void);
  * @return true on success, false on failure or if not mounted.
  */
 bool sdcard_getMountedInfo(uint32_t *totalSizeMb, uint32_t *freeSpaceMb);
+
+/**
+ * @brief Load entries from an SD card directory.
+ *
+ * Mirrors md-drives-emulator/sdcard_loadDirectory. Reads the directory at
+ * @p path and fills @p entries_arr with up to @c MAX_ENTRIES_DIR names,
+ * sorted directories-first then alphabetically. ".." is prepended unless
+ * the path is the root or @p top_dir.
+ */
+FRESULT __not_in_flash_func(sdcard_loadDirectory)(
+    const char *path, char entries_arr[][MAX_FILENAME_LENGTH + 1],
+    uint16_t *entry_count, uint16_t *selected, uint16_t *page, bool dirs_only,
+    EntryFilterFn filter_fn, char top_dir[MAX_FILENAME_LENGTH + 1]);
 
 // Hardware Configuration of SPI "objects"
 

@@ -8,7 +8,12 @@
 
 #include "emul.h"
 
+#include <ctype.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
 
 // inclusw in the C file to avoid multiple definitions
 #include "aconfig.h"
@@ -17,8 +22,10 @@
 #include "constants.h"
 #include "debug.h"
 #include "display.h"
+#include "display_term.h"
 #include "ff.h"
 #include "gconfig.h"
+#include "gemdrive.h"
 #include "memfunc.h"
 #include "network.h"
 #include "pico/stdlib.h"
@@ -37,12 +44,14 @@ enum {
 
 // Command handlers
 static void cmdMenu(const char *arg);
-static void cmdClear(const char *arg);
 static void cmdExit(const char *arg);
 static void cmdFirmware(const char *arg);
-static void cmdHelp(const char *arg);
 static void cmdBooster(const char *arg);
-static void cmdSettings(const char *arg);
+static void cmdGemdriveFolder(const char *arg);
+static void cmdGemdriveDrive(const char *arg);
+static void cmdGemdriveRelocAddr(const char *arg);
+static void cmdGemdriveMemtop(const char *arg);
+static void cmdHiddenSettings(const char *arg);
 static void cmdPrint(const char *arg);
 static void cmdSave(const char *arg);
 static void cmdErase(const char *arg);
@@ -51,16 +60,18 @@ static void cmdPutInt(const char *arg);
 static void cmdPutBool(const char *arg);
 static void cmdPutString(const char *arg);
 
-// Command table
+// Command table. Single-letter keys mirror md-drives-emulator. The hidden
+// "?" entry exposes the raw settings commands (print/save/get/...).
 static const Command commands[] = {
     {"m", cmdMenu},
-    {"h", cmdHelp},
     {"e", cmdExit},
     {"f", cmdFirmware},
     {"x", cmdBooster},
-    {"?", cmdHelp},
-    {"s", cmdSettings},
-    {"settings", cmdSettings},
+    {"o", cmdGemdriveFolder},
+    {"d", cmdGemdriveDrive},
+    {"r", cmdGemdriveRelocAddr},
+    {"t", cmdGemdriveMemtop},
+    {"?", cmdHiddenSettings},
     {"print", cmdPrint},
     {"save", cmdSave},
     {"erase", cmdErase},
@@ -76,7 +87,13 @@ static const size_t numCommands = sizeof(commands) / sizeof(commands[0]);
 // Keep active loop or exit
 static bool keepActive = true;
 static bool menuScreenActive = false;
-static absolute_time_t menuRefreshTime;
+
+// Boot countdown — auto-launches GEMDRIVE on the Atari ST when it hits 0.
+// Mirrors md-drives-emulator's behavior. Any key press halts it.
+#define BOOT_COUNTDOWN_SECONDS 20
+static int countdown = BOOT_COUNTDOWN_SECONDS;
+static bool haltCountdown = false;
+static absolute_time_t lastCountdownTick;
 
 // Polling tick used as the network poll callback so command handling stays
 // alive during multi-second WiFi operations.
@@ -85,117 +102,636 @@ static void __not_in_flash_func(emul_pollTick)(void) {
   term_loop();
 }
 
-#define MENU_REFRESH_TIME_MS 1000
-
 // Should we reset the device, or jump to the booster app?
 // By default, we reset the device.
 static bool resetDeviceAtBoot = true;
 
-static void showTitle() {
+// --- Helpers ported verbatim from md-drives-emulator/rp/src/emul.c -----
+
+// Returns the last n chars of str, prefixed with ".." if truncated.
+// Caller frees. NULL on bad input.
+static char *__not_in_flash_func(right)(const char *str, int n) {
+  if (str == NULL || n < 0) return NULL;
+  int len = (int)strlen(str);
+  if (n == 0) return strdup("");
+  if (n >= len) return strdup(str);
+  const char *suffix = str + len - n;
+  char *result = malloc(n + 3);
+  if (!result) return NULL;
+  strcpy(result, "..");
+  strncpy(result + 2, suffix, n);
+  result[n + 2] = '\0';
+  return result;
+}
+
+// "C".."Z" only; identical predicate to source's GEMDRIVE drive validator.
+static bool __not_in_flash_func(isValidDrive)(const char *drive) {
+  if (drive == NULL || drive[0] == '\0') {
+    return false;
+  }
+  char c = (char)toupper((unsigned char)drive[0]);
+  return (c >= 'C' && c <= 'Z');
+}
+
+// VT52 absolute cursor move (ESC Y row col, both biased by 0x20).
+static inline void vt52Cursor(uint8_t row, uint8_t col) {
+  char vt52Seq[5];
+  vt52Seq[0] = '\x1B';
+  vt52Seq[1] = 'Y';
+  vt52Seq[2] = (char)(32 + row);
+  vt52Seq[3] = (char)(32 + col);
+  vt52Seq[4] = '\0';
+  term_printString(vt52Seq);
+}
+
+// Title with reverse-video (ESC p / ESC q) — matches the source's
+// "two font sizes / dim+bright" feel by inverting the title bar.
+static void showTitle(void) {
   term_printString(
       "\x1B"
       "E"
-      "Microfirmware test app - " RELEASE_VERSION "\n");
+      "\x1Bp"
+      "DevOps Microfirmware - " RELEASE_VERSION "\n\x1Bq");
 }
 
-static void menu(void) {
+static void __not_in_flash_func(showCounter)(int cdown);
+
+// Bottom-of-OLED info strip rendered with the smaller squeezed font —
+// this is the "second font size" referenced by the source. Inverts a 1px
+// strip the height of one terminal row.
+static void drawSetupInfoLine(const char *message) {
+  u8g2_SetDrawColor(display_getU8g2Ref(), 1);
+  u8g2_DrawBox(display_getU8g2Ref(), 0,
+               DISPLAY_HEIGHT - DISPLAY_TERM_CHAR_HEIGHT, DISPLAY_WIDTH,
+               DISPLAY_TERM_CHAR_HEIGHT);
+  u8g2_SetFont(display_getU8g2Ref(), u8g2_font_squeezed_b7_tr);
+  u8g2_SetDrawColor(display_getU8g2Ref(), 0);
+  u8g2_DrawStr(display_getU8g2Ref(), 0, DISPLAY_HEIGHT - 1,
+               (message != NULL) ? message : "");
+  u8g2_SetDrawColor(display_getU8g2Ref(), 1);
+  u8g2_SetFont(display_getU8g2Ref(), u8g2_font_amstrad_cpc_extended_8f);
+}
+
+static void refreshSetupInfoLine(void) {
+  if (haltCountdown) {
+    drawSetupInfoLine("Countdown stopped. Press [E] or [X] to continue.");
+  } else {
+    showCounter(countdown);
+  }
+}
+
+// --- Directory navigation pager (ported from md-drives-emulator) ------
+
+#define NAV_LINES_PER_PAGE 16
+#define NAV_LINES_PER_PAGE_OFFSET 4
+enum navStatus {
+  NAV_DIR_ERROR = -1,
+  NAV_DIR_FIRST_TIME_OK = 0,
+  NAV_DIR_NEXT_TIME_OK = 1,
+  NAV_DIR_SELECTED = 2,
+  NAV_DIR_CANCEL = 3,
+};
+
+typedef struct {
+  uint16_t count;
+  uint16_t selected;
+  uint16_t page;
+  char entries[MAX_ENTRIES_DIR][MAX_FILENAME_LENGTH + 1];
+  char folderPath[MAX_FILENAME_LENGTH + 1];
+  char topDir[MAX_FILENAME_LENGTH + 1];
+} DirNavigation;
+
+static DirNavigation navStateStorage;
+static DirNavigation *navState = &navStateStorage;
+
+// Filter: directories only — we list folders, never files. Hidden dotfiles
+// are skipped. Mirrors the spirit of source's floppiesFilter for our case.
+static bool __not_in_flash_func(foldersOnlyFilter)(const char *name,
+                                                   BYTE attr) {
+  if (name[0] == '.') {
+    return false;
+  }
+  return (attr & AM_DIR) != 0;
+}
+
+// Remove last path component (".." navigation).
+static void __not_in_flash_func(pathUp)(void) {
+  char temp[MAX_FILENAME_LENGTH + 1];
+  char *segments[MAX_ENTRIES_DIR];
+  int sp = 0;
+
+  strncpy(temp, navState->folderPath, sizeof(temp));
+  temp[sizeof(temp) - 1] = '\0';
+
+  char *token = strtok(temp, "/");
+  while (token) {
+    if (strcmp(token, "..") == 0) {
+      if (sp > 0) sp--;
+    } else if (strcmp(token, "") != 0) {
+      segments[sp++] = token;
+    }
+    token = strtok(NULL, "/");
+  }
+
+  if (sp == 0) {
+    strcpy(navState->folderPath, "/");
+  } else {
+    char newPath[MAX_FILENAME_LENGTH + 1] = "";
+    for (int i = 0; i < sp; ++i) {
+      strlcat(newPath, "/", sizeof(newPath));
+      strlcat(newPath, segments[i], sizeof(newPath));
+    }
+    if (newPath[0] != '/') {
+      char tmp[MAX_FILENAME_LENGTH + 1];
+      snprintf(tmp, sizeof(tmp), "/%s", newPath);
+      strncpy(newPath, tmp, sizeof(newPath));
+    }
+    strncpy(navState->folderPath, newPath, sizeof(navState->folderPath));
+    navState->folderPath[sizeof(navState->folderPath) - 1] = '\0';
+  }
+}
+
+static void drawPage(uint16_t top_offset) {
+  uint16_t start = navState->page * NAV_LINES_PER_PAGE;
+  uint16_t end = start + NAV_LINES_PER_PAGE;
+  if (end > navState->count) {
+    end = navState->count;
+  }
+
+  for (uint16_t i = start; i < end; i++) {
+    uint8_t row = i - start;
+    vt52Cursor(row + top_offset, 0);
+    term_printString(i == navState->selected ? ">" : " ");
+    char buffer[TERM_SCREEN_SIZE_X + 1];
+    snprintf(buffer, sizeof(buffer), " %-*s", TERM_SCREEN_SIZE_X - 2,
+             navState->entries[i]);
+    term_printString(buffer);
+  }
+
+  vt52Cursor(TERM_SCREEN_SIZE_Y - 3, 0);
+  char infoBuffer[128];
+  int totalPages =
+      (navState->count + NAV_LINES_PER_PAGE - 1) / NAV_LINES_PER_PAGE;
+  sprintf(infoBuffer, "Page %d/%d\n", navState->page + 1, totalPages);
+  term_printString(infoBuffer);
+  term_printString("Use cursor keys and RETURN to navigate.\n");
+  term_printString("SPACE to confirm selection. ESC to exit");
+}
+
+static enum navStatus __not_in_flash_func(navigate_directory)(
+    bool first_time, bool dirs_only, char key, EntryFilterFn filter_fn,
+    char top_folder[MAX_FILENAME_LENGTH + 1]) {
+  enum navStatus status = NAV_DIR_ERROR;
+  if (first_time) {
+    DPRINTF("First time loading directory.\n");
+    navState->count = 0;
+    navState->selected = 0;
+    navState->page = 0;
+    if (top_folder != NULL) {
+      strncpy(navState->topDir, top_folder, sizeof(navState->topDir));
+      navState->topDir[sizeof(navState->topDir) - 1] = '\0';
+    } else {
+      strncpy(navState->topDir, "/", sizeof(navState->topDir));
+      navState->topDir[sizeof(navState->topDir) - 1] = '\0';
+    }
+    memset(navState->entries, 0, sizeof(navState->entries));
+    FRESULT result = sdcard_loadDirectory(
+        (strlen(navState->folderPath) == 0) ? "/" : navState->folderPath,
+        navState->entries, &navState->count, &navState->selected,
+        &navState->page, dirs_only, filter_fn, navState->topDir);
+    if (result != FR_OK) {
+      term_printString("Error loading directory.\n");
+    } else {
+      status = NAV_DIR_FIRST_TIME_OK;
+    }
+  } else {
+    DPRINTF("Next times loading directory.\n");
+    status = NAV_DIR_NEXT_TIME_OK;
+    int totalPages =
+        (navState->count + NAV_LINES_PER_PAGE - 1) / NAV_LINES_PER_PAGE;
+    switch (key) {
+      case TERM_KEYBOARD_KEY_UP:
+        if (navState->selected > 0) {
+          navState->selected--;
+        }
+        break;
+      case TERM_KEYBOARD_KEY_DOWN:
+        if ((navState->selected < navState->count - 1) &&
+            (navState->selected % NAV_LINES_PER_PAGE <
+             NAV_LINES_PER_PAGE - 1)) {
+          navState->selected++;
+        }
+        break;
+      case TERM_KEYBOARD_KEY_LEFT:
+        if (navState->page > 0) {
+          navState->page--;
+          navState->selected = navState->page * NAV_LINES_PER_PAGE;
+        }
+        break;
+      case TERM_KEYBOARD_KEY_RIGHT:
+        if (navState->page < (totalPages - 1)) {
+          navState->page++;
+          navState->selected = navState->page * NAV_LINES_PER_PAGE;
+        }
+        break;
+      case '\r':
+      case '\n': {
+        if ((navState->entries[navState->selected]
+                              [strlen(navState->entries[navState->selected]) -
+                               1] == '/') ||
+            (strcmp(navState->entries[navState->selected], "..") == 0)) {
+          navState->count = 0;
+          navState->page = 0;
+          char newFolderPath[MAX_FILENAME_LENGTH + 1];
+          size_t len = strlen(navState->folderPath);
+          if (len > 0 && navState->folderPath[len - 1] != '/') {
+            snprintf(newFolderPath, sizeof(newFolderPath), "%s/%s",
+                     navState->folderPath,
+                     navState->entries[navState->selected]);
+          } else {
+            snprintf(newFolderPath, sizeof(newFolderPath), "%s%s",
+                     navState->folderPath,
+                     navState->entries[navState->selected]);
+          }
+          strncpy(navState->folderPath, newFolderPath, sizeof(newFolderPath));
+          pathUp();
+          memset(navState->entries, 0, sizeof(navState->entries));
+          navState->selected = 0;
+          FRESULT result = sdcard_loadDirectory(
+              navState->folderPath, navState->entries, &navState->count,
+              &navState->selected, &navState->page, dirs_only, filter_fn,
+              navState->topDir);
+          if (result != FR_OK) {
+            term_printString("Error loading directory.\n");
+            status = NAV_DIR_ERROR;
+          }
+        }
+        break;
+      }
+      case ' ': {
+        status = NAV_DIR_SELECTED;
+        break;
+      }
+      default:
+        if (key >= 'a' && key <= 'z') {
+          key = key - 'a' + 'A';
+        }
+        if (key >= 'A' && key <= 'Z') {
+          status = key;
+        }
+        break;
+    }
+  }
+  return status;
+}
+
+// Builds the menu — single GEMDRIVE block + bottom navigation strip.
+// Layout follows the source's menu(): vt52Cursor positions, the F[o]lder/
+// [D]rive labels, and the bottom "[E]xit / [X] Return to Booster" line.
+static void __not_in_flash_func(menu)(void) {
+  term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
   menuScreenActive = true;
+
+  showTitle();
+
+  // Folder + drive read straight from aconfig, like source/md-drives.
+  vt52Cursor(2, 0);
+  term_printString("GEMDRIVE\n");
+
+  SettingsConfigEntry *gemDriveFolder =
+      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER);
+  const char *folderValue =
+      (gemDriveFolder != NULL && gemDriveFolder->value[0] != '\0')
+          ? gemDriveFolder->value
+          : "/devops";
+  char *folderTail = right(folderValue, 24);
+  term_printString("  F[o]lder      : ");
+  term_printString((folderTail != NULL) ? folderTail : folderValue);
+  if (folderTail != NULL) free(folderTail);
+
+  SettingsConfigEntry *gemDriveDrive =
+      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_DRIVE);
+  const char *driveValue =
+      (gemDriveDrive != NULL && gemDriveDrive->value[0] != '\0')
+          ? gemDriveDrive->value
+          : "C";
+  term_printString("\n  [D]rive       : ");
+  term_printString(driveValue);
+  term_printString(":");
+
+  // Reloc / memtop overrides — 0 means "auto" (default = screen_base - 8 KB).
+  SettingsConfigEntry *relocEntry = settings_find_entry(
+      aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR);
+  int relocAddr = (relocEntry != NULL) ? atoi(relocEntry->value) : 0;
+  char relocLine[48];
+  if (relocAddr == 0) {
+    snprintf(relocLine, sizeof(relocLine),
+             "\n  [R]eloc addr  : auto (screen-8KB)");
+  } else {
+    snprintf(relocLine, sizeof(relocLine), "\n  [R]eloc addr  : 0x%06X",
+             (unsigned)relocAddr);
+  }
+  term_printString(relocLine);
+
+  SettingsConfigEntry *memtopEntry =
+      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_DEVOPS_MEMTOP);
+  int memtop = (memtopEntry != NULL) ? atoi(memtopEntry->value) : 0;
+  char memtopLine[48];
+  if (memtop == 0) {
+    snprintf(memtopLine, sizeof(memtopLine),
+             "\n  Mem[t]op      : auto (matches reloc)");
+  } else {
+    snprintf(memtopLine, sizeof(memtopLine), "\n  Mem[t]op      : 0x%06X",
+             (unsigned)memtop);
+  }
+  term_printString(memtopLine);
+  term_printString("\n");
+
+  vt52Cursor(TERM_SCREEN_SIZE_Y - 2, 0);
+  term_printString("[E]xit (launch)   [X] Return to Booster");
+
+  vt52Cursor(TERM_SCREEN_SIZE_Y - 1, 0);
+  term_printString("Select an option: ");
+  refreshSetupInfoLine();
+}
+
+static void __not_in_flash_func(showCounter)(int cdown) {
+  char msg[64];
+  if (cdown > 0) {
+    sprintf(msg, "Boot will continue in %d seconds...", cdown);
+  } else {
+    showTitle();
+    sprintf(msg, "Booting... Please wait...               ");
+  }
+  drawSetupInfoLine(msg);
+}
+
+// --- Command handlers (single-key dispatch) ----------------------------
+
+void cmdMenu(const char *arg) {
+  (void)arg;
+  haltCountdown = true;
+  menu();
+}
+
+// [E]xit doubles as the firmware-launch shortcut now: per the user's
+// directive, leaving the menu drops straight into GEMDRIVE on the Atari ST
+// (same path as [F]).
+void cmdExit(const char *arg) {
+  (void)arg;
+  haltCountdown = true;
+  menuScreenActive = false;
   showTitle();
   term_printString("\n\n");
-  term_printString("[S]ettings     | [F]irmware launch\n");
-  term_printString("[E]xit desktop | [X] Back to Booster\n\n");
-
-  // Display network information
-  term_printNetworkInfo();
-
-  term_printString("\n");
-  term_printString("Select an option: ");
-  term_markMenuPromptCursor();
-  menuRefreshTime = make_timeout_time_ms(MENU_REFRESH_TIME_MS);
-}
-
-// Command handlers
-void cmdMenu(const char *arg) { menu(); }
-
-void cmdHelp(const char *arg) {
-  menuScreenActive = false;
-  // term_printString("\x1B" "E" "Available commands:\n");
-  term_printString("Available commands:\n");
-  term_printString(" General:\n");
-  term_printString("  clear   - Clear the terminal screen\n");
-  term_printString("  exit    - Exit the terminal\n");
-  term_printString("  f       - Launch user firmware on the Atari ST\n");
-  term_printString("  help    - Show available commands\n");
-}
-
-void cmdClear(const char *arg) {
-  menuScreenActive = false;
-  term_clearScreen();
-}
-
-void cmdExit(const char *arg) {
-  menuScreenActive = false;
-  term_printString("Exiting terminal...\n");
-  // Send continue to desktop command
-  SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_CONTINUE);
+  term_printString("Launching DevOps on the Atari ST...\n");
+  SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START);
 }
 
 void cmdFirmware(const char *arg) {
+  (void)arg;
+  haltCountdown = true;
   menuScreenActive = false;
-  term_printString("Launching user firmware on the Atari ST...\n");
-  // Write CMD_START into the cartridge sentinel slot. The m68k's
-  // check_commands macro polls the slot every vsync; on CMD_START it
-  // beq's into rom_function, which jmp's to USERFW (target/atarist/src/
-  // userfw.s). The default userfw demo prints
-  // "Example firmware load..." via Cconws and returns.
+  term_printString("Launching DevOps on the Atari ST...\n");
+  // CMD_START is the cartridge sentinel that GEMDRIVE polls during
+  // pre_auto; receiving it makes the m68k jump into the GEMDRIVE blob.
   SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START);
 }
 
 void cmdBooster(const char *arg) {
-  menuScreenActive = false;
+  (void)arg;
+  showTitle();
+  term_printString("\n\n");
   term_printString("Launching Booster app...\n");
   term_printString("The computer will boot shortly...\n\n");
   term_printString("If it doesn't boot, power it on and off.\n");
+  haltCountdown = true;
+  menuScreenActive = false;
   resetDeviceAtBoot = false;  // Jump to the booster app
-  keepActive = false;         // Exit the active loop
+  keepActive = false;
 }
 
-void cmdSettings(const char *arg) {
+// Folder picker — directly ported from md-drives-emulator's
+// cmdGemdriveFolder. First press of [O] paints the SD card directory at
+// the currently configured folder; subsequent keystrokes (arrows / RETURN
+// / SPACE) come back through TERM_COMMAND_LEVEL_COMMAND_SINGLE_KEY_REENTRY
+// and drive navigate_directory.
+void __not_in_flash_func(cmdGemdriveFolder)(const char *arg) {
+  haltCountdown = true;
+  enum navStatus status = NAV_DIR_ERROR;
+  switch (term_getCommandLevel()) {
+    case TERM_COMMAND_LEVEL_SINGLE_KEY: {
+      DPRINTF("Folder picker entering reentry mode.\n");
+      SettingsConfigEntry *gemDriveFolder = settings_find_entry(
+          aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER);
+      const char *seed =
+          (gemDriveFolder != NULL && gemDriveFolder->value[0] != '\0')
+              ? gemDriveFolder->value
+              : "/";
+      strncpy(navState->folderPath, seed, sizeof(navState->folderPath));
+      navState->folderPath[sizeof(navState->folderPath) - 1] = '\0';
+      term_setCommandLevel(TERM_COMMAND_LEVEL_COMMAND_SINGLE_KEY_REENTRY);
+      status = navigate_directory(true, true, '\0', foldersOnlyFilter, NULL);
+      break;
+    }
+    case TERM_COMMAND_LEVEL_COMMAND_SINGLE_KEY_REENTRY: {
+      DPRINTF("Folder picker key: %d\n", arg[0]);
+      char key = arg[0];
+      // ESC cancels the picker and returns to the menu.
+      if (key == 27) {
+        term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
+        menu();
+        return;
+      }
+      status =
+          navigate_directory(false, true, key, foldersOnlyFilter, NULL);
+      break;
+    }
+    default:
+      break;
+  }
+  switch (status) {
+    case NAV_DIR_FIRST_TIME_OK:
+    case NAV_DIR_NEXT_TIME_OK: {
+      showTitle();
+      term_printString("\nFolder in the micro SD card: ");
+      term_printString(navState->folderPath);
+      drawPage(NAV_LINES_PER_PAGE_OFFSET);
+      break;
+    }
+    case NAV_DIR_SELECTED: {
+      settings_put_string(aconfig_getContext(),
+                          ACONFIG_PARAM_GEMDRIVE_FOLDER,
+                          navState->folderPath);
+      settings_save(aconfig_getContext(), true);
+      term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
+      menu();
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+// Drive picker — verbatim adaptation of source's cmdGemdriveDrive.
+void cmdGemdriveDrive(const char *arg) {
+  haltCountdown = true;
+  if (term_getCommandLevel() == TERM_COMMAND_LEVEL_SINGLE_KEY) {
+    showTitle();
+    term_printString("\n\n");
+    term_printString("Enter the drive (C to Z):\n\n> ");
+    term_setCommandLevel(TERM_COMMAND_LEVEL_DATA_INPUT);
+    return;
+  }
+  term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
+  const char *input = (arg != NULL) ? arg : "";
+  if (!isValidDrive(input)) {
+    term_printString("Invalid drive. Press SPACE to continue...\n");
+    return;
+  }
+  char driveBuffer[2] = {(char)toupper((unsigned char)input[0]), '\0'};
+  settings_put_string(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_DRIVE,
+                      driveBuffer);
+  settings_save(aconfig_getContext(), true);
+  menu();
+}
+
+// Reloc-address picker. Same single-key → data-input pattern as drive.
+// Accepts hex (0x...) or decimal. 0 / "auto" / empty restores the default.
+void cmdGemdriveRelocAddr(const char *arg) {
+  haltCountdown = true;
+  if (term_getCommandLevel() == TERM_COMMAND_LEVEL_SINGLE_KEY) {
+    showTitle();
+    term_printString("\n\n");
+    term_printString("Enter the relocation address (hex 0x...):\n");
+    term_printString("Use 0 or empty for auto (screen-8KB).\n\n> ");
+    term_setCommandLevel(TERM_COMMAND_LEVEL_DATA_INPUT);
+    return;
+  }
+  term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
+  const char *input = (arg != NULL) ? arg : "";
+  // Trim leading spaces.
+  while (*input == ' ' || *input == '\t') input++;
+  long value = 0;
+  if ((input[0] == '\0') || (strcasecmp(input, "auto") == 0)) {
+    value = 0;
+  } else {
+    char *end = NULL;
+    int base = (input[0] == '0' && (input[1] == 'x' || input[1] == 'X'))
+                   ? 16
+                   : 10;
+    value = strtol(input, &end, base);
+    if ((end == input) || (value < 0)) {
+      term_printString("Invalid address. Press SPACE to continue...\n");
+      return;
+    }
+  }
+  settings_put_integer(aconfig_getContext(),
+                       ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR, (int)value);
+  settings_save(aconfig_getContext(), true);
+  menu();
+}
+
+// Memtop picker. Same shape as the reloc one. 0 mirrors reloc by default.
+void cmdGemdriveMemtop(const char *arg) {
+  haltCountdown = true;
+  if (term_getCommandLevel() == TERM_COMMAND_LEVEL_SINGLE_KEY) {
+    showTitle();
+    term_printString("\n\n");
+    term_printString("Enter the _memtop value (hex 0x...):\n");
+    term_printString("Use 0 or empty to follow the reloc address.\n\n> ");
+    term_setCommandLevel(TERM_COMMAND_LEVEL_DATA_INPUT);
+    return;
+  }
+  term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
+  const char *input = (arg != NULL) ? arg : "";
+  while (*input == ' ' || *input == '\t') input++;
+  long value = 0;
+  if ((input[0] == '\0') || (strcasecmp(input, "auto") == 0)) {
+    value = 0;
+  } else {
+    char *end = NULL;
+    int base = (input[0] == '0' && (input[1] == 'x' || input[1] == 'X'))
+                   ? 16
+                   : 10;
+    value = strtol(input, &end, base);
+    if ((end == input) || (value < 0)) {
+      term_printString("Invalid memtop. Press SPACE to continue...\n");
+      return;
+    }
+  }
+  settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_DEVOPS_MEMTOP,
+                       (int)value);
+  settings_save(aconfig_getContext(), true);
+  menu();
+}
+
+// Hidden command list — switches the term to line-based COMMAND_INPUT so
+// the user can type 'print', 'save', 'get key', etc.
+void cmdHiddenSettings(const char *arg) {
+  (void)arg;
+  haltCountdown = true;
   menuScreenActive = false;
-  term_cmdSettings(arg);
+  showTitle();
+  term_printString(
+      "\n\n"
+      "Available settings commands:\n"
+      "  print   - Show settings\n"
+      "  save    - Save settings\n"
+      "  erase   - Erase settings\n"
+      "  get     - Get setting (requires key)\n"
+      "  put_int - Set integer (key and value)\n"
+      "  put_bool- Set boolean (key and value)\n"
+      "  put_str - Set string (key and value)\n\n"
+      "Enter command. Type 'm' to return > ");
+  term_setCommandLevel(TERM_COMMAND_LEVEL_COMMAND_INPUT);
 }
 
 void cmdPrint(const char *arg) {
+  haltCountdown = true;
   menuScreenActive = false;
   term_cmdPrint(arg);
 }
 
 void cmdSave(const char *arg) {
+  haltCountdown = true;
   menuScreenActive = false;
   term_cmdSave(arg);
+  // Cartridge-side state (GEMDRIVE relocation, _memtop patch, etc.) is
+  // applied by gemdrive_init at CA_INIT time, so a saved aconfig change
+  // is invisible until the m68k re-runs CA_INIT. Issue an automatic ST
+  // reset so the change takes effect immediately.
+  term_printString("Resetting Atari ST to apply changes...\n");
+  display_refresh();
+  sleep_ms(300);
+  SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_RESET);
 }
 
 void cmdErase(const char *arg) {
+  haltCountdown = true;
   menuScreenActive = false;
   term_cmdErase(arg);
 }
 
 void cmdGet(const char *arg) {
+  haltCountdown = true;
   menuScreenActive = false;
   term_cmdGet(arg);
 }
 
 void cmdPutInt(const char *arg) {
+  haltCountdown = true;
   menuScreenActive = false;
   term_cmdPutInt(arg);
 }
 
 void cmdPutBool(const char *arg) {
+  haltCountdown = true;
   menuScreenActive = false;
   term_cmdPutBool(arg);
 }
 
 void cmdPutString(const char *arg) {
+  haltCountdown = true;
   menuScreenActive = false;
   term_cmdPutString(arg);
 }
@@ -347,6 +883,14 @@ void emul_start() {
   chandler_init();
   chandler_addCB(term_command_cb);
 
+  // Register GEMDRIVE before the cartridge boots — the m68k issues
+  // CMD_GEMDRIVE_HELLO from CA_INIT (bit 27, after GEMDOS init), which
+  // happens once the ST is powered on. The callback computes the
+  // effective relocation address / _memtop value from aconfig overrides
+  // (or screen_base - 8 KB by default) and publishes them via shared
+  // variables before send_sync's random-token ack returns to the m68k.
+  gemdrive_init();
+
   // After this point, the remote computer can execute the code
 
   // 4. During the setup/configuration mode, the driver code must interact
@@ -386,6 +930,22 @@ void emul_start() {
             sdcardErr);
   } else {
     DPRINTF("SD card found & initialized\n");
+    // Also ensure the GEMDRIVE folder exists. When the user boots a
+    // fresh card, the directory configured by GEMDRIVE_FOLDER (default
+    // "/devops") is missing, and Fsfirst / Fopen fail with FR_NO_PATH
+    // even though the SD itself is mounted. Mirrors what the
+    // md-drives-emulator firmware does at boot.
+    SettingsConfigEntry *gemdriveFolder = settings_find_entry(
+        aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER);
+    const char *gemdriveFolderName =
+        (gemdriveFolder != NULL) ? gemdriveFolder->value : "/devops";
+    sdcard_status_t gemdriveStatus = sdcard_ensureFolder(gemdriveFolderName);
+    if (gemdriveStatus != SDCARD_INIT_OK) {
+      DPRINTF("GEMDRIVE folder '%s' could not be ensured (status %i)\n",
+              gemdriveFolderName, gemdriveStatus);
+    } else {
+      DPRINTF("GEMDRIVE folder '%s' ready.\n", gemdriveFolderName);
+    }
   }
 
   // Initialize the display again (in case the terminal emulator changed it)
@@ -469,6 +1029,7 @@ void emul_start() {
   // The main loop runs until the user decides to exit.
   // For testing purposes, this app only shows commands to manage the settings
   DPRINTF("Start the app loop here\n");
+  lastCountdownTick = get_absolute_time();
   while (getKeepActive()) {
 #if PICO_CYW43_ARCH_POLL
     network_safePoll();
@@ -483,13 +1044,28 @@ void emul_start() {
     // output, etc.).
     term_loop();
 
-    if (menuScreenActive) {
+    // Any keystroke (visible in the terminal input buffer before Enter is
+    // pressed) halts the autoboot countdown — matches md-drives-emulator.
+    if (!haltCountdown) {
       char *input = term_getInputBuffer();
-      bool hasPendingInput = (input != NULL) && (input[0] != '\0');
-      if (!hasPendingInput &&
-          (absolute_time_diff_us(get_absolute_time(), menuRefreshTime) <= 0)) {
-        term_refreshMenuLiveInfo();
-        menuRefreshTime = make_timeout_time_ms(MENU_REFRESH_TIME_MS);
+      if ((input != NULL) && (input[0] != '\0')) {
+        haltCountdown = true;
+      }
+    }
+
+    if (!haltCountdown && menuScreenActive) {
+      absolute_time_t now = get_absolute_time();
+      if (absolute_time_diff_us(lastCountdownTick, now) >= 1000000) {
+        lastCountdownTick = now;
+        countdown--;
+        showCounter(countdown);
+        display_refresh();
+        if (countdown <= 0) {
+          haltCountdown = true;
+          // Autoboot expired — launch DevOps on the Atari ST. Same path
+          // as pressing [F].
+          cmdFirmware(NULL);
+        }
       }
     }
   }

@@ -77,6 +77,28 @@ typedef struct {
   void (*handler)(const char *arg);
 } Command;
 
+// Terminal command levels — drives how termInputChar dispatches incoming
+// characters. Single-key fires a one-shot handler per key (used by the
+// menu); data-input collects a line and feeds it to the last single-key
+// handler on Enter; command-input is the legacy line-based "type a word"
+// mode kept for the hidden settings prompt.
+typedef enum {
+  TERM_COMMAND_LEVEL_SINGLE_KEY = 0,
+  TERM_COMMAND_LEVEL_COMMAND_INPUT = 1,
+  TERM_COMMAND_LEVEL_DATA_INPUT = 2,
+  TERM_COMMAND_LEVEL_COMMAND_SINGLE_KEY_REENTRY = 3,
+} term_CommandLevel;
+
+#define TERM_KEYBOARD_SCAN_CODE_UP 72
+#define TERM_KEYBOARD_SCAN_CODE_DOWN 80
+#define TERM_KEYBOARD_SCAN_CODE_LEFT 75
+#define TERM_KEYBOARD_SCAN_CODE_RIGHT 77
+
+#define TERM_KEYBOARD_KEY_UP 16
+#define TERM_KEYBOARD_KEY_DOWN 14
+#define TERM_KEYBOARD_KEY_LEFT 2
+#define TERM_KEYBOARD_KEY_RIGHT 6
+
 /**
  * @brief chandler callback that publishes a parsed protocol command
  *        into the terminal double-buffer for term_loop() to drain.
@@ -117,6 +139,30 @@ void term_clearScreen(void);
  * commands.
  */
 void term_setCommands(const Command *cmds, size_t count);
+
+/**
+ * @brief Retrieves the current command level.
+ */
+uint8_t term_getCommandLevel(void);
+
+/**
+ * @brief Sets the command level used by the input dispatcher.
+ */
+void term_setCommandLevel(uint8_t level);
+
+/**
+ * @brief Records the last single-key command (used for re-entry / data-input
+ *        modes so the dispatcher can route subsequent input back to the
+ *        correct handler).
+ */
+void term_setLastSingleKeyCommand(char key);
+
+/**
+ * @brief Forces a character into the terminal input as if typed by the user.
+ *        Used to pre-seed the menu (e.g. termInputChar('m') after enter).
+ */
+void term_forceInputChar(char chr, bool shiftKey);
+
 /**
  * @brief Clears the terminal's input buffer.
  *

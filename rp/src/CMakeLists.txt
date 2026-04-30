@@ -113,6 +113,7 @@ target_sources(${PROJECT_NAME} PRIVATE
         download.c
         emul.c
         gconfig.c
+        gemdrive.c
         hw_config.c
         network.c
         reset.c

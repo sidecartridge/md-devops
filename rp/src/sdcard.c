@@ -1,7 +1,20 @@
 #include "sdcard.h"
 
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
 static FATFS *mountedFsPtr = NULL;
 static bool sdMounted = false;
+
+// qsort comparator: directories first, then alphabetic case-insensitive.
+static int dirFirstCmp(const void *a, const void *b) {
+  const DirEntry *e1 = (const DirEntry *)a;
+  const DirEntry *e2 = (const DirEntry *)b;
+  if (e1->is_dir && !e2->is_dir) return -1;
+  if (!e1->is_dir && e2->is_dir) return 1;
+  return strcasecmp(e1->name, e2->name);
+}
 
 static void sdcard_warnDebugRisk(void) {
   size_t sdCount = sd_get_num();
@@ -219,4 +232,59 @@ bool sdcard_getMountedInfo(uint32_t *totalSizeMb, uint32_t *freeSpaceMb) {
       (uint64_t)freeClusters * fs->csize * NUM_BYTES_PER_SECTOR;
   *freeSpaceMb = (uint32_t)(freeSpaceBytes / SDCARD_MEGABYTE);
   return true;
+}
+
+// Ported verbatim from md-drives-emulator/sdcard.c.
+FRESULT __not_in_flash_func(sdcard_loadDirectory)(
+    const char *path, char entries_arr[][MAX_FILENAME_LENGTH + 1],
+    uint16_t *entry_count, uint16_t *selected, uint16_t *page, bool dirs_only,
+    EntryFilterFn filter_fn, char top_dir[MAX_FILENAME_LENGTH + 1]) {
+  FILINFO fno;
+  DIR dir;
+  FRESULT res;
+  *entry_count = 0;
+
+  DirEntry temp_entries[MAX_ENTRIES_DIR];
+  uint16_t temp_count = 0;
+
+  // ".." unless we're at root or the configured top dir.
+  if ((strcmp(path, "/") != 0) &&
+      (top_dir != NULL && strlen(top_dir) > 0 && strcmp(path, top_dir) != 0)) {
+    snprintf(entries_arr[*entry_count], MAX_FILENAME_LENGTH + 1, "..");
+    (*entry_count)++;
+  }
+
+  res = f_opendir(&dir, path);
+  if (res != FR_OK) {
+    DPRINTF("Error opening directory: %d\n", res);
+    return res;
+  }
+
+  while ((res = f_readdir(&dir, &fno)) == FR_OK && fno.fname[0]) {
+    if (dirs_only && !(fno.fattrib & AM_DIR)) continue;
+    if (filter_fn && !filter_fn(fno.fname, fno.fattrib)) continue;
+    if (temp_count >= MAX_ENTRIES_DIR) break;
+
+    snprintf(temp_entries[temp_count].name, MAX_FILENAME_LENGTH + 1, "%s%s",
+             fno.fname, (fno.fattrib & AM_DIR) ? "/" : "");
+    temp_entries[temp_count].is_dir = (fno.fattrib & AM_DIR) != 0;
+    temp_count++;
+  }
+
+  f_closedir(&dir);
+
+  qsort(temp_entries, temp_count, sizeof(DirEntry), dirFirstCmp);
+
+  for (uint16_t i = 0; i < temp_count; i++) {
+    strncpy(entries_arr[*entry_count], temp_entries[i].name,
+            MAX_FILENAME_LENGTH);
+    entries_arr[*entry_count][MAX_FILENAME_LENGTH] = '\0';
+    (*entry_count)++;
+  }
+
+  *page = 0;
+  *selected = 0;
+
+  DPRINTF("Loaded %d entries\n", *entry_count);
+  return FR_OK;
 }

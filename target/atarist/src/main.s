@@ -11,6 +11,7 @@
 ; $FA0010 - CA_TIME. File's time stamp. In GEMDOS format.
 ; $FA0012 - CA_DATE. File's date stamp. In GEMDOS format.
 ; $FA0014 - CA_SIZE. Lenght of app. in bytes. Not really used.
+
 ; $FA0018 - CA_NAME. DOS/TOS filename 8.3 format. Terminated with 0 .
 
 ; CA_INIT holds address of optional init. routine. Bits 24-31 aren't used for addressing, and ensure in which moment by system init prg. will be initialized and/or started. Bits have following meanings, 1 means execution:
@@ -46,11 +47,16 @@ FRAMEBUFFER_ADDR	equ (ROM4_ADDR + $10000 - FRAMEBUFFER_SIZE)	; $FAE040
 APP_BUFFERS_ADDR	equ (SHARED_BLOCK_ADDR + $100)			; $FA2100
 TRANSTABLE		equ APP_BUFFERS_ADDR				; high-res translation table
 
-; User firmware entry point. The cartridge image places userfw.s at
-; offset $0800 of BOOT.BIN via target/atarist/src/userfw.ld; main.s
-; gets the first 2 KB ($0000..$07FF), userfw gets the next 6 KB
-; ($0800..$1FFF). The CARTRIDGE_CODE_SIZE = 8 KB cap covers both.
-USERFW			equ (ROM4_ADDR + $800)				; $FA0800
+; GEMDRIVE blob entry inside the cartridge image. devops.ld places
+; gemdrive.s at offset $0800; main.s gets $0000..$07FF (2 KB),
+; gemdrive.s gets $0800..$1FFF (6 KB). CARTRIDGE_CODE_SIZE = 8 KB
+; covers both. At boot, gemdrive_init copies GEMDRIVE_BLOB_SIZE bytes
+; from GEMDRIVE_BLOB into a configurable RAM address (default
+; screen_base - 8 KB) so the resident GEMDRIVE code can survive past
+; cartridge teardown and be reached after _memtop has been lowered to
+; protect the region.
+GEMDRIVE_BLOB		equ (ROM4_ADDR + $800)			; $FA0800
+GEMDRIVE_BLOB_SIZE	equ $1800				; 6 KB allocated by devops.ld
 
 SCREEN_SIZE			equ (-4096)	; Use the memory before the screen memory to store the copied code
 COLS_HIGH			equ 20		; 16 bit columns in the ST
@@ -67,7 +73,25 @@ CMD_NOP				equ 0		; No operation command
 CMD_RESET			equ 1		; Reset command
 CMD_BOOT_GEM		equ 2		; Boot GEM command
 CMD_TERMINAL		equ 3		; Terminal command
-CMD_START			equ 4		; Hand control to the user firmware (USERFW)
+CMD_START			equ 4		; Hand control to GEMDRIVE (rom_function)
+
+; GEMDRIVE app namespace. Wire-format compatible with md-drives-emulator:
+; APP_GEMDRVEMUL keeps the same value; CMD_GEMDRVEMUL_* values that exist
+; in the source (GEMDRVEMUL_RESET = 0, _SAVE_VECTORS = 1, etc.) will be
+; reused unchanged when S2 lands. CMD_GEMDRIVE_HELLO is a new S1-only
+; bootstrap command; $50 is unused in the source's allocation table.
+APP_GEMDRVEMUL			equ $0400
+CMD_GEMDRIVE_HELLO		equ ($50 + APP_GEMDRVEMUL)
+; Diagnostic: m68k publishes the value it observes at $436 immediately
+; after the patch so the RP can confirm the write actually landed.
+CMD_GEMDRIVE_VERIFY_MEMTOP	equ ($52 + APP_GEMDRVEMUL)
+
+; Indexed shared variable slots used by GEMDRIVE. Slots 0..2 are framework
+; (chandler.h: HARDWARE_TYPE / SVERSION / BUFFER_TYPE), 3..9 reserved for
+; future framework use. GEMDRIVE owns 10..11; further GEMDRIVE state will
+; claim 12..15 in later stories.
+SHARED_VAR_GEMDRIVE_RELOC_ADDR	equ 10		; RP-published reloc address
+SHARED_VAR_GEMDRIVE_MEMTOP	equ 11		; RP-published memtop value
 
 _conterm			equ $484	; Conterm device number
 
@@ -213,6 +237,12 @@ first:
     even
 
 pre_auto:
+; Relocate the GEMDRIVE blob to RAM and patch _memtop. Runs once at
+; boot, in cartridge ROM (this code is not part of start_rom_code so it
+; never executes from the relocated print-loop copy). See gemdrive_init
+; below for the protocol.
+	bsr gemdrive_init
+
 ; Relocate the content of the cartridge ROM to the RAM
 
 ; Get the screen memory address to display
@@ -328,15 +358,15 @@ boot_gem:
 	; If we get here, continue loading GEM
     rts
 
-; Dispatcher for the user firmware module. Reached on CMD_START via the
-; sentinel poll in check_commands. The cartridge image places userfw.s
-; at offset $0800 (USERFW = $FA0800) through target/atarist/src/userfw.ld;
-; main.s simply hands control over with a one-way jmp. Apps that want
-; to chain multiple modules can change this to a sequence of jsr / jmp
-; the same way md-drives-emulator's rom_function dispatches into
-; GEMDRIVE/FLOPPYEMUL/ACSIEMUL/RTCEMUL.
+; Dispatcher invoked on CMD_START from the sentinel poll in
+; check_commands. Jumps to the GEMDRIVE blob's diagnostic_entry at
+; cartridge offset $0804 (entry table: bra.w install at +0, bra.w
+; diagnostic at +4). The cartridge-ROM copy is fine for the diagnostic
+; print; the install_entry must NEVER be re-entered after boot
+; (re-installing the trap vector would chain to ourselves), so we
+; deliberately route [F]irmware to +4 and not +0.
 rom_function:
-    jmp USERFW
+    jmp GEMDRIVE_BLOB+4
 
 ; Shared functions included at the end of the file
 ; Don't forget to include the macros for the shared functions at the top of file
@@ -344,6 +374,75 @@ rom_function:
 
 
 end_rom_code:
+
+	even
+
+; -----------------------------------------------------------------------
+; gemdrive_init — GEMDRIVE relocation harness (called once from pre_auto)
+; -----------------------------------------------------------------------
+; Steps:
+;   1. Read screen base via XBIOS Logbase (fn 2).
+;   2. Send CMD_GEMDRIVE_HELLO with d3 = screen_base. The RP-side
+;      gemdrive_command_cb reads it, applies aconfig overrides
+;      (GEMDRIVE_RELOC_ADDR / GEMDRIVE_MEMTOP) or falls back to the
+;      default screen_base - 8 KB, and writes the effective values into
+;      shared variable slots SHARED_VAR_GEMDRIVE_RELOC_ADDR and
+;      SHARED_VAR_GEMDRIVE_MEMTOP. send_sync round-trips through the
+;      random-token ack, so by the time the macro returns the shared
+;      region is up to date — no separate ready flag is needed.
+;   3. Read the effective reloc + memtop from the shared region.
+;   4. Copy the GEMDRIVE blob (GEMDRIVE_BLOB_SIZE bytes from
+;      GEMDRIVE_BLOB) to the chosen RAM address.
+;   5. Patch _memtop ($436) so TOS won't allocate over the resident
+;      blob on subsequent Pexec calls. The cartridge runs at CA_INIT
+;      bit 27 (after GEMDOS init, before disk boot) so the patch only
+;      affects future TPA computations, which is what we want.
+;
+; This routine lives outside start_rom_code..end_rom_code so it is not
+; copied with the print-loop relocation; it executes once from
+; cartridge ROM and is never re-entered.
+gemdrive_init:
+	movem.l d0-d7/a0-a3, -(sp)
+
+	; Step 1: Logbase (XBIOS fn 2) → d0.l = screen base
+	move.w #2, -(sp)
+	trap #14
+	addq.l #2, sp
+
+	; Step 2: publish screen_base, RP applies overrides + writes back
+	move.l d0, d3
+	send_sync CMD_GEMDRIVE_HELLO, 4
+
+	; Step 3: read effective reloc and memtop. Both are written by the
+	; RP-side gemdrive_command_cb during the send_sync round-trip above.
+	move.l SHARED_VARIABLES+(SHARED_VAR_GEMDRIVE_RELOC_ADDR*4), d0
+	move.l SHARED_VARIABLES+(SHARED_VAR_GEMDRIVE_MEMTOP*4), d1
+
+	; Step 4: copy blob from cartridge ROM to RAM
+	move.l d0, a1
+	move.l #GEMDRIVE_BLOB, a0
+	move.l #GEMDRIVE_BLOB_SIZE, d2
+	lsr.w #2, d2
+	subq #1, d2
+.gd_copy_loop:
+	move.l (a0)+, (a1)+
+	dbf d2, .gd_copy_loop
+
+	; Step 5: lower _memtop so TOS won't allocate over the relocated copy
+	move.l d1, memtop.w
+
+	; Step 6: call the relocated install_entry to wire up the GEMDOS
+	; trap #1 hook. The blob's offset 0 is install_entry (entry table:
+	; bra.w install at +0, bra.w diagnostic at +4 — see gemdrive.s).
+	; install_entry runs Setexc + sends CMD_SAVE_VECTORS to the RP, then
+	; rts back here. d0 still holds the reloc address from step 3.
+	move.l d0, a1
+	jsr (a1)
+
+	movem.l (sp)+, d0-d7/a0-a3
+	rts
+
 end_pre_auto:
 	even
+	dc.l $DEADFFFF
 	dc.l 0
