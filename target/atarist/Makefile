@@ -41,7 +41,7 @@ DEBUG_MODE = 1
 VASMFLAGS=-Faout -quiet -x -m68000 -spaces -showopt -devpac -D_DEBUG=$(DEBUG_MODE) -DGEMDOS_DATE=$(GEMDOS_DATE_FORMATTED) -DGEMDOS_TIME=$(GEMDOS_TIME_FORMATTED) -DVERSION_MAJOR=\"$(VERSION_MAJOR)\" -DVERSION_MINOR=\"$(VERSION_MINOR)\" -DVERSION_PATCH=\"$(VERSION_PATCH)\"
 VASM = vasm
 VLINK =  vlink
-LINKER_SCRIPT = $(SOURCES_DIR)/userfw.ld
+LINKER_SCRIPT = $(SOURCES_DIR)/devops.ld
 VLINKFLAGS = -brawbin1 -T $(LINKER_SCRIPT)
 
 .PHONY: all
@@ -54,16 +54,16 @@ release: prepare dist
 prepare: clean
 	mkdir -p $(BUILD_DIR)
 
-clean-compile : clean main.o userfw.o
+clean-compile : clean main.o gemdrive.o
 
 main.o: prepare
 	$(VASM) $(VASMFLAGS) $(SOURCES_DIR)/main.s -o $(BUILD_DIR)/main.o
 
-userfw.o: prepare
-	$(VASM) $(VASMFLAGS) $(SOURCES_DIR)/userfw.s -o $(BUILD_DIR)/userfw.o
+gemdrive.o: prepare
+	$(VASM) $(VASMFLAGS) $(SOURCES_DIR)/gemdrive.s -o $(BUILD_DIR)/gemdrive.o
 
 .PHONY: build
-build: main.o userfw.o
+build: main.o gemdrive.o
 	$(VLINK) $(addprefix $(BUILD_DIR)/,$^) $(VLINKFLAGS) -o $(BUILD_DIR)/$(BIN)
 
 
