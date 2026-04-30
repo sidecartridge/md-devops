@@ -51,10 +51,19 @@ RUNNER_PROTO_VER		equ (RUNNER_BASE + $18C)	; 4 B  (u16 min | u16 max)
 RUNNER_HELLO_MAGIC		equ $524E5631	; 'RNV1' big-endian
 RUNNER_PROTO_VERSION		equ $00010001	; min=1, max=1
 
-; Sentinel commands that main.s already polls. The Runner clears the
-; sentinel back to NOP after taking control so check_commands doesn't
-; re-trigger.
+; Sentinel commands. main.s' framework values (CMD_NOP=0,
+; CMD_RESET=1, CMD_BOOT_GEM=2, CMD_TERMINAL=3, CMD_START=4,
+; CMD_START_RUNNER=5) live in the [0..15] range; Runner-namespace
+; commands live at $0500 + N to avoid collisions.
 CMD_NOP				equ 0
+APP_RUNNER			equ $0500
+RUNNER_CMD_RESET		equ ($01 + APP_RUNNER)	; cold reset
+; Future: RUNNER_CMD_EXECUTE, RUNNER_CMD_CD in S3/S4.
+
+; Wait between the RUNNER_RESET sentinel sighting and the actual
+; reset trampoline — gives any in-flight cartridge bus traffic time
+; to drain. Mirrors main.s' PRE_RESET_WAIT.
+PRE_RESET_WAIT			equ $FFFFF
 
 ; GEMDOS / XBIOS opcodes used here.
 GEMDOS_Cconws			equ 9
@@ -89,11 +98,31 @@ runner_entry:
 	trap	#1
 	addq.l	#6, sp
 
-	; --- Step 3: active poll loop. S1 skeleton — no command
-	; dispatch yet, just spin. RUNNER_RESET / EXECUTE / CD land in
-	; later stories. ---
+	; --- Step 3: active poll loop. Reads the cartridge sentinel
+	; the RP writes to dispatch Runner commands. RUNNER_CMD_EXECUTE
+	; / RUNNER_CMD_CD land in S3/S4. ---
 runner_poll_loop:
+	move.l	CMD_MAGIC_SENTINEL_ADDR, d6
+	cmp.l	#RUNNER_CMD_RESET, d6
+	beq.s	runner_reset
 	bra.s	runner_poll_loop
+
+; Cold reset — same sequence as main.s' .reset. Waits briefly,
+; invalidates TOS' memory-system "valid" cookies (so the next boot
+; rebuilds RAM tables instead of trusting stale ones), then jumps
+; through the reset vector at $00000004.
+runner_reset:
+	move.l	#PRE_RESET_WAIT, d6
+.runner_reset_wait:
+	subq.l	#1, d6
+	bne.s	.runner_reset_wait
+
+	clr.l	$420.w			; memvalid
+	clr.l	$43A.w			; memval2
+	clr.l	$51A.w			; memval3
+	move.l	$4.w, a0		; reset vector
+	jmp	(a0)
+	nop
 
 ; ---------------------------------------------------------------
 ; Read-only data (lives in cartridge ROM alongside the code).

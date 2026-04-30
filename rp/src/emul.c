@@ -28,6 +28,7 @@
 #include "gemdrive.h"
 #include "http_server.h"
 #include "memfunc.h"
+#include "runner.h"
 #include "network.h"
 #include "pico/stdlib.h"
 #include "reset.h"
@@ -91,14 +92,43 @@ static const size_t numCommands = sizeof(commands) / sizeof(commands[0]);
 static bool keepActive = true;
 static bool menuScreenActive = false;
 
-// Set true the moment cmdRunner sends DISPLAY_COMMAND_START_RUNNER —
-// i.e. the user picked [U] at boot. The HTTP API reads this via
-// emul_isRunnerActive() to answer GET /api/v1/runner. The m68k can't
-// write to the cartridge address space (read-only ROM emulation), so
-// the active flag is owned RP-side rather than handshaken from the ST.
+// Runner state owned RP-side (the m68k can't write to the cartridge
+// address space — read-only ROM emulation — so any handshake from
+// the Runner has to live in RP RAM). cmdRunner flips active when
+// the user picks [U] at boot; per-command handlers (S2 reset, later
+// S3 execute / S4 cd) update last_command and the started/finished
+// timestamps. GET /api/v1/runner surfaces this struct.
+//
+// Once active is set it stays set for the lifetime of the RP power
+// cycle: a `runner reset` cold-reboots the ST and auto-relaunches
+// straight back into Runner mode (no need to re-pick [U]) — that's
+// the dev-iteration UX described in docs/epics/03-runner.md. The
+// scheduled relaunch is driven from the main loop via
+// runnerRelaunchAtMs.
 static bool runnerActive = false;
+static runner_last_command_t runnerLastCommand = RUNNER_LAST_NONE;
+static uint32_t runnerLastStartedMs = 0;
+static uint32_t runnerLastFinishedMs = 0;
+static uint32_t runnerRelaunchAtMs = 0;  // 0 = no pending relaunch
 
 bool emul_isRunnerActive(void) { return runnerActive; }
+
+runner_last_command_t emul_getRunnerLastCommand(void) {
+  return runnerLastCommand;
+}
+
+uint32_t emul_getRunnerLastStartedMs(void) { return runnerLastStartedMs; }
+uint32_t emul_getRunnerLastFinishedMs(void) { return runnerLastFinishedMs; }
+
+void emul_recordRunnerCommand(runner_last_command_t cmd, uint32_t now_ms) {
+  runnerLastCommand = cmd;
+  runnerLastStartedMs = now_ms;
+  runnerLastFinishedMs = now_ms;
+}
+
+void emul_scheduleRunnerRelaunch(uint32_t at_ms) {
+  runnerRelaunchAtMs = at_ms;
+}
 
 // Boot countdown — auto-launches GEMDRIVE on the Atari ST when it hits 0.
 // Mirrors md-drives-emulator's behavior. Any key press halts it.
@@ -1105,6 +1135,24 @@ void emul_start() {
     // Run the terminal foreground (consume the published command, render
     // output, etc.).
     term_loop();
+
+    // Runner-mode auto-relaunch. After a `runner reset` (or any other
+    // path that schedules a relaunch), once the ST has had time to
+    // cold-boot back to its CA_INIT polling loop we re-fire
+    // DISPLAY_COMMAND_START_RUNNER so the m68k jumps straight back
+    // into the Runner without the user having to press [U] again.
+    // The active flag stays true for the lifetime of the RP power
+    // cycle — power-cycling the Pico W resets the stickiness.
+    if (runnerRelaunchAtMs != 0) {
+      uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+      if ((int32_t)(now_ms - runnerRelaunchAtMs) >= 0) {
+        runnerRelaunchAtMs = 0;
+        if (runnerActive) {
+          DPRINTF("emul: auto-relaunching Runner after reset\n");
+          SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START_RUNNER);
+        }
+      }
+    }
 
     // Any keystroke (bound OR unbound) halts the autoboot countdown,
     // matching md-drives-emulator. Bound keys also trigger their

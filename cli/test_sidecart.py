@@ -702,6 +702,38 @@ class RunnerStatusTests(unittest.TestCase):
         self.assertEqual(json.loads(out)["active"], True)
 
 
+class RunnerResetTests(unittest.TestCase):
+    """Epic 03 / S2 — `sidecart runner reset`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_reset_202(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "reset"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path, "/api/v1/runner/reset")
+        self.assertIn("RESET sent", out)
+
+    def test_runner_reset_409_runner_inactive(self) -> None:
+        self._set_response(409, {"ok": False, "code": "runner_inactive",
+                                 "message": "Runner mode is not active"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "reset"])
+        self.assertEqual(code, sidecart.EXIT_CONFLICT)
+        self.assertIn("runner_inactive", err)
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:

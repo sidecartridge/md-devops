@@ -9,6 +9,7 @@
 
 #include "aconfig.h"
 #include "debug.h"
+#include "display.h"
 #include "emul.h"
 #include "ff.h"
 #include "gconfig.h"
@@ -17,6 +18,7 @@
 #include "lwip/tcp.h"
 #include "pico/cyw43_arch.h"
 #include "pico/time.h"
+#include "runner.h"
 #include "settings.h"
 
 // Per-conn response buffer. Sized to comfortably hold a full status
@@ -1104,32 +1106,87 @@ static void __not_in_flash_func(handle_volume)(http_conn_t *c) {
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
-// GET /api/v1/runner — Epic 03 / S1.
+static const char *runner_last_command_str(runner_last_command_t cmd) {
+  switch (cmd) {
+    case RUNNER_LAST_RESET: return "RESET";
+    // S3/S4: EXECUTE, CD.
+    default: return NULL;  // RUNNER_LAST_NONE → JSON null
+  }
+}
+
+// GET /api/v1/runner — Epic 03 / S1+S2.
 //
 // Reports whether the user picked Runner mode at boot (the cmdRunner
 // menu handler flips emul_isRunnerActive() the moment it sends
-// DISPLAY_COMMAND_START_RUNNER) and, in later stories, the latest
-// command status.
+// DISPLAY_COMMAND_START_RUNNER) and the most-recent Runner command
+// the RP submitted.
 //
 // The active flag is owned RP-side because the m68k Runner cannot
 // write to the cartridge address space (read-only ROM emulation),
 // so an m68k → RP handshake via the shared region is impossible.
 //
-// In S1 the busy / cwd / last_* fields are placeholders (always
-// false / empty / null); they get populated as RUNNER_RESET / EXECUTE
-// / CD land in S2/S3/S4.
+// In S1+S2 the busy / cwd / exit-code fields are placeholders (always
+// false / empty / null); they get populated as RUNNER_EXECUTE / CD
+// land in S3/S4.
 static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
   bool active = emul_isRunnerActive();
-  char body[256];
-  int n = snprintf(body, sizeof(body),
-                   "{\"ok\":true,\"active\":%s,\"busy\":false,"
-                   "\"cwd\":\"\",\"last_command\":null,"
-                   "\"last_path\":null,\"last_exit_code\":null,"
-                   "\"last_started_at_ms\":null,"
-                   "\"last_finished_at_ms\":null}\n",
-                   active ? "true" : "false");
+  const char *last_cmd = runner_last_command_str(emul_getRunnerLastCommand());
+  char last_started_buf[24];
+  char last_finished_buf[24];
+  if (last_cmd != NULL) {
+    snprintf(last_started_buf, sizeof(last_started_buf), "%lu",
+             (unsigned long)emul_getRunnerLastStartedMs());
+    snprintf(last_finished_buf, sizeof(last_finished_buf), "%lu",
+             (unsigned long)emul_getRunnerLastFinishedMs());
+  } else {
+    snprintf(last_started_buf, sizeof(last_started_buf), "null");
+    snprintf(last_finished_buf, sizeof(last_finished_buf), "null");
+  }
+  char body[320];
+  int n = snprintf(
+      body, sizeof(body),
+      "{\"ok\":true,\"active\":%s,\"busy\":false,\"cwd\":\"\","
+      "\"last_command\":%s%s%s,\"last_path\":null,"
+      "\"last_exit_code\":null,"
+      "\"last_started_at_ms\":%s,\"last_finished_at_ms\":%s}\n",
+      active ? "true" : "false",
+      (last_cmd != NULL) ? "\"" : "",
+      (last_cmd != NULL) ? last_cmd : "null",
+      (last_cmd != NULL) ? "\"" : "",
+      last_started_buf, last_finished_buf);
   if (n < 0) n = 0;
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
+// POST /api/v1/runner/reset — Epic 03 / S2.
+//
+// Fire-and-forget: writes RUNNER_CMD_RESET into the cartridge
+// sentinel; the m68k Runner's poll loop sees it and cold-resets the
+// machine. The Runner can't reply (the machine is rebooting), so the
+// RP records last_command=RESET locally and answers 202 Accepted
+// immediately. If Runner mode wasn't selected at boot, return
+// 409 runner_inactive.
+static void __not_in_flash_func(handle_runner_reset)(http_conn_t *c) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return;
+  }
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  emul_recordRunnerCommand(RUNNER_LAST_RESET, now_ms);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_CMD_RESET);
+  // Schedule the auto-relaunch into Runner mode once the ST has
+  // had time to cold-boot back to its CA_INIT polling loop. 3 s is
+  // generous; TOS typically reaches CA_INIT well within 1.5 s. This
+  // is what keeps Runner mode sticky across resets so the dev
+  // iteration loop (upload → run → reset on failure) doesn't need
+  // the operator to re-press [U].
+  emul_scheduleRunnerRelaunch(now_ms + 3000);
+  char body[80];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"accepted\":true}\n");
+  if (n < 0) n = 0;
+  write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
 }
 
 // Append printf-formatted text to the response body buffer, advancing
@@ -2534,6 +2591,25 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
     }
     // S6 will add PUT (upload) here.
     write_405(c, "GET, HEAD, DELETE");
+    return;
+  }
+
+  // Prefix routes: /api/v1/runner/<action> (Epic 03). The exact-match
+  // /api/v1/runner endpoint (status query) is in g_routes above; only
+  // the slash-prefixed action paths fall through here.
+  static const char runner_prefix[] = "/api/v1/runner/";
+  static const size_t runner_prefix_len = sizeof(runner_prefix) - 1;
+  if (strncmp(c->path, runner_prefix, runner_prefix_len) == 0) {
+    const char *action = c->path + runner_prefix_len;
+    if (strcmp(action, "reset") == 0) {
+      if (c->method == HM_POST) {
+        handle_runner_reset(c);
+        return;
+      }
+      write_405(c, "POST");
+      return;
+    }
+    write_error(c, 404, "Not Found", "not_found", "Route not found");
     return;
   }
 

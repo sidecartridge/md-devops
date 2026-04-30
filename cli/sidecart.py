@@ -422,6 +422,28 @@ def _split_host(host: str) -> tuple[str, int]:
     return host, DEFAULT_PORT
 
 
+def cmd_runner_reset(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/reset — fire-and-forget cold reset."""
+    url = base_url(args.host) + "/api/v1/runner/reset"
+    try:
+        status, parsed, raw = request_json("POST", url, body=b"")
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 202:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        print("ok  RESET sent")
+    return EXIT_OK
+
+
 def cmd_runner_status(args: argparse.Namespace) -> int:
     """GET /api/v1/runner — Epic 03 Runner state."""
     url = base_url(args.host) + "/api/v1/runner"
@@ -651,6 +673,7 @@ def build_parser() -> argparse.ArgumentParser:
     runner = sub.add_parser("runner", help="Runner mode (Epic 03).")
     runner_sub = runner.add_subparsers(dest="runner_cmd", required=True)
     runner_sub.add_parser("status", help="Show Runner state and last completion.")
+    runner_sub.add_parser("reset", help="Cold-reset the Atari ST.")
     return p
 
 
@@ -674,6 +697,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "runner":
         runner_handlers = {
             "status": cmd_runner_status,
+            "reset": cmd_runner_reset,
         }
         handler = runner_handlers.get(args.runner_cmd)
         if handler is None:
