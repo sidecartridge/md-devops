@@ -647,6 +647,61 @@ class PutTests(unittest.TestCase):
         self.assertIn("busy", err)
 
 
+class RunnerStatusTests(unittest.TestCase):
+    """Epic 03 / S1 — `sidecart runner status`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_status_inactive(self) -> None:
+        self._set_response(200, {
+            "ok": True, "active": False, "busy": False, "cwd": "",
+            "last_command": None, "last_path": None,
+            "last_exit_code": None, "last_started_at_ms": None,
+            "last_finished_at_ms": None,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "GET")
+        self.assertEqual(self.server.state.last_path, "/api/v1/runner")
+        self.assertIn("not active", out)
+
+    def test_runner_status_active(self) -> None:
+        self._set_response(200, {
+            "ok": True, "active": True, "busy": False, "cwd": "/games",
+            "last_command": "EXECUTE", "last_path": "/games/prog.tos",
+            "last_exit_code": 0, "last_started_at_ms": 1,
+            "last_finished_at_ms": 2,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("active   : true", out)
+        self.assertIn("busy     : no", out)
+        self.assertIn("/games", out)
+        self.assertIn("EXECUTE", out)
+
+    def test_runner_status_json(self) -> None:
+        payload = {"ok": True, "active": True, "busy": False, "cwd": "",
+                   "last_command": None, "last_path": None,
+                   "last_exit_code": None, "last_started_at_ms": None,
+                   "last_finished_at_ms": None}
+        self._set_response(200, payload)
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "--json", "runner", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(json.loads(out)["active"], True)
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:

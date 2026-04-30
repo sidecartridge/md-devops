@@ -422,6 +422,48 @@ def _split_host(host: str) -> tuple[str, int]:
     return host, DEFAULT_PORT
 
 
+def cmd_runner_status(args: argparse.Namespace) -> int:
+    """GET /api/v1/runner — Epic 03 Runner state."""
+    url = base_url(args.host) + "/api/v1/runner"
+    try:
+        status, parsed, raw = request_json("GET", url)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200 or parsed is None or parsed.get("ok") is not True:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        json.dump(parsed, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return EXIT_OK
+    if args.quiet:
+        return EXIT_OK
+
+    active = parsed.get("active", False)
+    if not active:
+        print("Runner mode is not active. Boot via [U] to enable.")
+        return EXIT_OK
+
+    busy = parsed.get("busy", False)
+    cwd = parsed.get("cwd", "") or "(unset)"
+    last_cmd = parsed.get("last_command")
+    last_path = parsed.get("last_path")
+    last_exit = parsed.get("last_exit_code")
+    print(f"active   : true")
+    print(f"busy     : {'yes' if busy else 'no'}")
+    print(f"cwd      : {cwd}")
+    if last_cmd is None:
+        print(f"last     : (no command run yet)")
+    elif last_path is None:
+        print(f"last     : {last_cmd} (exit={last_exit})")
+    else:
+        print(f"last     : {last_cmd} {last_path} (exit={last_exit})")
+    return EXIT_OK
+
+
 def cmd_put(args: argparse.Namespace) -> int:
     """PUT /api/v1/files/<remote>?overwrite=0|1 — stream LOCAL up.
 
@@ -605,6 +647,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Remote destination (default: basename of LOCAL).")
     put.add_argument("-f", "--force", action="store_true",
                      help="Overwrite if the remote file exists.")
+
+    runner = sub.add_parser("runner", help="Runner mode (Epic 03).")
+    runner_sub = runner.add_subparsers(dest="runner_cmd", required=True)
+    runner_sub.add_parser("status", help="Show Runner state and last completion.")
     return p
 
 
@@ -625,6 +671,15 @@ def main(argv: list[str] | None = None) -> int:
         "get": cmd_get,
         "put": cmd_put,
     }
+    if args.cmd == "runner":
+        runner_handlers = {
+            "status": cmd_runner_status,
+        }
+        handler = runner_handlers.get(args.runner_cmd)
+        if handler is None:
+            parser.error(f"unknown runner subcommand: {args.runner_cmd}")
+            return EXIT_USAGE
+        return handler(args)
     handler = handlers.get(args.cmd)
     if handler is None:
         parser.error(f"unknown subcommand: {args.cmd}")

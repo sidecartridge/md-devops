@@ -9,6 +9,8 @@
 #ifndef EMUL_H
 #define EMUL_H
 
+#include <stdbool.h>
+
 /**
  * @brief
  *
@@ -18,5 +20,13 @@
  * user interaction and potential system resets.
  */
 void emul_start();
+
+/**
+ * @brief Whether the user picked Runner mode at boot ([U] in the
+ *        setup menu). Set RP-side by cmdRunner because the m68k
+ *        cannot write a handshake into the read-only cartridge area.
+ *        Returns false for the GEMDRIVE-only [E]/[F]/countdown path.
+ */
+bool emul_isRunnerActive(void);
 
 #endif  // EMUL_H

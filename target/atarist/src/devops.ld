@@ -2,14 +2,19 @@
  *
  * The cartridge image is loaded verbatim at $FA0000 by the cartridge
  * port hardware, so the offsets below become runtime addresses by
- * adding ROM4_ADDR. main.s gets the first 2 KB ($0000..$07FF) and
- * gemdrive.s occupies the next 6 KB ($0800..$1FFF); together they must
- * fit in CARTRIDGE_CODE_SIZE = 8 KB (the build script asserts this).
+ * adding ROM4_ADDR. The 8 KB cartridge code budget
+ * (CARTRIDGE_CODE_SIZE = $2000) is split:
  *
- * The gemdrive blob is also copied at boot to a configurable RAM
- * address (default screen_base - 8 KB) by main.s's gemdrive_init, so
- * gemdrive.s must be position-independent — see the warning at the
- * top of gemdrive.s.
+ *   $0000..$07FF  main.s     2 KB   boot, dispatch, terminal
+ *   $0800..$1BFF  gemdrive.s 5 KB   GEMDOS hooks + protocol blob
+ *                                   (relocated to RAM at boot)
+ *   $1C00..$1FFF  runner.s   1 KB   Runner foreground loop (Epic 03)
+ *
+ * The gemdrive blob is copied at boot to a configurable RAM address
+ * (default screen_base - 8 KB) by main.s's gemdrive_init; the Runner
+ * blob currently runs in place from cartridge ROM. Both .s files
+ * must be position-independent — see the warnings at the top of
+ * gemdrive.s and runner.s.
  *
  * Adding a new module: add a ".text_<name> 0x????? : { <name>.o(.text) }"
  * section here, mirror the offset with `equ (ROM4_ADDR + $????)` in
@@ -24,5 +29,9 @@ SECTIONS
 
     .text_gemdrive 0x000800 : {
         gemdrive.o(.text)
+    }
+
+    .text_runner 0x001C00 : {
+        runner.o(.text)
     }
 }

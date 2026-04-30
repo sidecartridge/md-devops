@@ -9,6 +9,7 @@
 
 #include "aconfig.h"
 #include "debug.h"
+#include "emul.h"
 #include "ff.h"
 #include "gconfig.h"
 #include "lwip/err.h"
@@ -1099,6 +1100,34 @@ static void __not_in_flash_func(handle_volume)(http_conn_t *c) {
                    "\"fs_type\":\"%s\"}\n",
                    (unsigned long long)total_bytes,
                    (unsigned long long)free_bytes, fat_type_name(fs->fs_type));
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
+// GET /api/v1/runner — Epic 03 / S1.
+//
+// Reports whether the user picked Runner mode at boot (the cmdRunner
+// menu handler flips emul_isRunnerActive() the moment it sends
+// DISPLAY_COMMAND_START_RUNNER) and, in later stories, the latest
+// command status.
+//
+// The active flag is owned RP-side because the m68k Runner cannot
+// write to the cartridge address space (read-only ROM emulation),
+// so an m68k → RP handshake via the shared region is impossible.
+//
+// In S1 the busy / cwd / last_* fields are placeholders (always
+// false / empty / null); they get populated as RUNNER_RESET / EXECUTE
+// / CD land in S2/S3/S4.
+static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
+  bool active = emul_isRunnerActive();
+  char body[256];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"active\":%s,\"busy\":false,"
+                   "\"cwd\":\"\",\"last_command\":null,"
+                   "\"last_path\":null,\"last_exit_code\":null,"
+                   "\"last_started_at_ms\":null,"
+                   "\"last_finished_at_ms\":null}\n",
+                   active ? "true" : "false");
   if (n < 0) n = 0;
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
@@ -2381,6 +2410,7 @@ static const route_t g_routes[] = {
     {"/api/v1/ping", M_GET | M_HEAD, handle_ping},
     {"/api/v1/volume", M_GET | M_HEAD, handle_volume},
     {"/api/v1/files", M_GET | M_HEAD, handle_files_list},
+    {"/api/v1/runner", M_GET | M_HEAD, handle_runner_status},
 };
 
 #define ROUTES_COUNT (sizeof(g_routes) / sizeof(g_routes[0]))

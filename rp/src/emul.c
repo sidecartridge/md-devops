@@ -52,6 +52,7 @@ static void cmdGemdriveFolder(const char *arg);
 static void cmdGemdriveDrive(const char *arg);
 static void cmdGemdriveRelocAddr(const char *arg);
 static void cmdGemdriveMemtop(const char *arg);
+static void cmdRunner(const char *arg);
 static void cmdHiddenSettings(const char *arg);
 static void cmdPrint(const char *arg);
 static void cmdSave(const char *arg);
@@ -72,6 +73,7 @@ static const Command commands[] = {
     {"d", cmdGemdriveDrive},
     {"r", cmdGemdriveRelocAddr},
     {"t", cmdGemdriveMemtop},
+    {"u", cmdRunner},
     {"?", cmdHiddenSettings},
     {"print", cmdPrint},
     {"save", cmdSave},
@@ -88,6 +90,15 @@ static const size_t numCommands = sizeof(commands) / sizeof(commands[0]);
 // Keep active loop or exit
 static bool keepActive = true;
 static bool menuScreenActive = false;
+
+// Set true the moment cmdRunner sends DISPLAY_COMMAND_START_RUNNER —
+// i.e. the user picked [U] at boot. The HTTP API reads this via
+// emul_isRunnerActive() to answer GET /api/v1/runner. The m68k can't
+// write to the cartridge address space (read-only ROM emulation), so
+// the active flag is owned RP-side rather than handshaken from the ST.
+static bool runnerActive = false;
+
+bool emul_isRunnerActive(void) { return runnerActive; }
 
 // Boot countdown — auto-launches GEMDRIVE on the Atari ST when it hits 0.
 // Mirrors md-drives-emulator's behavior. Any key press halts it.
@@ -473,7 +484,7 @@ static void __not_in_flash_func(menu)(void) {
   term_printString(ipLine);
 
   vt52Cursor(TERM_SCREEN_SIZE_Y - 2, 0);
-  term_printString("[E]xit (launch)   [X] Return to Booster");
+  term_printString("[E]xit (launch)  r[U]nner  [X] Booster");
 
   vt52Cursor(TERM_SCREEN_SIZE_Y - 1, 0);
   term_printString("Select an option: ");
@@ -520,6 +531,25 @@ void cmdFirmware(const char *arg) {
   // CMD_START is the cartridge sentinel that GEMDRIVE polls during
   // pre_auto; receiving it makes the m68k jump into the GEMDRIVE blob.
   SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START);
+}
+
+// [U] launches Runner mode (Epic 03). Same shape as cmdFirmware but
+// sends DISPLAY_COMMAND_START_RUNNER, which the m68k's check_commands
+// dispatch maps to runner_function (jmp RUNNER_BLOB). GEMDRIVE has
+// already been installed by pre_auto's gemdrive_init — the Runner
+// runs alongside it, in foreground.
+void cmdRunner(const char *arg) {
+  (void)arg;
+  haltCountdown = true;
+  menuScreenActive = false;
+  showTitle();
+  term_printString("\n\n");
+  term_printString("Launching DevOps Runner on the Atari ST...\n");
+  // Flip the RP-side active flag so GET /api/v1/runner answers
+  // "active": true even though the m68k Runner can't write a
+  // handshake into the read-only cartridge area.
+  runnerActive = true;
+  SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START_RUNNER);
 }
 
 void cmdBooster(const char *arg) {

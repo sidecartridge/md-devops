@@ -47,16 +47,20 @@ FRAMEBUFFER_ADDR	equ (ROM4_ADDR + $10000 - FRAMEBUFFER_SIZE)	; $FAE040
 APP_BUFFERS_ADDR	equ (SHARED_BLOCK_ADDR + $100)			; $FA2100
 TRANSTABLE		equ APP_BUFFERS_ADDR				; high-res translation table
 
-; GEMDRIVE blob entry inside the cartridge image. devops.ld places
-; gemdrive.s at offset $0800; main.s gets $0000..$07FF (2 KB),
-; gemdrive.s gets $0800..$1FFF (6 KB). CARTRIDGE_CODE_SIZE = 8 KB
-; covers both. At boot, gemdrive_init copies GEMDRIVE_BLOB_SIZE bytes
-; from GEMDRIVE_BLOB into a configurable RAM address (default
+; Cartridge code layout (devops.ld; CARTRIDGE_CODE_SIZE = 8 KB):
+;   $0000..$07FF  main.s     2 KB   boot + dispatch + terminal
+;   $0800..$1BFF  gemdrive.s 5 KB   GEMDRIVE blob (relocated to RAM)
+;   $1C00..$1FFF  runner.s   1 KB   Epic 03 Runner foreground loop
+; At boot, gemdrive_init copies GEMDRIVE_BLOB_SIZE bytes from
+; GEMDRIVE_BLOB into a configurable RAM address (default
 ; screen_base - 8 KB) so the resident GEMDRIVE code can survive past
 ; cartridge teardown and be reached after _memtop has been lowered to
-; protect the region.
+; protect the region. The Runner currently runs in place from
+; cartridge ROM (no relocation in v1).
 GEMDRIVE_BLOB		equ (ROM4_ADDR + $800)			; $FA0800
-GEMDRIVE_BLOB_SIZE	equ $1800				; 6 KB allocated by devops.ld
+GEMDRIVE_BLOB_SIZE	equ $1400				; 5 KB allocated by devops.ld
+RUNNER_BLOB		equ (ROM4_ADDR + $1C00)			; $FA1C00
+RUNNER_BLOB_SIZE	equ $400				; 1 KB allocated by devops.ld
 
 SCREEN_SIZE			equ (-4096)	; Use the memory before the screen memory to store the copied code
 COLS_HIGH			equ 20		; 16 bit columns in the ST
@@ -74,6 +78,7 @@ CMD_RESET			equ 1		; Reset command
 CMD_BOOT_GEM		equ 2		; Boot GEM command
 CMD_TERMINAL		equ 3		; Terminal command
 CMD_START			equ 4		; Hand control to GEMDRIVE (rom_function)
+CMD_START_RUNNER	equ 5		; Hand control to the Runner (runner_function)
 
 ; GEMDRIVE app namespace. Wire-format compatible with md-drives-emulator:
 ; APP_GEMDRVEMUL keeps the same value; CMD_GEMDRVEMUL_* values that exist
@@ -205,6 +210,8 @@ check_commands		macro
 					beq boot_gem				; If it is, boot GEM
 					cmp.l #CMD_START, d6		; Check if the command hands over to USERFW
 					beq rom_function			; If it is, jump to the user firmware dispatcher
+					cmp.l #CMD_START_RUNNER, d6	; Check if the command hands over to the Runner
+					beq runner_function			; If it is, jump to the Runner blob entry
 
 					; If we are here, the command is a NOP
 					; If the command is a NOP, check the shift keys to bypass the command
@@ -367,6 +374,15 @@ boot_gem:
 ; deliberately route [F]irmware to +4 and not +0.
 rom_function:
     jmp GEMDRIVE_BLOB+4
+
+; Dispatcher invoked on CMD_START_RUNNER from the sentinel poll in
+; check_commands — the user pressed [U] in the setup terminal.
+; Hands control to the Runner blob (runner.s). gemdrive_init has
+; already run from pre_auto so GEMDRIVE's trap hook is in place;
+; the Runner runs in foreground from cartridge ROM (no relocation
+; in v1) and never returns.
+runner_function:
+    jmp RUNNER_BLOB
 
 ; Shared functions included at the end of the file
 ; Don't forget to include the macros for the shared functions at the top of file
