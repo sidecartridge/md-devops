@@ -44,6 +44,9 @@
 // straight into FatFs without buffering here.
 #define HTTP_REQUEST_BODY_BUF_BYTES 256
 
+// Hard cap on a single upload (PUT) body. Per the locked spec.
+#define HTTP_MAX_UPLOAD_BYTES (4u * 1024u * 1024u)
+
 // Idle-connection sweeper: tcp_poll fires every (4 × tcp_poll_interval) /
 // 2 seconds. With interval 8, that's 16 seconds per tick; we close on
 // the first tick, so a connection that never sends a complete request
@@ -57,6 +60,7 @@ typedef enum {
   HC_WRITE_RESPONSE,
   HC_STREAM_LISTING,
   HC_STREAM_DOWNLOAD,
+  HC_STREAM_UPLOAD,
   HC_DRAINING,
 } hc_state_t;
 
@@ -85,6 +89,7 @@ typedef struct http_conn {
   bool has_host;
   bool has_chunked_te;
   bool content_type_json;  // request Content-Type starts with application/json
+  bool has_content_length;
   size_t content_length;
 
   // Request body (POST/PUT for non-streaming routes only).
@@ -114,6 +119,16 @@ typedef struct http_conn {
   uint32_t stream_end;       // one-past-last byte to send (file size or
                              // Range slice end)
   bool holds_body_lock;      // this conn holds the body-stream lock
+
+  // Streaming file upload state. Active while state == HC_STREAM_UPLOAD;
+  // FIL handle released by conn_close (and the partial file unlinked
+  // if the upload didn't complete cleanly via upload_finish_ok).
+  FIL upload_file;
+  bool upload_file_open;
+  bool upload_was_overwrite;       // true -> reply 200, false -> 201 Created
+  uint32_t upload_received;        // bytes already written to file
+  char upload_norm[HTTP_PATH_BUF_BYTES];      // for response Location: /api/v1/files<rel>
+  char upload_abs[HTTP_FAT_PATH_BUF_BYTES];   // for cleanup f_unlink
 
   // Range request state, populated during header parsing.
   bool has_range;
@@ -157,6 +172,14 @@ static err_t srv_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p,
 static err_t srv_sent_cb(void *arg, struct tcp_pcb *pcb, u16_t len);
 static err_t srv_poll_cb(void *arg, struct tcp_pcb *pcb);
 static void srv_err_cb(void *arg, err_t err);
+
+// Streaming-handler forward decls; bodies live alongside the
+// download / listing / upload route handlers further down.
+static void stream_listing_drive(http_conn_t *c);
+static void stream_download_drive(http_conn_t *c);
+static bool handle_file_upload_init(http_conn_t *c, const char *body_start,
+                                    size_t leftover);
+static void upload_finish_ok(http_conn_t *c);
 
 // --- Public API ---
 
@@ -232,6 +255,18 @@ static void __not_in_flash_func(conn_close)(http_conn_t *c) {
   if (c->stream_file_open) {
     f_close(&c->stream_file);
     c->stream_file_open = false;
+  }
+  // upload_finish_ok closes the upload file cleanly before the
+  // response is sent. If it's still open when conn_close runs, the
+  // upload was interrupted (peer aborted, idle timeout, write error)
+  // — close the FIL and unlink the partial file so we don't leave
+  // junk on disk.
+  if (c->upload_file_open) {
+    f_close(&c->upload_file);
+    c->upload_file_open = false;
+    if (c->upload_abs[0] != '\0') {
+      f_unlink(c->upload_abs);
+    }
   }
   if (c->holds_body_lock) {
     g_body_stream_busy = false;
@@ -326,6 +361,39 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
     if (c->body_received >= c->content_length) {
       route(c);
     }
+  } else if (c->state == HC_STREAM_UPLOAD) {
+    // Drain pbuf segments straight into FatFs in <= sizeof(c->resp)
+    // chunks. Once content_length bytes are written we send the
+    // success response and close.
+    size_t want = c->content_length - c->upload_received;
+    size_t take = (p->tot_len < want) ? p->tot_len : want;
+    size_t off = 0;
+    while (off < take) {
+      size_t chunk = take - off;
+      if (chunk > sizeof(c->resp)) chunk = sizeof(c->resp);
+      pbuf_copy_partial(p, c->resp, (u16_t)chunk, (u16_t)off);
+      UINT written = 0;
+      FRESULT fr =
+          f_write(&c->upload_file, c->resp, (UINT)chunk, &written);
+      if (fr != FR_OK || written != chunk) {
+        DPRINTF("http_server: upload f_write failed (%d, %u/%zu)\n",
+                (int)fr, (unsigned)written, chunk);
+        // Surface 500 to the client; conn_close closes the FIL and
+        // unlinks the partial file when the response has been drained.
+        write_error(c, 500, "Internal Server Error", "disk_error",
+                    "f_write failed mid-upload");
+        tcp_recved(pcb, p->tot_len);
+        pbuf_free(p);
+        return ERR_OK;
+      }
+      off += chunk;
+    }
+    c->upload_received += take;
+    tcp_recved(pcb, p->tot_len);
+    pbuf_free(p);
+    if (c->upload_received >= c->content_length) {
+      upload_finish_ok(c);
+    }
   } else {
     // Already writing the response (or draining); discard any extra
     // bytes the client sent.
@@ -334,10 +402,6 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
   }
   return ERR_OK;
 }
-
-// Forward decls — defined alongside the listing / download handlers.
-static void stream_listing_drive(http_conn_t *c);
-static void stream_download_drive(http_conn_t *c);
 
 static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u16_t len) {
   (void)pcb;
@@ -482,6 +546,7 @@ static void __not_in_flash_func(parse_and_dispatch)(http_conn_t *c) {
         }
       } else if (strncasecmp_n(name, "Content-Length", 15) == 0) {
         c->content_length = (size_t)atoi(value);
+        c->has_content_length = true;
       } else if (strncasecmp_n(name, "Content-Type", 13) == 0) {
         // Match the media-type prefix; ignore any "; charset=..." tail.
         if (strncasecmp_n(value, "application/json", 16) == 0) {
@@ -545,6 +610,37 @@ static void __not_in_flash_func(parse_and_dispatch)(http_conn_t *c) {
 
   c->is_head = (c->method == HM_HEAD);
 
+  // Compute the body-segment bytes that fell after the headers in the
+  // same TCP segment. Used both by the upload streaming path (which
+  // writes them straight to the file) and by the generic JSON-body
+  // path (which buffers them into c->body).
+  char *body_start = p + 2;
+  size_t header_consumed_total = (size_t)(body_start - c->hdr);
+  size_t body_leftover = (c->hdr_len > header_consumed_total)
+                             ? c->hdr_len - header_consumed_total
+                             : 0;
+
+  // Special-case PUT-on-/api/v1/files/ for streaming upload — it
+  // bypasses the small JSON-body buffer (which has a 256-byte cap)
+  // and writes directly into FatFs as bytes arrive.
+  static const char files_prefix[] = "/api/v1/files/";
+  static const size_t files_prefix_len = sizeof(files_prefix) - 1;
+  if (c->method == HM_PUT &&
+      strncmp(c->path, files_prefix, files_prefix_len) == 0) {
+    size_t leftover = body_leftover;
+    if (leftover > c->content_length) leftover = c->content_length;
+    if (!handle_file_upload_init(c, body_start, leftover)) {
+      return;  // upload_init already wrote the error response
+    }
+    if (c->upload_received >= c->content_length) {
+      // Whole body already in the first segment (or Content-Length 0).
+      upload_finish_ok(c);
+      return;
+    }
+    c->state = HC_STREAM_UPLOAD;
+    return;
+  }
+
   // For body-bearing methods (POST, PUT) with Content-Length > 0, peel
   // any leftover bytes from the header buffer that fell after
   // \r\n\r\n into the body buffer, then transition to HC_READ_BODY
@@ -557,15 +653,11 @@ static void __not_in_flash_func(parse_and_dispatch)(http_conn_t *c) {
                   "Body too large for this route");
       return;
     }
-    // p points at the CRLF that ends the empty (terminator) line; the
-    // body starts two bytes later. The header parser nul-terminated
-    // each header it walked, so c->hdr_len is the original byte count
-    // we copied off the wire — anything past (p+2) is body.
-    char *body_start = p + 2;
-    size_t header_consumed = (size_t)(body_start - c->hdr);
-    size_t leftover = (c->hdr_len > header_consumed)
-                          ? c->hdr_len - header_consumed
-                          : 0;
+    // body_start / body_leftover were computed above. The header
+    // parser nul-terminated each header it walked but c->hdr_len is
+    // the original byte count copied off the wire, so anything past
+    // body_start is body that arrived in the same segment.
+    size_t leftover = body_leftover;
     if (leftover > c->content_length) leftover = c->content_length;
     if (leftover > 0) {
       memcpy(c->body, body_start, leftover);
@@ -1457,7 +1549,10 @@ static void __not_in_flash_func(handle_folder_delete)(http_conn_t *c, const char
   }
   fr = f_unlink(abs_path);
   if (fr == FR_DENIED) {
-    write_error(c, 409, "Conflict", "conflict", "Folder is not empty");
+    // FR_DENIED can mean: folder is non-empty, the target is locked
+    // open by another FIL, or the read-only attribute is set.
+    write_error(c, 409, "Conflict", "conflict",
+                "Folder is not empty, locked open, or read-only");
     return;
   }
   if (fr != FR_OK) {
@@ -1852,6 +1947,10 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
       f_close(&c->stream_file);
       c->stream_file_open = false;
     }
+    if (c->holds_body_lock) {
+      g_body_stream_busy = false;
+      c->holds_body_lock = false;
+    }
     c->state = HC_DRAINING;
     return;
   }
@@ -1859,6 +1958,214 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
   c->state = HC_STREAM_DOWNLOAD;
   // Pump first chunk(s) immediately.
   stream_download_drive(c);
+}
+
+// --- Streaming file upload (S6) ---
+//
+// PUT /api/v1/files/<rel>?overwrite=0|1 streams the body straight
+// into FatFs as bytes arrive. The init step is invoked from
+// parse_and_dispatch BEFORE the generic body-bearing block (whose
+// 256-byte buffer is too small for real uploads). After validation
+// and f_open, any leftover bytes from the same TCP segment as the
+// headers are written immediately, then the conn enters
+// HC_STREAM_UPLOAD and srv_recv_cb's upload branch keeps writing
+// each pbuf chunk to the file until Content-Length bytes are in.
+
+// Send the success response. Closes the FIL cleanly first so
+// conn_close's interrupted-upload cleanup path (which unlinks) does
+// NOT fire on success. If f_close fails we surface a 500 and unlink
+// the partial file — leaving the upload's lock entry in FatFs's
+// lock table (FF_FS_LOCK in ffconf.h) would block any future delete
+// or overwrite of the same name until the next power cycle.
+static void __not_in_flash_func(upload_finish_ok)(http_conn_t *c) {
+  FRESULT close_fr = FR_OK;
+  if (c->upload_file_open) {
+    close_fr = f_close(&c->upload_file);
+    c->upload_file_open = false;
+  }
+  if (c->holds_body_lock) {
+    g_body_stream_busy = false;
+    c->holds_body_lock = false;
+  }
+  if (close_fr != FR_OK) {
+    DPRINTF("http_server: upload f_close failed (%d)\n", (int)close_fr);
+    if (c->upload_abs[0] != '\0') {
+      f_unlink(c->upload_abs);
+    }
+    write_error(c, 500, "Internal Server Error", "disk_error",
+                "f_close failed; partial upload removed");
+    return;
+  }
+  uint32_t size = c->upload_received;
+  char body[200];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"path\":\"%s\",\"size\":%lu}\n",
+                   c->upload_norm, (unsigned long)size);
+  if (n < 0) n = 0;
+  if (c->upload_was_overwrite) {
+    write_response(c, 200, "OK", "application/json", body, (size_t)n);
+  } else {
+    char extra[256];
+    int en = snprintf(extra, sizeof(extra),
+                      "Location: /api/v1/files%s\r\n", c->upload_norm);
+    if (en < 0 || (size_t)en >= sizeof(extra)) extra[0] = '\0';
+    write_response_ex(c, 201, "Created", "application/json",
+                      (extra[0] != '\0') ? extra : NULL, body, (size_t)n);
+  }
+}
+
+// Validate path, parse query, open the file, write any leftover body
+// bytes that arrived in the same TCP segment as the headers. Returns
+// true on success (caller transitions to HC_STREAM_UPLOAD or, if the
+// upload was already complete after the leftover write, calls
+// upload_finish_ok); false means upload_init wrote the error response
+// itself and the caller should just return.
+static bool __not_in_flash_func(handle_file_upload_init)(
+    http_conn_t *c, const char *body_start, size_t leftover) {
+  // Single-streamer lock.
+  if (g_body_stream_busy) {
+    char body[160];
+    int n = snprintf(body, sizeof(body),
+                     "{\"ok\":false,\"code\":\"busy\","
+                     "\"message\":\"Another body request is in progress\"}\n");
+    if (n < 0) n = 0;
+    write_response_ex(c, 503, "Service Unavailable", "application/json",
+                      "Retry-After: 1\r\n", body, (size_t)n);
+    return false;
+  }
+
+  // Extract <rel> from /api/v1/files/<rel>; strip the trailing
+  // /rename action suffix (which is POST-only — PUT here is 405).
+  static const char prefix[] = "/api/v1/files/";
+  static const size_t prefix_len = sizeof(prefix) - 1;
+  const char *url_rel = c->path + prefix_len;
+  if (url_rel[0] == '\0') {
+    write_error(c, 404, "Not Found", "not_found", "Route not found");
+    return false;
+  }
+  size_t rel_len = strlen(url_rel);
+  if (rel_len > 7 &&
+      memcmp(url_rel + rel_len - 7, "/rename", 7) == 0) {
+    write_405(c, "POST");
+    return false;
+  }
+
+  // PUT requires Content-Length (chunked TE was already rejected).
+  if (!c->has_content_length) {
+    write_error(c, 411, "Length Required", "length_required",
+                "PUT requires Content-Length");
+    return false;
+  }
+  if (c->content_length > HTTP_MAX_UPLOAD_BYTES) {
+    write_error(c, 413, "Payload Too Large", "payload_too_large",
+                "Body exceeds 4 MB cap");
+    return false;
+  }
+
+  // Resolve and jail the path.
+  char norm[HTTP_PATH_BUF_BYTES];
+  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  norm_status_t s = resolve_pair(url_rel, norm, sizeof(norm), abs_path,
+                                 sizeof(abs_path));
+  if (s != NORM_OK) {
+    write_path_error(c, s);
+    return false;
+  }
+  if (strcmp(norm, "/") == 0) {
+    write_error(c, 409, "Conflict", "conflict", "Cannot PUT root");
+    return false;
+  }
+  norm_status_t v = validate_8_3_last(norm);
+  if (v != NORM_OK) {
+    write_path_error(c, v);
+    return false;
+  }
+
+  // Parse ?overwrite=0|1 (default 0).
+  bool overwrite = false;
+  if (c->query[0] != '\0') {
+    char ov[8];
+    if (query_get(c->query, "overwrite", ov, sizeof(ov))) {
+      if (strcmp(ov, "0") == 0) {
+        overwrite = false;
+      } else if (strcmp(ov, "1") == 0) {
+        overwrite = true;
+      } else {
+        write_error(c, 400, "Bad Request", "bad_query",
+                    "overwrite must be 0 or 1");
+        return false;
+      }
+    }
+  }
+
+  // Stat target. is_directory blocks PUT regardless of overwrite.
+  FILINFO info;
+  FRESULT fr = f_stat(abs_path, &info);
+  bool exists = (fr == FR_OK);
+  if (exists && finfo_is_dir(&info)) {
+    write_error(c, 409, "Conflict", "is_directory",
+                "Target path is a directory");
+    return false;
+  }
+  if (exists && !overwrite) {
+    write_error(c, 409, "Conflict", "conflict",
+                "File exists; pass ?overwrite=1 to replace");
+    return false;
+  }
+  if (fr != FR_OK && fr != FR_NO_FILE && fr != FR_NO_PATH) {
+    write_error(c, 500, "Internal Server Error", "disk_error",
+                "f_stat failed");
+    return false;
+  }
+
+  // Open for write. FA_CREATE_ALWAYS creates a new file or truncates.
+  fr = f_open(&c->upload_file, abs_path, FA_WRITE | FA_CREATE_ALWAYS);
+  if (fr == FR_NO_PATH) {
+    write_error(c, 404, "Not Found", "not_found",
+                "Parent folder does not exist");
+    return false;
+  }
+  if (fr != FR_OK) {
+    write_error(c, 500, "Internal Server Error", "disk_error",
+                "f_open failed");
+    return false;
+  }
+  c->upload_file_open = true;
+  c->upload_was_overwrite = exists;
+  c->upload_received = 0;
+  // Stash the canonical path for the response Location header.
+  size_t nlen = strlen(norm);
+  if (nlen >= sizeof(c->upload_norm)) nlen = sizeof(c->upload_norm) - 1;
+  memcpy(c->upload_norm, norm, nlen);
+  c->upload_norm[nlen] = '\0';
+  // Stash the absolute on-disk path for cleanup unlink on abort.
+  size_t alen = strlen(abs_path);
+  if (alen >= sizeof(c->upload_abs)) alen = sizeof(c->upload_abs) - 1;
+  memcpy(c->upload_abs, abs_path, alen);
+  c->upload_abs[alen] = '\0';
+
+  // Acquire body-stream lock — released by upload_finish_ok or
+  // conn_close.
+  g_body_stream_busy = true;
+  c->holds_body_lock = true;
+
+  // Write any leftover bytes that arrived in the same TCP segment as
+  // the headers.
+  if (leftover > 0) {
+    UINT written = 0;
+    fr = f_write(&c->upload_file, body_start, (UINT)leftover, &written);
+    if (fr != FR_OK || written != leftover) {
+      DPRINTF("http_server: upload leftover f_write failed (%d, %u/%zu)\n",
+              (int)fr, (unsigned)written, leftover);
+      // Close + unlink happens in conn_close. Surface the error to
+      // the client first.
+      write_error(c, 500, "Internal Server Error", "disk_error",
+                  "f_write failed");
+      return false;
+    }
+    c->upload_received = (uint32_t)leftover;
+  }
+  return true;
 }
 
 // --- File mutation handlers (S4) ---
@@ -1899,6 +2206,16 @@ static void __not_in_flash_func(handle_file_delete)(http_conn_t *c,
     return;
   }
   fr = f_unlink(abs_path);
+  if (fr == FR_DENIED) {
+    // FatFs returns FR_DENIED when the target is open elsewhere
+    // (e.g. GEMDRIVE on the ST side still holds it) or when its
+    // read-only attribute is set. Either way the client can do
+    // something about it (close the file, clear RO flag) so this is
+    // 409 conflict, not a 500.
+    write_error(c, 409, "Conflict", "conflict",
+                "File is open elsewhere or marked read-only");
+    return;
+  }
   if (fr != FR_OK) {
     write_error(c, 500, "Internal Server Error", "disk_error",
                 "f_unlink failed");

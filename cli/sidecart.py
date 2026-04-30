@@ -18,6 +18,7 @@ S1 ships only `ping`.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import sys
@@ -377,6 +378,109 @@ def cmd_get(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _split_host(host: str) -> tuple[str, int]:
+    """Parse host[:port] or http://host[:port]/. Default port = 80."""
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    host = host.rstrip("/")
+    if ":" in host:
+        h, p = host.rsplit(":", 1)
+        try:
+            return h, int(p)
+        except ValueError:
+            return host, DEFAULT_PORT
+    return host, DEFAULT_PORT
+
+
+def cmd_put(args: argparse.Namespace) -> int:
+    """PUT /api/v1/files/<remote>?overwrite=0|1 — stream LOCAL up.
+
+    Uses http.client.HTTPConnection so we can interleave a progress
+    counter with each chunk send (urllib.request would buffer up the
+    whole body before reading the response).
+    """
+    local = args.local
+    if not os.path.isfile(local):
+        print(f"error: local file not found: {local}", file=sys.stderr)
+        return EXIT_USAGE
+    remote = args.remote or os.path.basename(local)
+    if not remote:
+        print("error: cannot derive remote filename from local path",
+              file=sys.stderr)
+        return EXIT_USAGE
+
+    size = os.path.getsize(local)
+    encoded = urllib.parse.quote(remote.lstrip("/"), safe="/")
+    path = "/api/v1/files/" + encoded
+    if args.force:
+        path += "?overwrite=1"
+
+    host, port = _split_host(args.host)
+
+    raw = b""
+    status = 0
+    sent = 0
+    try:
+        conn = http.client.HTTPConnection(host, port,
+                                          timeout=REQUEST_TIMEOUT_S)
+        try:
+            conn.putrequest("PUT", path, skip_host=True,
+                            skip_accept_encoding=True)
+            conn.putheader("Host", f"{host}:{port}")
+            conn.putheader("User-Agent", USER_AGENT)
+            conn.putheader("Content-Type", "application/octet-stream")
+            conn.putheader("Content-Length", str(size))
+            conn.endheaders()
+
+            with open(local, "rb") as f:
+                while True:
+                    chunk = f.read(8192)
+                    if not chunk:
+                        break
+                    conn.send(chunk)
+                    sent += len(chunk)
+                    if not args.quiet:
+                        sys.stderr.write(
+                            f"\r{_format_progress(sent, size)}")
+                        sys.stderr.flush()
+            if not args.quiet:
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+
+            resp = conn.getresponse()
+            try:
+                raw = resp.read()
+                status = resp.status
+            finally:
+                resp.close()
+        finally:
+            conn.close()
+    except OSError as exc:
+        print(f"error: cannot reach {host}:{port}: {exc}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    parsed: dict | None = None
+    if raw:
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            parsed = None
+
+    success = (200 <= status < 300)
+    if not success:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        target = parsed.get("path") if parsed else remote
+        print(f"ok  {local} -> {target}  ({sent} bytes)")
+    return EXIT_OK
+
+
 def cmd_ls(args: argparse.Namespace) -> int:
     """GET /api/v1/files?path=PATH → print entries."""
     path = args.path or "/"
@@ -465,6 +569,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Local destination (default: basename of REMOTE).")
     get.add_argument("-r", "--resume", action="store_true",
                      help="Resume partial download via Range:.")
+    put = sub.add_parser("put", help="Upload a file.")
+    put.add_argument("local", help="Local file to upload.")
+    put.add_argument("remote", nargs="?", default=None,
+                     help="Remote destination (default: basename of LOCAL).")
+    put.add_argument("-f", "--force", action="store_true",
+                     help="Overwrite if the remote file exists.")
     return p
 
 
@@ -483,6 +593,7 @@ def main(argv: list[str] | None = None) -> int:
         "rm": cmd_rm,
         "mv": cmd_mv,
         "get": cmd_get,
+        "put": cmd_put,
     }
     handler = handlers.get(args.cmd)
     if handler is None:

@@ -571,6 +571,82 @@ class GetTests(unittest.TestCase):
         self.assertIn("range_invalid", err)
 
 
+class PutTests(unittest.TestCase):
+    """File upload via the `put` subcommand."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="sidecart-put-")
+        self.cwd = os.getcwd()
+        os.chdir(self.tmp)
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self) -> None:
+        os.chdir(self.cwd)
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _set_response(self, status: int, payload: dict | None) -> None:
+        body = json.dumps(payload).encode("utf-8") if payload is not None else b""
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def _write_local(self, name: str, data: bytes) -> None:
+        with open(name, "wb") as f:
+            f.write(data)
+
+    def test_put_201_create(self) -> None:
+        payload = b"\x01\x02\x03" * 1000  # 3 KB
+        self._write_local("up.bin", payload)
+        self._set_response(201, {"ok": True, "path": "/up.bin",
+                                 "size": len(payload)})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "-q", "put", "up.bin"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "PUT")
+        self.assertEqual(self.server.state.last_path, "/api/v1/files/up.bin")
+        self.assertEqual(
+            self.server.state.last_headers.get("Content-Type"),
+            "application/octet-stream")
+        self.assertEqual(
+            int(self.server.state.last_headers.get("Content-Length", "0")),
+            len(payload))
+        self.assertEqual(self.server.state.last_body, payload)
+
+    def test_put_force_adds_overwrite_query(self) -> None:
+        self._write_local("a.txt", b"hello")
+        self._set_response(200, {"ok": True, "path": "/a.txt", "size": 5})
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "-q", "put", "a.txt", "/a.txt", "-f"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("overwrite=1", self.server.state.last_path)
+        self.assertEqual(self.server.state.last_body, b"hello")
+
+    def test_put_409_conflict_no_force(self) -> None:
+        self._write_local("a.txt", b"hello")
+        self._set_response(409, {"ok": False, "code": "conflict",
+                                 "message": "File exists"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "-q", "put", "a.txt"])
+        self.assertEqual(code, sidecart.EXIT_CONFLICT)
+        self.assertIn("conflict", err)
+        # No overwrite query when --force is absent.
+        self.assertNotIn("overwrite=", self.server.state.last_path)
+
+    def test_put_503_busy(self) -> None:
+        self._write_local("a.txt", b"hello")
+        self._set_response(503, {"ok": False, "code": "busy",
+                                 "message": "Another upload in progress"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "-q", "put", "a.txt", "/a.txt", "-f"])
+        self.assertEqual(code, sidecart.EXIT_BUSY)
+        self.assertIn("busy", err)
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:
