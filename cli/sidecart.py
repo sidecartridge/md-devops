@@ -282,6 +282,101 @@ def cmd_mv(args: argparse.Namespace) -> int:
     return _do_mutation(args, "POST", url, body=body, headers=headers)
 
 
+def _format_progress(done: int, total: int) -> str:
+    if total > 0:
+        return f"{done // 1024} KB / {total // 1024} KB"
+    return f"{done // 1024} KB"
+
+
+def cmd_get(args: argparse.Namespace) -> int:
+    """GET /api/v1/files/<remote> → stream raw bytes to LOCAL."""
+    url = _files_url(args.host, args.remote)
+    local_path = args.local or os.path.basename(args.remote.rstrip("/"))
+    if not local_path:
+        print("error: cannot derive local filename from remote path",
+              file=sys.stderr)
+        return EXIT_USAGE
+
+    resume_offset = 0
+    if args.resume and os.path.exists(local_path):
+        resume_offset = os.path.getsize(local_path)
+
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/octet-stream"}
+    if resume_offset > 0:
+        headers["Range"] = f"bytes={resume_offset}-"
+
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        resp = urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S)
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read() if exc.fp is not None else b""
+        finally:
+            exc.close()
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            parsed = None
+        render_error(parsed, raw, exc.code)
+        return status_to_exit_code(exc.code)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    try:
+        # Total size for progress: prefer Content-Range (Range responses)
+        # else Content-Length.
+        total = 0
+        cr = resp.headers.get("Content-Range")
+        if cr and "/" in cr:
+            try:
+                total = int(cr.rsplit("/", 1)[1])
+            except ValueError:
+                total = 0
+        if not total:
+            try:
+                total = int(resp.headers.get("Content-Length", "0"))
+                if resume_offset > 0:
+                    total += resume_offset
+            except ValueError:
+                total = 0
+
+        mode = "ab" if resume_offset > 0 and resp.status == 206 else "wb"
+        # If we asked to resume but the server returned 200 (no Range
+        # support / range ignored), restart from scratch.
+        if mode == "ab" and resp.status != 206:
+            mode = "wb"
+            resume_offset = 0
+
+        done = resume_offset
+        chunk_size = 8192
+        with open(local_path, mode) as out:
+            while True:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if not args.quiet:
+                    sys.stderr.write(f"\r{_format_progress(done, total)}")
+                    sys.stderr.flush()
+        if not args.quiet:
+            # Newline after the progress line.
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+    finally:
+        resp.close()
+
+    if args.json:
+        json.dump({"ok": True, "path": args.remote, "local": local_path,
+                   "size": done},
+                  sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+    elif not args.quiet:
+        print(f"ok  {args.remote} -> {local_path}  ({done} bytes)")
+    return EXIT_OK
+
+
 def cmd_ls(args: argparse.Namespace) -> int:
     """GET /api/v1/files?path=PATH → print entries."""
     path = args.path or "/"
@@ -364,6 +459,12 @@ def build_parser() -> argparse.ArgumentParser:
     mv = sub.add_parser("mv", help="Rename or move a file.")
     mv.add_argument("from_", metavar="FROM", help="Source file path.")
     mv.add_argument("to", help="Destination file path.")
+    get = sub.add_parser("get", help="Download a file.")
+    get.add_argument("remote", help="File path on the SD card.")
+    get.add_argument("local", nargs="?", default=None,
+                     help="Local destination (default: basename of REMOTE).")
+    get.add_argument("-r", "--resume", action="store_true",
+                     help="Resume partial download via Range:.")
     return p
 
 
@@ -381,6 +482,7 @@ def main(argv: list[str] | None = None) -> int:
         "mvdir": cmd_mvdir,
         "rm": cmd_rm,
         "mv": cmd_mv,
+        "get": cmd_get,
     }
     handler = handlers.get(args.cmd)
     if handler is None:

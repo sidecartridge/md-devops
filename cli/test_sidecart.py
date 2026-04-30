@@ -478,6 +478,99 @@ class FileMutationTests(unittest.TestCase):
         self.assertIn("is_directory", err)
 
 
+class GetTests(unittest.TestCase):
+    """File download via the `get` subcommand."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+        # Each test uses its own working directory under tmp.
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="sidecart-get-")
+        self.cwd = os.getcwd()
+        os.chdir(self.tmp)
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self) -> None:
+        os.chdir(self.cwd)
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _set_octets(self, status: int, body: bytes,
+                    extra_headers: dict[str, str] | None = None) -> None:
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/octet-stream"}
+        if extra_headers:
+            self.server.state.next_headers.update(extra_headers)
+
+    def _set_json_error(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_get_full_download(self) -> None:
+        payload = b"A" * 5000
+        self._set_octets(200, payload)
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "-q", "get", "/foo.bin"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        with open("foo.bin", "rb") as f:
+            self.assertEqual(f.read(), payload)
+        self.assertEqual(self.server.state.last_method, "GET")
+        self.assertEqual(self.server.state.last_path,
+                         "/api/v1/files/foo.bin")
+
+    def test_get_local_override(self) -> None:
+        self._set_octets(200, b"hello")
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "-q", "get", "/foo.bin", "out.bin"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        with open("out.bin", "rb") as f:
+            self.assertEqual(f.read(), b"hello")
+
+    def test_get_resume_sends_range(self) -> None:
+        # Partial file already on disk: 100 bytes.
+        with open("foo.bin", "wb") as f:
+            f.write(b"X" * 100)
+        # Server responds 206 with the trailing slice.
+        slice_data = b"Y" * 50
+        self._set_octets(206, slice_data, {
+            "Content-Range": "bytes 100-149/150"})
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "-q", "get", "/foo.bin", "-r"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        # The CLI must have sent Range: bytes=100-.
+        self.assertEqual(
+            self.server.state.last_headers.get("Range"), "bytes=100-")
+        # Combined file: 100 X's + 50 Y's.
+        with open("foo.bin", "rb") as f:
+            self.assertEqual(f.read(), b"X" * 100 + b"Y" * 50)
+
+    def test_get_404(self) -> None:
+        self._set_json_error(404, {"ok": False, "code": "not_found",
+                                   "message": "File not found"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "-q", "get", "/missing"])
+        self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
+        self.assertIn("not_found", err)
+
+    def test_get_416_range_invalid(self) -> None:
+        # Resume request, but server says range is invalid.
+        with open("foo.bin", "wb") as f:
+            f.write(b"X" * 200)
+        self._set_json_error(416, {"ok": False, "code": "range_invalid",
+                                   "message": "Range outside file"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "-q", "get", "/foo.bin", "-r"])
+        # 416 falls into the "other 4xx" bucket = EXIT_BAD_REQUEST.
+        self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
+        self.assertIn("range_invalid", err)
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:

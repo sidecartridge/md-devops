@@ -56,6 +56,7 @@ typedef enum {
   HC_READ_BODY,
   HC_WRITE_RESPONSE,
   HC_STREAM_LISTING,
+  HC_STREAM_DOWNLOAD,
   HC_DRAINING,
 } hc_state_t;
 
@@ -104,11 +105,32 @@ typedef struct http_conn {
   bool stream_truncated;
   bool stream_body_done;  // closing envelope already emitted
   uint16_t stream_entry_count;
+
+  // Streaming file download state. Active while state ==
+  // HC_STREAM_DOWNLOAD; FIL handle released by conn_close().
+  FIL stream_file;
+  bool stream_file_open;
+  uint32_t stream_pos;       // next byte offset to read from file
+  uint32_t stream_end;       // one-past-last byte to send (file size or
+                             // Range slice end)
+  bool holds_body_lock;      // this conn holds the body-stream lock
+
+  // Range request state, populated during header parsing.
+  bool has_range;
+  bool range_invalid;        // syntactically present but unparseable
+  uint32_t range_start;
+  uint32_t range_end_inclusive;  // inclusive end byte (0xFFFFFFFF = open)
+  bool range_suffix;         // true if "bytes=-N" form
 } http_conn_t;
 
 static http_conn_t g_conns[HTTP_SERVER_MAX_CONNECTIONS];
 static struct tcp_pcb *g_listen_pcb = NULL;
 static absolute_time_t g_boot_time;
+
+// Body-stream lock. At most one in-flight upload (PUT) or streaming
+// GET download at a time; second body request returns 503 + Retry-
+// After: 1. Listing, ping, volume, mutations are NOT gated.
+static bool g_body_stream_busy = false;
 
 static http_conn_t *conn_alloc(void);
 static void conn_free(http_conn_t *c);
@@ -206,6 +228,14 @@ static void __not_in_flash_func(conn_close)(http_conn_t *c) {
   if (c->stream_dir_open) {
     f_closedir(&c->stream_dir);
     c->stream_dir_open = false;
+  }
+  if (c->stream_file_open) {
+    f_close(&c->stream_file);
+    c->stream_file_open = false;
+  }
+  if (c->holds_body_lock) {
+    g_body_stream_busy = false;
+    c->holds_body_lock = false;
   }
   if (c->pcb != NULL) {
     struct tcp_pcb *pcb = c->pcb;
@@ -305,8 +335,9 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
   return ERR_OK;
 }
 
-// Forward decl — defined alongside the listing handler below.
+// Forward decls — defined alongside the listing / download handlers.
 static void stream_listing_drive(http_conn_t *c);
+static void stream_download_drive(http_conn_t *c);
 
 static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u16_t len) {
   (void)pcb;
@@ -321,6 +352,8 @@ static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u1
   } else if (c->state == HC_STREAM_LISTING) {
     // Peer ack'd some bytes — keep pumping more chunks.
     stream_listing_drive(c);
+  } else if (c->state == HC_STREAM_DOWNLOAD) {
+    stream_download_drive(c);
   } else if (c->state == HC_DRAINING && c->stream_body_done) {
     // Streaming finished and the chunked terminator has now been
     // ack'd; safe to close.
@@ -453,6 +486,40 @@ static void __not_in_flash_func(parse_and_dispatch)(http_conn_t *c) {
         // Match the media-type prefix; ignore any "; charset=..." tail.
         if (strncasecmp_n(value, "application/json", 16) == 0) {
           c->content_type_json = true;
+        }
+      } else if (strncasecmp_n(name, "Range", 6) == 0) {
+        // Forms: "bytes=N-M" / "bytes=N-" / "bytes=-N". A comma in
+        // the value means a multi-range request, which we reject as
+        // 416 at handler time.
+        c->has_range = true;
+        c->range_invalid = false;
+        c->range_start = 0;
+        c->range_end_inclusive = 0xFFFFFFFFu;
+        c->range_suffix = false;
+        if (strncasecmp_n(value, "bytes=", 6) != 0) {
+          c->range_invalid = true;
+        } else {
+          const char *p2 = value + 6;
+          if (strchr(p2, ',') != NULL) {
+            c->range_invalid = true;
+          } else if (*p2 == '-') {
+            // Suffix form: last N bytes.
+            c->range_suffix = true;
+            c->range_start = (uint32_t)atoi(p2 + 1);
+            if (c->range_start == 0) c->range_invalid = true;
+          } else {
+            // Closed or open-ended form.
+            c->range_start = (uint32_t)atoi(p2);
+            const char *dash = strchr(p2, '-');
+            if (dash == NULL) {
+              c->range_invalid = true;
+            } else if (dash[1] == '\0') {
+              // bytes=N- → open ended.
+              c->range_end_inclusive = 0xFFFFFFFFu;
+            } else {
+              c->range_end_inclusive = (uint32_t)atoi(dash + 1);
+            }
+          }
         }
       }
     }
@@ -1543,6 +1610,257 @@ static void __not_in_flash_func(handle_folder_rename)(http_conn_t *c, const char
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
+// --- Streaming file download (S5) ---
+//
+// Body bytes are sent via tcp_write in chunks of up to ~1 KB driven
+// by tcp_sent acks. Content-Length is known up-front (file size or
+// Range slice length) so we use plain raw bytes — no chunked
+// transfer-encoding. Range is supported for resumable downloads.
+
+static void __not_in_flash_func(stream_download_drive)(http_conn_t *c) {
+  if (!c->stream_file_open || c->stream_pos >= c->stream_end) {
+    // Nothing left to send. Close once everything is acked.
+    if (c->stream_pos >= c->stream_end) {
+      c->state = HC_DRAINING;
+      if (c->stream_file_open) {
+        f_close(&c->stream_file);
+        c->stream_file_open = false;
+      }
+      conn_close(c);
+    }
+    return;
+  }
+
+  // Pump as many chunks as fit in the current send window.
+  while (c->stream_pos < c->stream_end) {
+    size_t free_b = (size_t)tcp_sndbuf(c->pcb);
+    if (free_b < 64) {
+      return;  // wait for next sent_cb
+    }
+    size_t want = c->stream_end - c->stream_pos;
+    if (want > sizeof(c->resp)) want = sizeof(c->resp);
+    if (want > free_b) want = free_b;
+
+    UINT got = 0;
+    FRESULT fr = f_read(&c->stream_file, c->resp, (UINT)want, &got);
+    if (fr != FR_OK || got == 0) {
+      DPRINTF("http_server: download f_read failed (%d, got=%u)\n",
+              (int)fr, (unsigned)got);
+      // Body partially sent already; can't write a JSON error. Just
+      // close the connection — client sees truncated stream.
+      conn_close(c);
+      return;
+    }
+    err_t err = tcp_write(c->pcb, c->resp, (u16_t)got, TCP_WRITE_FLAG_COPY);
+    if (err != ERR_OK) {
+      // Send buffer full or other error. f_read already advanced; we
+      // need to seek back so the next round re-reads those bytes.
+      f_lseek(&c->stream_file, c->stream_pos);
+      if (err == ERR_MEM) return;
+      conn_close(c);
+      return;
+    }
+    tcp_output(c->pcb);
+    c->stream_pos += got;
+  }
+}
+
+static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
+                                                      const char *url_rel) {
+  // Body-stream lock. A streaming GET counts as a body request; if
+  // another download or upload is already in flight, return 503.
+  if (g_body_stream_busy) {
+    char body[160];
+    int n = snprintf(body, sizeof(body),
+                     "{\"ok\":false,\"code\":\"busy\","
+                     "\"message\":\"Another body request is in progress\"}\n");
+    if (n < 0) n = 0;
+    write_response_ex(c, 503, "Service Unavailable", "application/json",
+                      "Retry-After: 1\r\n", body, (size_t)n);
+    return;
+  }
+
+  char norm[HTTP_PATH_BUF_BYTES];
+  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  norm_status_t s = resolve_pair(url_rel, norm, sizeof(norm), abs_path,
+                                 sizeof(abs_path));
+  if (s != NORM_OK) {
+    write_path_error(c, s);
+    return;
+  }
+  if (strcmp(norm, "/") == 0) {
+    write_error(c, 404, "Not Found", "not_found", "Path is root");
+    return;
+  }
+
+  FILINFO info;
+  FRESULT fr = f_stat(abs_path, &info);
+  if (fr == FR_NO_FILE || fr == FR_NO_PATH) {
+    write_error(c, 404, "Not Found", "not_found", "File not found");
+    return;
+  }
+  if (fr != FR_OK) {
+    write_error(c, 500, "Internal Server Error", "disk_error",
+                "f_stat failed");
+    return;
+  }
+  if (finfo_is_dir(&info)) {
+    write_error(c, 404, "Not Found", "is_directory",
+                "Path is a directory; use GET /api/v1/files?path=<rel> to list");
+    return;
+  }
+
+  uint32_t file_size = (uint32_t)info.fsize;
+
+  // Resolve Range against the file size.
+  uint32_t start = 0;
+  uint32_t end_inclusive = (file_size == 0) ? 0 : (file_size - 1);
+  bool partial = false;
+  if (c->has_range) {
+    if (c->range_invalid) {
+      char extra[64];
+      snprintf(extra, sizeof(extra), "Content-Range: bytes */%lu\r\n",
+               (unsigned long)file_size);
+      char body[200];
+      int bn = snprintf(body, sizeof(body),
+                        "{\"ok\":false,\"code\":\"range_invalid\","
+                        "\"message\":\"Bad Range header\"}\n");
+      if (bn < 0) bn = 0;
+      write_response_ex(c, 416, "Range Not Satisfiable", "application/json",
+                        extra, body, (size_t)bn);
+      return;
+    }
+    if (c->range_suffix) {
+      // Last N bytes (range_start holds N from "bytes=-N").
+      uint32_t n = c->range_start;
+      if (n == 0 || file_size == 0) {
+        char extra[64];
+        snprintf(extra, sizeof(extra), "Content-Range: bytes */%lu\r\n",
+                 (unsigned long)file_size);
+        write_error(c, 416, "Range Not Satisfiable", "range_invalid",
+                    "Suffix range exceeds file size");
+        return;
+      }
+      if (n > file_size) n = file_size;
+      start = file_size - n;
+      end_inclusive = file_size - 1;
+    } else {
+      start = c->range_start;
+      if (c->range_end_inclusive != 0xFFFFFFFFu &&
+          c->range_end_inclusive < file_size) {
+        end_inclusive = c->range_end_inclusive;
+      } else {
+        end_inclusive = (file_size == 0) ? 0 : (file_size - 1);
+      }
+    }
+    if (file_size == 0 || start >= file_size || start > end_inclusive) {
+      char extra[64];
+      snprintf(extra, sizeof(extra), "Content-Range: bytes */%lu\r\n",
+               (unsigned long)file_size);
+      char body[200];
+      int bn = snprintf(body, sizeof(body),
+                        "{\"ok\":false,\"code\":\"range_invalid\","
+                        "\"message\":\"Range outside file bounds\"}\n");
+      if (bn < 0) bn = 0;
+      write_response_ex(c, 416, "Range Not Satisfiable", "application/json",
+                        extra, body, (size_t)bn);
+      return;
+    }
+    partial = (start != 0) || (end_inclusive + 1 != file_size);
+  }
+
+  uint32_t send_len = (file_size == 0) ? 0 : (end_inclusive - start + 1);
+
+  // Open the file. Released on close (normal or aborted).
+  fr = f_open(&c->stream_file, abs_path, FA_READ);
+  if (fr != FR_OK) {
+    write_error(c, 500, "Internal Server Error", "disk_error",
+                "f_open failed");
+    return;
+  }
+  c->stream_file_open = true;
+  if (start > 0) {
+    fr = f_lseek(&c->stream_file, start);
+    if (fr != FR_OK) {
+      f_close(&c->stream_file);
+      c->stream_file_open = false;
+      write_error(c, 500, "Internal Server Error", "disk_error",
+                  "f_lseek failed");
+      return;
+    }
+  }
+
+  // Acquire body-stream lock.
+  g_body_stream_busy = true;
+  c->holds_body_lock = true;
+  c->stream_pos = start;
+  c->stream_end = (file_size == 0) ? 0 : (end_inclusive + 1);
+
+  // Build status line + headers in c->resp.
+  char extra[80];
+  if (partial) {
+    int en = snprintf(extra, sizeof(extra),
+                      "Content-Range: bytes %lu-%lu/%lu\r\n",
+                      (unsigned long)start, (unsigned long)end_inclusive,
+                      (unsigned long)file_size);
+    if (en < 0 || (size_t)en >= sizeof(extra)) extra[0] = '\0';
+  } else {
+    extra[0] = '\0';
+  }
+  int hn = snprintf(c->resp, sizeof(c->resp),
+                    "HTTP/1.1 %d %s\r\n"
+                    "Server: md-devops/%s\r\n"
+                    "Connection: close\r\n"
+                    "Accept-Ranges: bytes\r\n"
+                    "%s"
+                    "Content-Type: application/octet-stream\r\n"
+                    "Content-Length: %lu\r\n"
+                    "\r\n",
+                    partial ? 206 : 200,
+                    partial ? "Partial Content" : "OK", RELEASE_VERSION,
+                    extra, (unsigned long)send_len);
+  if (hn < 0 || (size_t)hn >= sizeof(c->resp)) {
+    conn_close(c);
+    return;
+  }
+  err_t err = tcp_write(c->pcb, c->resp, (u16_t)hn,
+                        TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE);
+  if (err != ERR_OK) {
+    conn_close(c);
+    return;
+  }
+
+  // HEAD: send headers, no body, close.
+  if (c->is_head) {
+    tcp_output(c->pcb);
+    if (c->stream_file_open) {
+      f_close(&c->stream_file);
+      c->stream_file_open = false;
+    }
+    if (c->holds_body_lock) {
+      g_body_stream_busy = false;
+      c->holds_body_lock = false;
+    }
+    conn_close(c);
+    return;
+  }
+
+  // Empty body — Content-Length: 0, no streaming round needed.
+  if (send_len == 0) {
+    tcp_output(c->pcb);
+    if (c->stream_file_open) {
+      f_close(&c->stream_file);
+      c->stream_file_open = false;
+    }
+    c->state = HC_DRAINING;
+    return;
+  }
+
+  c->state = HC_STREAM_DOWNLOAD;
+  // Pump first chunk(s) immediately.
+  stream_download_drive(c);
+}
+
 // --- File mutation handlers (S4) ---
 //
 // Mirror the folder routes but enforce that the resolved path is a
@@ -1854,13 +2172,16 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
       write_405(c, "POST");
       return;
     }
-    // S5 will add GET (download) and S6 will add PUT (upload). For
-    // now, only DELETE is handled here.
+    if (c->method == HM_GET || c->method == HM_HEAD) {
+      handle_file_download(c, rel);
+      return;
+    }
     if (c->method == HM_DELETE) {
       handle_file_delete(c, rel);
       return;
     }
-    write_405(c, "DELETE");
+    // S6 will add PUT (upload) here.
+    write_405(c, "GET, HEAD, DELETE");
     return;
   }
 
