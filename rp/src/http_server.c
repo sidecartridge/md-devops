@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "aconfig.h"
+#include "chandler.h"
 #include "debug.h"
 #include "display.h"
 #include "emul.h"
@@ -20,6 +21,11 @@
 #include "pico/time.h"
 #include "runner.h"
 #include "settings.h"
+
+// Cartridge shared-region mirror in RP RAM (memmap_rp.ld). Used by
+// the Runner endpoints to write path / cmdline buffers the m68k
+// Runner reads directly via cartridge bus.
+extern unsigned int __rom_in_ram_start__;
 
 // Per-conn response buffer. Sized to comfortably hold a full status
 // line + headers + the largest non-streaming body we emit. RAM is
@@ -1130,32 +1136,240 @@ static const char *runner_last_command_str(runner_last_command_t cmd) {
 // land in S3/S4.
 static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
   bool active = emul_isRunnerActive();
+  bool busy = emul_isRunnerBusy();
   const char *last_cmd = runner_last_command_str(emul_getRunnerLastCommand());
+  const char *last_path = emul_getRunnerLastPath();
+  int32_t exit_code = 0;
+  bool has_exit = emul_getRunnerLastExitCode(&exit_code);
+
   char last_started_buf[24];
   char last_finished_buf[24];
   if (last_cmd != NULL) {
     snprintf(last_started_buf, sizeof(last_started_buf), "%lu",
              (unsigned long)emul_getRunnerLastStartedMs());
-    snprintf(last_finished_buf, sizeof(last_finished_buf), "%lu",
-             (unsigned long)emul_getRunnerLastFinishedMs());
+    uint32_t finished = emul_getRunnerLastFinishedMs();
+    if (finished == 0) {
+      snprintf(last_finished_buf, sizeof(last_finished_buf), "null");
+    } else {
+      snprintf(last_finished_buf, sizeof(last_finished_buf), "%lu",
+               (unsigned long)finished);
+    }
   } else {
     snprintf(last_started_buf, sizeof(last_started_buf), "null");
     snprintf(last_finished_buf, sizeof(last_finished_buf), "null");
   }
-  char body[320];
+
+  char last_exit_buf[24];
+  if (has_exit) {
+    snprintf(last_exit_buf, sizeof(last_exit_buf), "%ld", (long)exit_code);
+  } else {
+    snprintf(last_exit_buf, sizeof(last_exit_buf), "null");
+  }
+
+  char body[400];
   int n = snprintf(
       body, sizeof(body),
-      "{\"ok\":true,\"active\":%s,\"busy\":false,\"cwd\":\"\","
-      "\"last_command\":%s%s%s,\"last_path\":null,"
-      "\"last_exit_code\":null,"
+      "{\"ok\":true,\"active\":%s,\"busy\":%s,\"cwd\":\"\","
+      "\"last_command\":%s%s%s,"
+      "\"last_path\":%s%s%s,"
+      "\"last_exit_code\":%s,"
       "\"last_started_at_ms\":%s,\"last_finished_at_ms\":%s}\n",
       active ? "true" : "false",
+      busy ? "true" : "false",
       (last_cmd != NULL) ? "\"" : "",
       (last_cmd != NULL) ? last_cmd : "null",
       (last_cmd != NULL) ? "\"" : "",
+      (last_path != NULL && last_path[0] != '\0') ? "\"" : "",
+      (last_path != NULL && last_path[0] != '\0') ? last_path : "null",
+      (last_path != NULL && last_path[0] != '\0') ? "\"" : "",
+      last_exit_buf,
       last_started_buf, last_finished_buf);
   if (n < 0) n = 0;
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
+// Forward decls for path-resolution helpers defined further down
+// (with the file-mutation handlers from S3-S4).
+static void write_path_error(http_conn_t *c, norm_status_t s);
+static norm_status_t resolve_pair(const char *url_rel, char *norm,
+                                  size_t norm_cap, char *abs,
+                                  size_t abs_cap);
+static bool finfo_is_dir(const FILINFO *info);
+
+// Runner sub-region writers. m68k can only READ the cartridge area;
+// the RP populates path / cmdline buffers in APP_FREE so the m68k
+// Runner can dereference them directly when it runs Pexec.
+static uint32_t __not_in_flash_func(runner_app_free_address)(void) {
+  return (uint32_t)&__rom_in_ram_start__ + CHANDLER_APP_FREE_OFFSET;
+}
+
+// Byte-pair-swapped write into the cartridge mirror. The bus
+// emulator presents 16-bit words to the m68k in BE order, so RP
+// little-endian byte-storage at offset 0,1 appears at m68k addr+1,+0
+// for byte reads. We pre-swap each pair so the m68k's byte reads
+// land in the right order. Same idea as writeAppFreeBytesSwapped in
+// gemdrive.c.
+static void __not_in_flash_func(runner_memcpy_swapped)(uint8_t *dst,
+                                                       const char *src,
+                                                       size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    dst[i ^ 1u] = (uint8_t)src[i];
+  }
+}
+
+static void __not_in_flash_func(runner_write_path)(const char *path) {
+  uint8_t *dst = (uint8_t *)(runner_app_free_address() + RUNNER_PATH_OFFSET);
+  size_t n = strlen(path);
+  if (n >= RUNNER_PATH_LEN - 1) n = RUNNER_PATH_LEN - 2;
+  // Zero the buffer first so any stale bytes don't leak through.
+  memset(dst, 0, RUNNER_PATH_LEN);
+  runner_memcpy_swapped(dst, path, n);
+  // NUL terminator at swapped offset for the (n)th byte.
+  dst[n ^ 1u] = '\0';
+}
+
+// TOS Pexec cmdline format: <u8 length><bytes...>, no NUL. The
+// length byte is BYTE 0; the m68k passes a pointer to this buffer
+// straight to GEMDOS Pexec. Same byte-pair swap as the path.
+static void __not_in_flash_func(runner_write_cmdline)(const char *cmdline) {
+  uint8_t *dst =
+      (uint8_t *)(runner_app_free_address() + RUNNER_CMDLINE_OFFSET);
+  size_t n = strlen(cmdline);
+  if (n > 127) n = 127;
+  memset(dst, 0, RUNNER_CMDLINE_LEN);
+  // Length byte at logical offset 0 → swapped offset 1.
+  dst[1] = (uint8_t)n;
+  // Payload bytes at logical offsets 1..n → each XOR'd with 1.
+  for (size_t i = 0; i < n; i++) {
+    dst[(1 + i) ^ 1u] = (uint8_t)cmdline[i];
+  }
+}
+
+// POST /api/v1/runner/run — Epic 03 / S3.
+//
+// JSON body: {"path": "<rel>", "cmdline": "<≤127>"}.
+// Validates active + not busy + path jailed under GEMDRIVE_FOLDER +
+// path exists + cmdline ≤127 chars. Writes path + cmdline into the
+// Runner sub-region of APP_FREE so the m68k can read them, marks
+// the Runner busy, fires RUNNER_CMD_EXECUTE on the cartridge
+// sentinel. The m68k's Pexec result is reported asynchronously via
+// the chandler RUNNER_CMD_DONE_EXECUTE callback (runner.c).
+static void __not_in_flash_func(handle_runner_run)(http_conn_t *c) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return;
+  }
+  if (emul_isRunnerBusy()) {
+    write_response_ex(c, 503, "Service Unavailable", "application/json",
+                      "Retry-After: 1\r\n",
+                      "{\"ok\":false,\"code\":\"busy\","
+                      "\"message\":\"Runner is busy with another command\"}\n",
+                      0);
+    return;
+  }
+  if (c->content_length == 0) {
+    write_error(c, 411, "Length Required", "length_required",
+                "JSON body required");
+    return;
+  }
+  if (!c->content_type_json) {
+    write_error(c, 415, "Unsupported Media Type", "unsupported_media",
+                "Content-Type must be application/json");
+    return;
+  }
+
+  char path[RUNNER_PATH_LEN];
+  json_status_t js = json_extract_string(c->body, c->body_received, "path",
+                                         path, sizeof(path));
+  if (js == JSON_BAD) {
+    write_error(c, 422, "Unprocessable Entity", "bad_json",
+                "Malformed JSON body");
+    return;
+  }
+  if (js != JSON_OK) {
+    write_error(c, 422, "Unprocessable Entity", "unprocessable",
+                "Missing or non-string `path` field");
+    return;
+  }
+
+  char cmdline[128] = {0};
+  js = json_extract_string(c->body, c->body_received, "cmdline", cmdline,
+                           sizeof(cmdline));
+  if (js == JSON_BAD) {
+    write_error(c, 422, "Unprocessable Entity", "bad_json",
+                "Malformed JSON body");
+    return;
+  }
+  // cmdline missing is fine — empty string by default.
+  if (js != JSON_OK) {
+    cmdline[0] = '\0';
+  }
+  if (strlen(cmdline) > 127) {
+    write_error(c, 400, "Bad Request", "bad_request",
+                "cmdline exceeds 127 chars");
+    return;
+  }
+
+  // Resolve and jail the path; ensure it exists and is a regular file.
+  char norm[HTTP_PATH_BUF_BYTES];
+  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  norm_status_t s = resolve_pair(path, norm, sizeof(norm), abs_path,
+                                 sizeof(abs_path));
+  if (s != NORM_OK) {
+    write_path_error(c, s);
+    return;
+  }
+  if (strcmp(norm, "/") == 0) {
+    write_error(c, 400, "Bad Request", "bad_path",
+                "Cannot execute root");
+    return;
+  }
+  FILINFO info;
+  FRESULT fr = f_stat(abs_path, &info);
+  if (fr == FR_NO_FILE || fr == FR_NO_PATH) {
+    write_error(c, 404, "Not Found", "not_found", "Program file not found");
+    return;
+  }
+  if (fr != FR_OK) {
+    write_error(c, 500, "Internal Server Error", "disk_error",
+                "f_stat failed");
+    return;
+  }
+  if (finfo_is_dir(&info)) {
+    write_error(c, 404, "Not Found", "is_directory",
+                "Path is a directory; cannot execute");
+    return;
+  }
+
+  // Translate the API-side normalised path (relative to
+  // GEMDRIVE_FOLDER, leading slash) into the Atari ST's view of
+  // drive C:. The m68k Runner passes this to Pexec; GEMDRIVE's trap
+  // hook handles "C:\..." paths.
+  char st_path[RUNNER_PATH_LEN];
+  // Convert "/SUB/PROG.TOS" -> "C:\SUB\PROG.TOS".
+  st_path[0] = 'C';
+  st_path[1] = ':';
+  size_t out = 2;
+  for (size_t i = 0; norm[i] != '\0' && out < sizeof(st_path) - 1; i++) {
+    char ch = norm[i];
+    st_path[out++] = (ch == '/') ? '\\' : ch;
+  }
+  st_path[out] = '\0';
+
+  // Stage path + cmdline into APP_FREE for the m68k.
+  runner_write_path(st_path);
+  runner_write_cmdline(cmdline);
+
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  emul_recordRunnerExecuteSubmit(norm, now_ms);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_CMD_EXECUTE);
+
+  char body[80];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"accepted\":true}\n");
+  if (n < 0) n = 0;
+  write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
 }
 
 // POST /api/v1/runner/reset — Epic 03 / S2.
@@ -2604,6 +2818,14 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
     if (strcmp(action, "reset") == 0) {
       if (c->method == HM_POST) {
         handle_runner_reset(c);
+        return;
+      }
+      write_405(c, "POST");
+      return;
+    }
+    if (strcmp(action, "run") == 0) {
+      if (c->method == HM_POST) {
+        handle_runner_run(c);
         return;
       }
       write_405(c, "POST");

@@ -95,9 +95,10 @@ static bool menuScreenActive = false;
 // Runner state owned RP-side (the m68k can't write to the cartridge
 // address space — read-only ROM emulation — so any handshake from
 // the Runner has to live in RP RAM). cmdRunner flips active when
-// the user picks [U] at boot; per-command handlers (S2 reset, later
-// S3 execute / S4 cd) update last_command and the started/finished
-// timestamps. GET /api/v1/runner surfaces this struct.
+// the user picks [U] at boot; per-command handlers update
+// last_command + timestamps; the runner_command_cb chandler hook
+// records exit codes when the m68k Runner reports DONE_EXECUTE.
+// GET /api/v1/runner surfaces this struct.
 //
 // Once active is set it stays set for the lifetime of the RP power
 // cycle: a `runner reset` cold-reboots the ST and auto-relaunches
@@ -106,15 +107,29 @@ static bool menuScreenActive = false;
 // scheduled relaunch is driven from the main loop via
 // runnerRelaunchAtMs.
 static bool runnerActive = false;
+static bool runnerBusy = false;
 static runner_last_command_t runnerLastCommand = RUNNER_LAST_NONE;
+static char runnerLastPath[RUNNER_PATH_LEN] = {0};
+static bool runnerLastHasExitCode = false;
+static int32_t runnerLastExitCode = 0;
 static uint32_t runnerLastStartedMs = 0;
 static uint32_t runnerLastFinishedMs = 0;
 static uint32_t runnerRelaunchAtMs = 0;  // 0 = no pending relaunch
 
 bool emul_isRunnerActive(void) { return runnerActive; }
+bool emul_isRunnerBusy(void) { return runnerBusy; }
 
 runner_last_command_t emul_getRunnerLastCommand(void) {
   return runnerLastCommand;
+}
+
+const char *emul_getRunnerLastPath(void) { return runnerLastPath; }
+
+bool emul_getRunnerLastExitCode(int32_t *out) {
+  if (runnerLastHasExitCode && out != NULL) {
+    *out = runnerLastExitCode;
+  }
+  return runnerLastHasExitCode;
 }
 
 uint32_t emul_getRunnerLastStartedMs(void) { return runnerLastStartedMs; }
@@ -124,6 +139,33 @@ void emul_recordRunnerCommand(runner_last_command_t cmd, uint32_t now_ms) {
   runnerLastCommand = cmd;
   runnerLastStartedMs = now_ms;
   runnerLastFinishedMs = now_ms;
+  runnerLastHasExitCode = false;
+  runnerLastExitCode = 0;
+  runnerLastPath[0] = '\0';
+}
+
+void emul_recordRunnerExecuteSubmit(const char *path, uint32_t now_ms) {
+  runnerLastCommand = RUNNER_LAST_EXECUTE;
+  runnerLastStartedMs = now_ms;
+  runnerLastFinishedMs = 0;  // not finished yet
+  runnerLastHasExitCode = false;
+  runnerLastExitCode = 0;
+  if (path != NULL) {
+    size_t n = strlen(path);
+    if (n >= sizeof(runnerLastPath)) n = sizeof(runnerLastPath) - 1;
+    memcpy(runnerLastPath, path, n);
+    runnerLastPath[n] = '\0';
+  } else {
+    runnerLastPath[0] = '\0';
+  }
+  runnerBusy = true;
+}
+
+void emul_recordRunnerExecuteDone(int32_t exit_code, uint32_t now_ms) {
+  runnerLastExitCode = exit_code;
+  runnerLastHasExitCode = true;
+  runnerLastFinishedMs = now_ms;
+  runnerBusy = false;
 }
 
 void emul_scheduleRunnerRelaunch(uint32_t at_ms) {
@@ -971,6 +1013,11 @@ void emul_start() {
   // (or screen_base - 8 KB by default) and publishes them via shared
   // variables before send_sync's random-token ack returns to the m68k.
   gemdrive_init();
+
+  // Register the Runner's chandler callback — receives
+  // RUNNER_CMD_DONE_EXECUTE (and future report-back commands) the
+  // m68k Runner publishes via send_sync.
+  runner_init();
 
   // After this point, the remote computer can execute the code
 

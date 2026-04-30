@@ -33,6 +33,13 @@ void emul_start();
 bool emul_isRunnerActive(void);
 
 /**
+ * @brief Whether a Runner command is in flight (only EXECUTE for
+ *        now). Cleared by emul_recordRunnerExecuteDone when the
+ *        runner_command_cb chandler hook receives RUNNER_CMD_DONE.
+ */
+bool emul_isRunnerBusy(void);
+
+/**
  * @brief Most-recent Runner command the RP submitted (for
  *        GET /api/v1/runner). Returns RUNNER_LAST_NONE if no
  *        Runner command has been issued in this boot.
@@ -40,19 +47,48 @@ bool emul_isRunnerActive(void);
 runner_last_command_t emul_getRunnerLastCommand(void);
 
 /**
+ * @brief Last submitted EXECUTE path (canonical normalised form).
+ *        Empty string if last command wasn't an EXECUTE.
+ */
+const char *emul_getRunnerLastPath(void);
+
+/**
+ * @brief Last EXECUTE exit code, if available. Returns true and
+ *        writes the i32 into *out when an exit code has been
+ *        recorded by emul_recordRunnerExecuteDone(); false (and
+ *        leaves *out untouched) if not.
+ */
+bool emul_getRunnerLastExitCode(int32_t *out);
+
+/**
  * @brief Timestamps (RP uptime ms) for the most-recent Runner
  *        command's submit / completion edges. RUNNER_RESET sets both
  *        to the same value (the m68k can't reply — the machine is
- *        rebooting).
+ *        rebooting). EXECUTE leaves finished=0 until DONE arrives.
  */
 uint32_t emul_getRunnerLastStartedMs(void);
 uint32_t emul_getRunnerLastFinishedMs(void);
 
 /**
- * @brief Record a Runner command submission. Sets last_command and
- *        the started/finished timestamps to now_ms.
+ * @brief Record a fire-and-forget Runner command (RESET). Sets
+ *        last_command and started/finished timestamps to now_ms,
+ *        clears any prior exit code / path.
  */
 void emul_recordRunnerCommand(runner_last_command_t cmd, uint32_t now_ms);
+
+/**
+ * @brief Record an EXECUTE submission. Sets last_command=EXECUTE,
+ *        last_path, started_at_ms; flags busy=true; clears any
+ *        prior exit code; finished_at_ms stays 0 until DONE.
+ */
+void emul_recordRunnerExecuteSubmit(const char *path, uint32_t now_ms);
+
+/**
+ * @brief Record an EXECUTE completion (RUNNER_CMD_DONE_EXECUTE on
+ *        the chandler protocol). Stores exit_code, finished_at_ms,
+ *        clears busy.
+ */
+void emul_recordRunnerExecuteDone(int32_t exit_code, uint32_t now_ms);
 
 /**
  * @brief Schedule an automatic re-launch of Runner mode. After

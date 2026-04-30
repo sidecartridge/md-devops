@@ -386,6 +386,14 @@ runner_function:
 
 ; Shared functions included at the end of the file
 ; Don't forget to include the macros for the shared functions at the top of file
+;
+; Export send_sync_command_to_sidecart so runner.s' send_sync macro
+; (which lives in a separate object) can `bsr` to this single copy
+; via vlink. gemdrive.s has its OWN private copy because it's
+; relocated to RAM and the BSR must land in the relocated blob; the
+; Runner runs in place from cartridge ROM, so a cross-module BSR
+; back into main.o resolves fine.
+    xdef send_sync_command_to_sidecart
     include "inc/sidecart_functions.s"
 
 

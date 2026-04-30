@@ -46,13 +46,27 @@
 // poll loop reads and acts on it.
 #define APP_RUNNER 0x0500
 #define RUNNER_CMD_RESET (APP_RUNNER + 0x01)  // cold reset
+#define RUNNER_CMD_EXECUTE (APP_RUNNER + 0x02)  // Pexec mode 0
+
+// m68k -> RP report commands (sent via send_sync from the Runner).
+// High bit set so they don't collide with the RP -> m68k sentinel
+// command IDs above.
+#define RUNNER_CMD_DONE_EXECUTE (APP_RUNNER + 0x82)  // payload: i32 exit code
 
 // RP-side state machine mirror. cmdRunner sets ACTIVE; per-command
 // handlers update last_command. Used by GET /api/v1/runner.
 typedef enum {
   RUNNER_LAST_NONE = 0,
   RUNNER_LAST_RESET = 1,
-  // S3/S4: RUNNER_LAST_EXECUTE, RUNNER_LAST_CD.
+  RUNNER_LAST_EXECUTE = 2,
+  // S4: RUNNER_LAST_CD.
 } runner_last_command_t;
+
+/**
+ * @brief Register the Runner's chandler callback for m68k → RP
+ *        report-back commands (RUNNER_CMD_DONE_EXECUTE etc.).
+ *        Called once at boot from emul_start().
+ */
+void runner_init(void);
 
 #endif  // RUNNER_H

@@ -58,15 +58,70 @@ RUNNER_PROTO_VERSION		equ $00010001	; min=1, max=1
 CMD_NOP				equ 0
 APP_RUNNER			equ $0500
 RUNNER_CMD_RESET		equ ($01 + APP_RUNNER)	; cold reset
-; Future: RUNNER_CMD_EXECUTE, RUNNER_CMD_CD in S3/S4.
+RUNNER_CMD_EXECUTE		equ ($02 + APP_RUNNER)	; Pexec mode 0
+; m68k -> RP report commands (sent via send_sync from the Runner).
+RUNNER_CMD_DONE_EXECUTE		equ ($82 + APP_RUNNER)	; payload: i32 exit code
 
 ; Wait between the RUNNER_RESET sentinel sighting and the actual
 ; reset trampoline — gives any in-flight cartridge bus traffic time
 ; to drain. Mirrors main.s' PRE_RESET_WAIT.
 PRE_RESET_WAIT			equ $FFFFF
 
+; Constants required by inc/sidecart_macros.s when send_sync expands.
+; main.s defines these too; we need our own local copies because
+; runner.s is its own assembly unit.
+RANDOM_TOKEN_ADDR		equ $FA2004
+RANDOM_TOKEN_SEED_ADDR		equ $FA2008
+RANDOM_TOKEN_POST_WAIT		equ $1
+ROMCMD_START_ADDR		equ $FB0000
+CMD_MAGIC_NUMBER		equ $ABCD
+CMD_RETRIES_COUNT		equ 3
+CMD_SET_SHARED_VAR		equ 1
+COMMAND_TIMEOUT			equ $0000FFFF
+COMMAND_WRITE_TIMEOUT		equ COMMAND_TIMEOUT
+_dskbufp			equ $4C6
+
 ; GEMDOS / XBIOS opcodes used here.
 GEMDOS_Cconws			equ 9
+GEMDOS_Dsetdrv			equ $E
+GEMDOS_Pexec			equ $4B
+PE_LOAD_GO			equ 0	; Pexec mode 0: load + go, returns
+
+; Shared-variable slot 12 (drive number) is published by the RP-side
+; handleGemdriveHello during gemdrive_init. The m68k's TOS process was
+; created at GEMDOS init time — *before* install_entry ran — so its
+; current drive was inherited from the boot ROM's _bootdev (typically
+; A:), not from the value install_entry later wrote. The Runner forces
+; a Dsetdrv to the emulated drive before Pexec so gemdrive's
+; .Pexec/detect_emulated_drive macro sees a current drive that matches
+; SHARED_VAR_DRIVE_NUMBER and stays on the GEMDRIVE-handled path
+; instead of chaining to TOS native (which would EFILNF on C:\).
+SHARED_VARIABLES_ADDR		equ $FA2010
+SHARED_VAR_DRIVE_NUMBER		equ 12
+DRIVE_NUMBER_ADDR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_DRIVE_NUMBER*4)
+
+; main.s' send_sync_command_to_sidecart lives ~6 KB away from this
+; module's BSR sites; that fits BSR.W's ±32 KB range, but vlink emits
+; an absolute relocation for cross-module references and tries to
+; squeeze the 32-bit absolute address into the BSR.W's 16-bit slot,
+; which fails. Substitute a private send_sync macro that uses JSR
+; (absolute long) instead — same semantics, just 4 bytes more per
+; call site.
+	xref	send_sync_command_to_sidecart
+
+runner_send_sync	macro
+	move.w	#CMD_RETRIES_COUNT, d7
+.\@retry:
+	movem.l	d1-d7, -(sp)
+	moveq.l	#\2, d1
+	move.w	#\1, d0
+	jsr	send_sync_command_to_sidecart
+	movem.l	(sp)+, d1-d7
+	tst.w	d0
+	beq.s	.\@ok
+	dbf	d7, .\@retry
+.\@ok:
+	endm
 
 ; ---------------------------------------------------------------
 ; Entry point — offset 0 of the runner blob. Reached via
@@ -104,14 +159,91 @@ runner_entry:
 runner_poll_loop:
 	move.l	CMD_MAGIC_SENTINEL_ADDR, d6
 	cmp.l	#RUNNER_CMD_RESET, d6
-	beq.s	runner_reset
+	beq	runner_reset
+	cmp.l	#RUNNER_CMD_EXECUTE, d6
+	beq	runner_execute
 	bra.s	runner_poll_loop
+
+; RUNNER_CMD_EXECUTE handler. Reads RUNNER_PATH (NUL-terminated) and
+; RUNNER_CMDLINE (TOS length-prefixed) from the Runner sub-region of
+; APP_FREE, then calls GEMDOS Pexec mode 0 (load + go). On return,
+; the program's exit code is in d0; we ship it to the RP via
+; send_sync RUNNER_CMD_DONE_EXECUTE so the RP can update its state
+; struct (last_exit_code, busy=false). Then resume polling.
+runner_execute:
+	; Trace: "[RUN  ] - Launching <path>\r\n". Cconws clobbers d0/d1/d2/a0-a2,
+	; but we haven't called Pexec yet so no exit code to preserve.
+	pea	text_run(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+	pea	RUNNER_PATH.l
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+	pea	text_crlf(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+
+	; Switch the m68k's current drive to the GEMDRIVE-emulated one so
+	; gemdrive's .Pexec drive-detection macro recognises this Pexec
+	; as belonging to the emulated drive and dispatches via
+	; CMD_PEXEC_CALL. See comment near DRIVE_NUMBER_ADDR above.
+	move.l	DRIVE_NUMBER_ADDR, d3
+	move.w	d3, -(sp)
+	move.w	#GEMDOS_Dsetdrv, -(sp)
+	trap	#1
+	addq.l	#4, sp
+
+	; Pexec stack frame (top-down after pushes):
+	;   [sp+0]   .w  GEMDOS function code ($4B)
+	;   [sp+2]   .w  mode (0 = PE_LOAD_GO)
+	;   [sp+4]   .l  fname (path)
+	;   [sp+8]   .l  cmdline
+	;   [sp+12]  .l  envstring (NULL = inherit)
+	clr.l	-(sp)			; envstring = NULL (inherit)
+	move.l	#RUNNER_CMDLINE, -(sp)	; cmdline pointer (TOS-format, length-prefixed)
+	move.l	#RUNNER_PATH, -(sp)	; fname pointer (NUL-terminated)
+	move.w	#PE_LOAD_GO, -(sp)
+	move.w	#GEMDOS_Pexec, -(sp)
+	trap	#1
+	lea	16(sp), sp
+
+	; Stash exit code on the stack — Cconws below will trash d0.
+	move.l	d0, -(sp)
+
+	; Trace: "[EXIT ] - <path> terminated\r\n".
+	pea	text_exit(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+	pea	RUNNER_PATH.l
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+	pea	text_terminated(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+
+	; Recover exit code and ship it to the RP.
+	move.l	(sp)+, d3
+	runner_send_sync RUNNER_CMD_DONE_EXECUTE, 4
+	bra	runner_poll_loop
 
 ; Cold reset — same sequence as main.s' .reset. Waits briefly,
 ; invalidates TOS' memory-system "valid" cookies (so the next boot
 ; rebuilds RAM tables instead of trusting stale ones), then jumps
 ; through the reset vector at $00000004.
 runner_reset:
+	; Trace before the wait so the user sees something even if the
+	; reset itself takes a moment.
+	pea	text_reset(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+
 	move.l	#PRE_RESET_WAIT, d6
 .runner_reset_wait:
 	subq.l	#1, d6
@@ -134,10 +266,29 @@ vt52_clear:
 
 banner_text:
 	dc.b	13, 10
-	dc.b	"  DevOps Runner ", 13, 10
-	dc.b	"  -----------------------------------", 13, 10
-	dc.b	"  [Ready] - waiting for commands", 13, 10
+	dc.b	"DevOps Runner ", 13, 10
+	dc.b	"---------------------------------------", 13, 10
+	dc.b	"[READY] - Waiting for commands", 13, 10
 	dc.b	0
+	even
+
+; Per-command trace strings. Cconws prints these alongside the path
+; (read straight from RUNNER_PATH in APP_FREE) so the operator can see
+; on the ST screen exactly which command landed and which program ran.
+text_reset:
+	dc.b	13, 10, "[RESET] - Received Cold Reset command", 13, 10, 0
+	even
+text_run:
+	dc.b	13, 10, "[RUN  ] - Launching ", 0
+	even
+text_exit:
+	dc.b	13, 10, "[EXIT ] - ", 0
+	even
+text_terminated:
+	dc.b	" terminated", 13, 10, 0
+	even
+text_crlf:
+	dc.b	13, 10, 0
 	even
 
 ; Trailing sentinel: keeps the cartridge-image last-non-zero-byte on

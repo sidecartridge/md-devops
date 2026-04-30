@@ -422,6 +422,33 @@ def _split_host(host: str) -> tuple[str, int]:
     return host, DEFAULT_PORT
 
 
+def cmd_runner_run(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/run — fire-and-forget Pexec."""
+    cmdline = " ".join(args.cmdline) if args.cmdline else ""
+    body_json = {"path": args.remote, "cmdline": cmdline}
+    body = json.dumps(body_json, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    url = base_url(args.host) + "/api/v1/runner/run"
+    try:
+        status, parsed, raw = request_json(
+            "POST", url, body=body, headers=headers)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 202:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        print(f"ok  EXECUTE {args.remote} sent")
+    return EXIT_OK
+
+
 def cmd_runner_reset(args: argparse.Namespace) -> int:
     """POST /api/v1/runner/reset — fire-and-forget cold reset."""
     url = base_url(args.host) + "/api/v1/runner/reset"
@@ -674,6 +701,13 @@ def build_parser() -> argparse.ArgumentParser:
     runner_sub = runner.add_subparsers(dest="runner_cmd", required=True)
     runner_sub.add_parser("status", help="Show Runner state and last completion.")
     runner_sub.add_parser("reset", help="Cold-reset the Atari ST.")
+    run_p = runner_sub.add_parser(
+        "run", help="Run a .TOS / .PRG on the Atari ST.")
+    run_p.add_argument("remote", help="Path to the program (relative to GEMDRIVE_FOLDER).")
+    run_p.add_argument("cmdline", nargs=argparse.REMAINDER,
+                       help="Command-line arguments (joined with spaces, ≤127 chars). "
+                            "Everything after REMOTE is captured verbatim, including "
+                            "leading dashes — no need for --.")
     return p
 
 
@@ -698,6 +732,7 @@ def main(argv: list[str] | None = None) -> int:
         runner_handlers = {
             "status": cmd_runner_status,
             "reset": cmd_runner_reset,
+            "run": cmd_runner_run,
         }
         handler = runner_handlers.get(args.runner_cmd)
         if handler is None:

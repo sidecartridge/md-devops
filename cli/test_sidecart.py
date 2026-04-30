@@ -734,6 +734,59 @@ class RunnerResetTests(unittest.TestCase):
         self.assertIn("runner_inactive", err)
 
 
+class RunnerRunTests(unittest.TestCase):
+    """Epic 03 / S3 — `sidecart runner run`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_run_202_no_cmdline(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "run", "/PROG.TOS"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path,
+                         "/api/v1/runner/run")
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body["path"], "/PROG.TOS")
+        self.assertEqual(body["cmdline"], "")
+        self.assertIn("EXECUTE", out)
+
+    def test_runner_run_202_with_cmdline(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "run",
+             "/PROG.TOS", "-v", "--file", "foo.txt"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body["cmdline"], "-v --file foo.txt")
+
+    def test_runner_run_503_busy(self) -> None:
+        self._set_response(503, {"ok": False, "code": "busy",
+                                 "message": "Runner busy"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "run", "/PROG.TOS"])
+        self.assertEqual(code, sidecart.EXIT_BUSY)
+        self.assertIn("busy", err)
+
+    def test_runner_run_404_not_found(self) -> None:
+        self._set_response(404, {"ok": False, "code": "not_found",
+                                 "message": "Program file not found"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "run", "/MISSING.TOS"])
+        self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
+        self.assertIn("not_found", err)
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:
