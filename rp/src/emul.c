@@ -1026,9 +1026,15 @@ void emul_start() {
         }
         network_setPollingCallback(NULL);
 
-        // Start the Remote HTTP Management API (Epic 02). Idempotent —
-        // safe even if the connect attempts above all timed out; the
-        // server will simply have no clients until Wi-Fi recovers.
+        // Remote HTTP Management API (Epic 02). Started right after
+        // Wi-Fi association so it's reachable from the menu phase.
+        // Earlier builds deferred this to firmware launch because of
+        // an ST-side crash; that turned out to be RAM pressure (the
+        // per-conn pool was 47 KB of BSS, pushing the heap into the
+        // ROM-in-RAM region). After shrinking the pool to ~5 KB and
+        // moving every http_server function to RAM via
+        // __not_in_flash_func, running the server during the menu
+        // is safe. Idempotent — safe even if Wi-Fi connect timed out.
         http_server_init();
       }
     } else {

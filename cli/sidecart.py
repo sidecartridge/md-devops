@@ -202,6 +202,66 @@ def cmd_volume(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _folders_url(host: str, remote: str) -> str:
+    """Build /api/v1/folders/<remote>, URL-encoding everything except '/'."""
+    encoded = urllib.parse.quote(remote.lstrip("/"), safe="/")
+    return base_url(host) + "/api/v1/folders/" + encoded
+
+
+def _do_mutation(args: argparse.Namespace, method: str, url: str,
+                 body: bytes | None,
+                 headers: dict[str, str] | None) -> int:
+    """Shared scaffolding for write subcommands: send the request, map
+    response to exit code, render JSON or human output."""
+    try:
+        status, parsed, raw = request_json(method, url, body=body,
+                                           headers=headers)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    # Successful no-content responses (204 delete) return empty raw.
+    success = (200 <= status < 300)
+    if not success:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+        else:
+            sys.stdout.write("{}\n")
+    elif not args.quiet:
+        if parsed and "path" in parsed:
+            print(f"ok  {parsed['path']}")
+        elif parsed and "from" in parsed and "to" in parsed:
+            print(f"ok  {parsed['from']} -> {parsed['to']}")
+        else:
+            print("ok")
+    return EXIT_OK
+
+
+def cmd_mkdir(args: argparse.Namespace) -> int:
+    """POST /api/v1/folders/<remote>."""
+    url = _folders_url(args.host, args.remote)
+    return _do_mutation(args, "POST", url, body=None, headers=None)
+
+
+def cmd_rmdir(args: argparse.Namespace) -> int:
+    """DELETE /api/v1/folders/<remote>."""
+    url = _folders_url(args.host, args.remote)
+    return _do_mutation(args, "DELETE", url, body=None, headers=None)
+
+
+def cmd_mvdir(args: argparse.Namespace) -> int:
+    """POST /api/v1/folders/<from>/rename body {'to': '<to>'}."""
+    url = _folders_url(args.host, args.from_) + "/rename"
+    body = json.dumps({"to": args.to}, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    return _do_mutation(args, "POST", url, body=body, headers=headers)
+
+
 def cmd_ls(args: argparse.Namespace) -> int:
     """GET /api/v1/files?path=PATH → print entries."""
     path = args.path or "/"
@@ -271,6 +331,14 @@ def build_parser() -> argparse.ArgumentParser:
     ls = sub.add_parser("ls", help="List a folder on the SD card.")
     ls.add_argument("path", nargs="?", default="/",
                     help="Folder path (default: /).")
+    mkdir = sub.add_parser("mkdir", help="Create a folder.")
+    mkdir.add_argument("remote", help="Folder path on the SD card.")
+    rmdir = sub.add_parser("rmdir", help="Delete an empty folder.")
+    rmdir.add_argument("remote", help="Folder path on the SD card.")
+    mvdir = sub.add_parser("mvdir", help="Rename or move a folder.")
+    mvdir.add_argument("from_", metavar="FROM",
+                       help="Source folder path.")
+    mvdir.add_argument("to", help="Destination folder path.")
     return p
 
 
@@ -283,6 +351,9 @@ def main(argv: list[str] | None = None) -> int:
         "ping": cmd_ping,
         "volume": cmd_volume,
         "ls": cmd_ls,
+        "mkdir": cmd_mkdir,
+        "rmdir": cmd_rmdir,
+        "mvdir": cmd_mvdir,
     }
     handler = handlers.get(args.cmd)
     if handler is None:

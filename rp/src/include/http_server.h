@@ -17,14 +17,16 @@
 
 #define HTTP_SERVER_PORT 80
 
-// Per-connection request header buffer cap. Spec says ≤ 4 KB; we use
-// 2 KB which is comfortably above realistic curl traffic and saves
-// 8 KB across the four-connection pool.
-#define HTTP_HEADER_BUF_BYTES 2048
+// Per-connection request header buffer cap. RAM is at a premium —
+// the cartridge ROM mirror lives in the same SRAM bank as the heap,
+// so every extra BSS byte shrinks safe heap headroom. 1 KB still
+// covers real-world curl headers comfortably.
+#define HTTP_HEADER_BUF_BYTES 1024
 
-// Maximum concurrent connections. Clamped by lwIP's MEMP_NUM_TCP_PCB
-// (4) regardless of what we set here.
-#define HTTP_SERVER_MAX_CONNECTIONS 4
+// Maximum concurrent connections. Two is enough for a single-user
+// management API; any more and the static pool starts pushing the
+// heap into the ROM-in-RAM region.
+#define HTTP_SERVER_MAX_CONNECTIONS 2
 
 /**
  * @brief Bind the listener and start accepting connections.

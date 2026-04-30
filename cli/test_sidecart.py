@@ -311,6 +311,99 @@ class LsTests(unittest.TestCase):
         self.assertIn("is_file", err)
 
 
+class FolderMutationTests(unittest.TestCase):
+    """Folder create / delete / rename via mkdir / rmdir / mvdir."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict | None) -> None:
+        body = json.dumps(payload).encode("utf-8") if payload is not None else b""
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+
+    # mkdir ----------------------------------------------------------
+
+    def test_mkdir_201(self) -> None:
+        self._set_response(201, {"ok": True, "path": "/sub"})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "mkdir", "/sub"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path, "/api/v1/folders/sub")
+        self.assertIn("/sub", out)
+
+    def test_mkdir_409_conflict(self) -> None:
+        self._set_response(409, {"ok": False, "code": "conflict",
+                                 "message": "Folder already exists"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "mkdir", "/sub"])
+        self.assertEqual(code, sidecart.EXIT_CONFLICT)
+        self.assertIn("conflict", err)
+
+    def test_mkdir_400_name_too_long(self) -> None:
+        self._set_response(400, {"ok": False, "code": "name_too_long",
+                                 "message": "Stem > 8 chars"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "mkdir", "/longerthan8"])
+        self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
+        self.assertIn("name_too_long", err)
+
+    # rmdir ----------------------------------------------------------
+
+    def test_rmdir_204(self) -> None:
+        # 204 No Content — empty body, no JSON.
+        self._set_response(204, None)
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "rmdir", "/sub"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "DELETE")
+        self.assertEqual(self.server.state.last_path, "/api/v1/folders/sub")
+        self.assertIn("ok", out)
+
+    def test_rmdir_409_not_empty(self) -> None:
+        self._set_response(409, {"ok": False, "code": "conflict",
+                                 "message": "Folder is not empty"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "rmdir", "/sub"])
+        self.assertEqual(code, sidecart.EXIT_CONFLICT)
+        self.assertIn("not empty", err)
+
+    def test_rmdir_404_is_file(self) -> None:
+        self._set_response(404, {"ok": False, "code": "is_file",
+                                 "message": "Path is a file"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "rmdir", "/foo.txt"])
+        self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
+        self.assertIn("is_file", err)
+
+    # mvdir ----------------------------------------------------------
+
+    def test_mvdir_200(self) -> None:
+        self._set_response(200, {"ok": True, "from": "/old", "to": "/new"})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "mvdir", "/old", "/new"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path,
+                         "/api/v1/folders/old/rename")
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body, {"to": "/new"})
+        self.assertEqual(
+            self.server.state.last_headers.get("Content-Type"),
+            "application/json")
+        self.assertIn("/old -> /new", out)
+
+    def test_mvdir_422_cycle(self) -> None:
+        self._set_response(422, {"ok": False, "code": "unprocessable",
+                                 "message": "Cannot rename into descendant"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "mvdir", "/foo", "/foo/bar"])
+        self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
+        self.assertIn("unprocessable", err)
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:
