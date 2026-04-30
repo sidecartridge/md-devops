@@ -114,6 +114,7 @@ target_sources(${PROJECT_NAME} PRIVATE
         emul.c
         gconfig.c
         gemdrive.c
+        http_server.c
         hw_config.c
         network.c
         reset.c
@@ -134,6 +135,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     no-OS-FatFS-SD-SDIO-SPI-RPi-Pico                # FATFS library   
     pico_stdlib              # Core functionality
     pico_multicore          # Multicore support
+    pico_lwip_mdns           # lwIP mDNS responder so <hostname>.local works
     httpc                    # HTTP client
     settings                 # Custom settings library
     u8g2                     # for display

@@ -60,3 +60,4 @@ dist/
 .cache/
 .claude/
 docs/epics/
+cli/__pycache__/

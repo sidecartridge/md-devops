@@ -26,6 +26,7 @@
 #include "ff.h"
 #include "gconfig.h"
 #include "gemdrive.h"
+#include "http_server.h"
 #include "memfunc.h"
 #include "network.h"
 #include "pico/stdlib.h"
@@ -445,7 +446,27 @@ static void __not_in_flash_func(menu)(void) {
              (unsigned)memtop);
   }
   term_printString(memtopLine);
-  term_printString("\n");
+  term_printString("\n\n");
+
+  // Remote HTTP API endpoint (Epic 02). Show the leased IP and the
+  // mDNS hostname so the user can hit it from a PC without guessing.
+  ip_addr_t apiIp = network_getCurrentIp();
+  SettingsConfigEntry *hostnameEntry =
+      settings_find_entry(gconfig_getContext(), PARAM_HOSTNAME);
+  const char *hostname =
+      (hostnameEntry != NULL && hostnameEntry->value[0] != '\0')
+          ? hostnameEntry->value
+          : "sidecart";
+  char apiLine[80];
+  if (apiIp.addr != 0) {
+    snprintf(apiLine, sizeof(apiLine),
+             "  API           : http://%s.local/  (%s)", hostname,
+             ipaddr_ntoa(&apiIp));
+  } else {
+    snprintf(apiLine, sizeof(apiLine),
+             "  API           : http://%s.local/  (no IP)", hostname);
+  }
+  term_printString(apiLine);
 
   vt52Cursor(TERM_SCREEN_SIZE_Y - 2, 0);
   term_printString("[E]xit (launch)   [X] Return to Booster");
@@ -1004,6 +1025,11 @@ void emul_start() {
           // Optionally, return an error code here.
         }
         network_setPollingCallback(NULL);
+
+        // Start the Remote HTTP Management API (Epic 02). Idempotent —
+        // safe even if the connect attempts above all timed out; the
+        // server will simply have no clients until Wi-Fi recovers.
+        http_server_init();
       }
     } else {
       DPRINTF("WiFi mode is AP. No initializing.\n");
