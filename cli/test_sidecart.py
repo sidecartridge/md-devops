@@ -201,6 +201,116 @@ class PingTests(unittest.TestCase):
         self.assertIn("cannot reach", err)
 
 
+class VolumeTests(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict | None) -> None:
+        body = json.dumps(payload).encode("utf-8") if payload is not None else b""
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+
+    def test_volume_human(self) -> None:
+        self._set_response(200, {
+            "ok": True,
+            "total_b": 8 * 1024 * 1024 * 1024,
+            "free_b": 1 * 1024 * 1024 * 1024,
+            "fs_type": "FAT32",
+        })
+        code, out, _err = _run_cli(["--host", self.server.host, "volume"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("FAT32", out)
+        self.assertIn("GB", out)
+        self.assertEqual(self.server.state.last_path, "/api/v1/volume")
+        self.assertEqual(self.server.state.last_method, "GET")
+
+    def test_volume_json(self) -> None:
+        self._set_response(200, {"ok": True, "total_b": 1, "free_b": 1,
+                                 "fs_type": "FAT16"})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "--json", "volume"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(json.loads(out)["fs_type"], "FAT16")
+
+    def test_volume_503_busy(self) -> None:
+        self._set_response(503, {"ok": False, "code": "busy",
+                                 "message": "SD not mounted"})
+        code, _out, err = _run_cli(["--host", self.server.host, "volume"])
+        self.assertEqual(code, sidecart.EXIT_BUSY)
+        self.assertIn("busy", err)
+
+
+class LsTests(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict | None) -> None:
+        body = json.dumps(payload).encode("utf-8") if payload is not None else b""
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+
+    def test_ls_default_root(self) -> None:
+        self._set_response(200, {
+            "ok": True, "path": "/",
+            "entries": [
+                {"name": "FOO.TXT", "size": 1234, "is_dir": False,
+                 "mtime": "2026-04-30T12:34:56"},
+                {"name": "SUB", "size": 0, "is_dir": True,
+                 "mtime": "2026-04-29T08:00:00"},
+            ],
+            "truncated": False,
+        })
+        code, out, _err = _run_cli(["--host", self.server.host, "ls"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("FOO.TXT", out)
+        self.assertIn("SUB", out)
+        self.assertIn("file", out)
+        self.assertIn("dir", out)
+        # Default path resolves to /api/v1/files?path=%2F or /api/v1/files?path=/.
+        self.assertTrue(self.server.state.last_path.startswith("/api/v1/files"))
+        self.assertIn("path=", self.server.state.last_path)
+
+    def test_ls_explicit_path(self) -> None:
+        self._set_response(200, {"ok": True, "path": "/sub",
+                                 "entries": [], "truncated": False})
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "ls", "/sub/foo bar"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        # Spaces must be URL-encoded.
+        self.assertIn("foo%20bar", self.server.state.last_path)
+
+    def test_ls_truncated_flag_shown(self) -> None:
+        self._set_response(200, {
+            "ok": True, "path": "/",
+            "entries": [{"name": "A", "size": 0, "is_dir": False,
+                         "mtime": None}],
+            "truncated": True,
+        })
+        code, out, _err = _run_cli(["--host", self.server.host, "ls"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("truncated", out)
+
+    def test_ls_404_maps_to_exit_3(self) -> None:
+        self._set_response(404, {"ok": False, "code": "not_found",
+                                 "message": "Path not found"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "ls", "/missing"])
+        self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
+        self.assertIn("not_found", err)
+
+    def test_ls_listing_a_file_returns_422(self) -> None:
+        self._set_response(422, {"ok": False, "code": "is_file",
+                                 "message": "Path is a file"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "ls", "/foo.txt"])
+        self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
+        self.assertIn("is_file", err)
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:

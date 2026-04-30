@@ -1,21 +1,39 @@
 #include "include/http_server.h"
 
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "aconfig.h"
 #include "debug.h"
+#include "ff.h"
+#include "gconfig.h"
 #include "lwip/err.h"
 #include "lwip/pbuf.h"
 #include "lwip/tcp.h"
 #include "pico/cyw43_arch.h"
 #include "pico/time.h"
+#include "settings.h"
 
-#define HTTP_RESPONSE_BUF_BYTES 1024
+// Per-conn response buffer. Sized to comfortably hold a full status
+// line + headers + the largest non-streaming body we emit (the
+// directory listing JSON). At ~80 bytes per entry, 8 KB lets us emit
+// ~95 entries before tripping the truncated flag — enough for any
+// realistic SD card folder. True streaming for multi-MB downloads
+// arrives in S5.
+#define HTTP_RESPONSE_BUF_BYTES 8192
 #define HTTP_PATH_BUF_BYTES 256
 #define HTTP_QUERY_BUF_BYTES 256
+
+// Listing cap. Spec says 1000, but the response buffer is the real
+// constraint right now — whichever cap we hit first sets truncated.
+#define HTTP_LISTING_MAX_ENTRIES 1000
+
+// FatFs LFN buffer cap. Match FF_MAX_LFN from ffconf.h (255).
+#define HTTP_FAT_PATH_BUF_BYTES 256
 
 // Idle-connection sweeper: tcp_poll fires every (4 × tcp_poll_interval) /
 // 2 seconds. With interval 8, that's 16 seconds per tick; we close on
@@ -395,26 +413,466 @@ static void parse_and_dispatch(http_conn_t *c) {
   route(c);
 }
 
-static void route(http_conn_t *c) {
-  // S1: only one route. Anything else with a known path → 405; unknown
-  // path → 404. The full route table arrives in S2.
+// --- URL decoding + query parsing ---
 
-  if (strcmp(c->path, "/api/v1/ping") == 0) {
-    if (c->method != HM_GET && c->method != HM_HEAD) {
-      write_405(c, "GET, HEAD");
+static int hex_digit(int c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+// Decode percent-encoding in `src` into `dst`. Treats '+' as literal
+// (we don't accept form-encoded query strings as space-encoded).
+// Returns false on bad encoding, NUL byte in result, or buffer
+// overflow.
+static bool url_decode(const char *src, char *dst, size_t dst_cap) {
+  size_t out = 0;
+  while (*src != '\0') {
+    if (out + 1 >= dst_cap) return false;
+    char c = *src++;
+    if (c == '%') {
+      int hi = hex_digit((unsigned char)*src);
+      if (hi < 0) return false;
+      src++;
+      int lo = hex_digit((unsigned char)*src);
+      if (lo < 0) return false;
+      src++;
+      int v = (hi << 4) | lo;
+      if (v == 0) return false;  // NUL not allowed in paths
+      dst[out++] = (char)v;
+    } else {
+      dst[out++] = c;
+    }
+  }
+  dst[out] = '\0';
+  return true;
+}
+
+// Find `key` in a URL-encoded query string `?a=1&b=2&...`. Writes the
+// URL-decoded value into `out`. Returns true on hit (even when value
+// is empty), false if key not present or buffer would overflow.
+static bool query_get(const char *query, const char *key, char *out,
+                      size_t out_cap) {
+  size_t key_len = strlen(key);
+  const char *p = query;
+  while (*p != '\0') {
+    const char *amp = strchr(p, '&');
+    const char *eq = strchr(p, '=');
+    const char *seg_end = (amp != NULL) ? amp : (p + strlen(p));
+    if (eq != NULL && eq < seg_end && (size_t)(eq - p) == key_len &&
+        memcmp(p, key, key_len) == 0) {
+      // Decode value [eq+1 .. seg_end).
+      char tmp[HTTP_QUERY_BUF_BYTES];
+      size_t v_len = (size_t)(seg_end - (eq + 1));
+      if (v_len >= sizeof(tmp)) return false;
+      memcpy(tmp, eq + 1, v_len);
+      tmp[v_len] = '\0';
+      return url_decode(tmp, out, out_cap);
+    }
+    if (amp == NULL) break;
+    p = amp + 1;
+  }
+  return false;
+}
+
+// --- Path normalisation and jailing ---
+
+// Reads gconfig PARAM_HOSTNAME (used for the API's mDNS name); we
+// don't actually need it here but the GEMDRIVE_FOLDER lookup is the
+// real prize.
+static const char *get_gemdrive_folder(void) {
+  SettingsConfigEntry *entry =
+      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER);
+  if (entry == NULL || entry->value[0] == '\0') return "/devops";
+  return entry->value;
+}
+
+// Normalise `rel` (already URL-decoded) into `out` as a forward-slash-
+// separated relative path with leading slash. Collapses "//" and "/.",
+// strips trailing "/". Rejects "..", non-ASCII, and control chars.
+// Result is always "/" or "/foo[/bar...]" — never empty.
+typedef enum {
+  NORM_OK = 0,
+  NORM_BAD_PATH,
+  NORM_TOO_LONG,
+} norm_status_t;
+
+static norm_status_t normalize_rel(const char *rel, char *out,
+                                   size_t out_cap) {
+  if (out_cap < 2) return NORM_TOO_LONG;
+  out[0] = '/';
+  out[1] = '\0';
+  if (rel == NULL || rel[0] == '\0' || strcmp(rel, "/") == 0) {
+    return NORM_OK;
+  }
+  if (out_cap < 2) return NORM_TOO_LONG;
+
+  size_t i = 0;
+  size_t out_len = 0;
+  out[0] = '\0';
+
+  // Skip a single leading slash (we always re-emit one).
+  if (rel[i] == '/') i++;
+
+  while (rel[i] != '\0') {
+    // Find next segment end.
+    size_t seg_start = i;
+    while (rel[i] != '\0' && rel[i] != '/') {
+      char ch = rel[i];
+      if ((unsigned char)ch < 0x20 || (unsigned char)ch >= 0x80) {
+        return NORM_BAD_PATH;
+      }
+      i++;
+    }
+    size_t seg_len = i - seg_start;
+    if (seg_len == 0) {
+      // Repeated slash; skip.
+    } else if (seg_len == 1 && rel[seg_start] == '.') {
+      // "." segment; skip.
+    } else if (seg_len == 2 && rel[seg_start] == '.' &&
+               rel[seg_start + 1] == '.') {
+      return NORM_BAD_PATH;  // ".." escapes the root.
+    } else {
+      if (out_len + 1 + seg_len + 1 > out_cap) return NORM_TOO_LONG;
+      out[out_len++] = '/';
+      memcpy(out + out_len, rel + seg_start, seg_len);
+      out_len += seg_len;
+      out[out_len] = '\0';
+    }
+    if (rel[i] == '/') i++;
+  }
+
+  if (out_len == 0) {
+    out[0] = '/';
+    out[1] = '\0';
+  }
+  return NORM_OK;
+}
+
+// Build absolute on-disk path: GEMDRIVE_FOLDER + normalised rel.
+// rel can be NULL/empty (treated as "/").
+static norm_status_t resolve_jail(const char *rel, char *out,
+                                  size_t out_cap) {
+  char norm[HTTP_PATH_BUF_BYTES];
+  norm_status_t s = normalize_rel(rel, norm, sizeof(norm));
+  if (s != NORM_OK) return s;
+
+  const char *root = get_gemdrive_folder();
+  size_t root_len = strlen(root);
+  size_t norm_len = strlen(norm);
+
+  // GEMDRIVE_FOLDER is expected to be "/foo" (no trailing slash). If
+  // norm is just "/", drop the duplicate slash to yield exactly the
+  // root.
+  if (norm_len == 1) {
+    if (root_len + 1 > out_cap) return NORM_TOO_LONG;
+    memcpy(out, root, root_len + 1);
+    return NORM_OK;
+  }
+  if (root_len + norm_len + 1 > out_cap) return NORM_TOO_LONG;
+  memcpy(out, root, root_len);
+  memcpy(out + root_len, norm, norm_len + 1);
+  return NORM_OK;
+}
+
+// FAT date+time → ISO-8601 "YYYY-MM-DDTHH:MM:SS". Returns false if
+// the date field is zero (FatFs uses 0 for "no date set") so the
+// caller can emit `null`.
+static bool fat_to_iso8601(WORD fdate, WORD ftime, char *out,
+                           size_t out_cap) {
+  if (fdate == 0) return false;
+  unsigned year = 1980u + ((fdate >> 9) & 0x7F);
+  unsigned month = (fdate >> 5) & 0x0F;
+  unsigned day = fdate & 0x1F;
+  unsigned hour = (ftime >> 11) & 0x1F;
+  unsigned minute = (ftime >> 5) & 0x3F;
+  unsigned second = (ftime & 0x1F) * 2;
+  int n = snprintf(out, out_cap, "%04u-%02u-%02uT%02u:%02u:%02u", year,
+                   month, day, hour, minute, second);
+  return (n > 0 && (size_t)n < out_cap);
+}
+
+// --- Route handlers ---
+
+static void handle_ping(http_conn_t *c) {
+  uint64_t uptime_us =
+      (uint64_t)absolute_time_diff_us(g_boot_time, get_absolute_time());
+  uint64_t uptime_s = uptime_us / 1000000ULL;
+  char body[160];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"version\":\"%s\",\"uptime_s\":%llu}\n",
+                   RELEASE_VERSION, (unsigned long long)uptime_s);
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
+static const char *fat_type_name(BYTE fs_type) {
+  switch (fs_type) {
+    case FS_FAT12: return "FAT12";
+    case FS_FAT16: return "FAT16";
+    case FS_FAT32: return "FAT32";
+    case FS_EXFAT: return "EXFAT";
+    default: return "UNKNOWN";
+  }
+}
+
+static void handle_volume(http_conn_t *c) {
+  FATFS *fs = NULL;
+  DWORD free_clusters = 0;
+  FRESULT res = f_getfree("", &free_clusters, &fs);
+  if (res != FR_OK || fs == NULL) {
+    DPRINTF("http_server: /volume f_getfree failed (%d)\n", (int)res);
+    write_error(c, 503, "Service Unavailable", "busy",
+                "SD filesystem unavailable");
+    return;
+  }
+  uint64_t bytes_per_sector =
+#if FF_MAX_SS == FF_MIN_SS
+      (uint64_t)FF_MIN_SS;
+#else
+      (uint64_t)fs->ssize;
+#endif
+  uint64_t cluster_bytes = (uint64_t)fs->csize * bytes_per_sector;
+  uint64_t total_bytes = (uint64_t)(fs->n_fatent - 2) * cluster_bytes;
+  uint64_t free_bytes = (uint64_t)free_clusters * cluster_bytes;
+  char body[200];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"total_b\":%llu,\"free_b\":%llu,"
+                   "\"fs_type\":\"%s\"}\n",
+                   (unsigned long long)total_bytes,
+                   (unsigned long long)free_bytes, fat_type_name(fs->fs_type));
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
+// Append printf-formatted text to the response body buffer, advancing
+// *body_len. Returns false if the buffer is full (caller should set
+// truncated and stop appending).
+static bool body_appendf(char *body, size_t cap, size_t *len,
+                         const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+
+static bool body_appendf(char *body, size_t cap, size_t *len,
+                         const char *fmt, ...) {
+  if (*len >= cap) return false;
+  va_list args;
+  va_start(args, fmt);
+  int n = vsnprintf(body + *len, cap - *len, fmt, args);
+  va_end(args);
+  if (n < 0 || (size_t)n >= cap - *len) {
+    return false;
+  }
+  *len += (size_t)n;
+  return true;
+}
+
+static void handle_files_list(http_conn_t *c) {
+  // Extract ?path=, default to "/".
+  char rel[HTTP_PATH_BUF_BYTES];
+  rel[0] = '\0';
+  if (c->query[0] != '\0') {
+    if (!query_get(c->query, "path", rel, sizeof(rel))) {
+      // Either the key is missing (ok, default to "/") or the value
+      // failed to decode (bad_path). query_get returns false in both
+      // cases; disambiguate by looking for "path=" literal.
+      if (strstr(c->query, "path=") != NULL) {
+        write_error(c, 400, "Bad Request", "bad_path",
+                    "Malformed path query parameter");
+        return;
+      }
+    }
+  }
+
+  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  norm_status_t s = resolve_jail(rel, abs_path, sizeof(abs_path));
+  if (s == NORM_BAD_PATH) {
+    write_error(c, 400, "Bad Request", "bad_path", "Path not allowed");
+    return;
+  }
+  if (s == NORM_TOO_LONG) {
+    write_error(c, 400, "Bad Request", "bad_path", "Path too long");
+    return;
+  }
+
+  // Stat the path: must exist and be a directory.
+  FILINFO info;
+  FRESULT fr = f_stat(abs_path, &info);
+  if (fr == FR_NO_FILE || fr == FR_NO_PATH) {
+    // f_stat on the GEMDRIVE_FOLDER root returns FR_NO_FILE because
+    // root has no parent entry to stat — that's expected and means the
+    // root exists.
+    bool is_root = (rel[0] == '\0' || strcmp(rel, "/") == 0);
+    if (!is_root) {
+      write_error(c, 404, "Not Found", "not_found", "Path not found");
       return;
     }
-    uint64_t uptime_us =
-        (uint64_t)absolute_time_diff_us(g_boot_time, get_absolute_time());
-    uint64_t uptime_s = uptime_us / 1000000ULL;
-    char body[160];
-    int n = snprintf(body, sizeof(body),
-                     "{\"ok\":true,\"version\":\"%s\",\"uptime_s\":%llu}\n",
-                     RELEASE_VERSION, (unsigned long long)uptime_s);
-    if (n < 0) {
-      n = 0;
+  } else if (fr != FR_OK) {
+    write_error(c, 500, "Internal Server Error", "disk_error",
+                "f_stat failed");
+    return;
+  } else if (!(info.fattrib & AM_DIR)) {
+    write_error(c, 422, "Unprocessable Entity", "is_file",
+                "Path is a file; use GET /api/v1/files/<rel> to download");
+    return;
+  }
+
+  // Build response into resp[]; reserve room for status + headers, fill
+  // body in a temporary buffer, then assemble.
+  // Worst-case headers + envelope ≈ 256 bytes; leave the rest for body.
+  char body[HTTP_RESPONSE_BUF_BYTES - 384];
+  size_t body_len = 0;
+  bool truncated = false;
+
+  // Recompute the canonical (normalised, root-stripped) path to echo.
+  char norm[HTTP_PATH_BUF_BYTES];
+  if (normalize_rel(rel, norm, sizeof(norm)) != NORM_OK) {
+    norm[0] = '/';
+    norm[1] = '\0';
+  }
+
+  if (!body_appendf(body, sizeof(body), &body_len,
+                    "{\"ok\":true,\"path\":\"%s\",\"entries\":[", norm)) {
+    write_error(c, 500, "Internal Server Error", "internal_error",
+                "Response buffer overflow");
+    return;
+  }
+
+  DIR dir;
+  fr = f_opendir(&dir, abs_path);
+  if (fr != FR_OK) {
+    write_error(c, 500, "Internal Server Error", "disk_error",
+                "f_opendir failed");
+    return;
+  }
+
+  uint16_t entry_count = 0;
+  bool first = true;
+  while (entry_count < HTTP_LISTING_MAX_ENTRIES) {
+    FILINFO finfo;
+    fr = f_readdir(&dir, &finfo);
+    if (fr != FR_OK || finfo.fname[0] == '\0') break;
+
+    char mtime[24];
+    bool has_mtime = fat_to_iso8601(finfo.fdate, finfo.ftime, mtime,
+                                    sizeof(mtime));
+    bool is_dir = (finfo.fattrib & AM_DIR) != 0;
+    uint32_t size = is_dir ? 0u : (uint32_t)finfo.fsize;
+
+    // Save state in case the entry overflows the buffer; we want to
+    // emit truncated:true and not leave a dangling comma.
+    size_t saved_len = body_len;
+    bool ok = true;
+    if (!first) {
+      ok = body_appendf(body, sizeof(body), &body_len, ",");
     }
-    write_response(c, 200, "OK", "application/json", body, (size_t)n);
+    if (ok) {
+      if (has_mtime) {
+        ok = body_appendf(body, sizeof(body), &body_len,
+                          "{\"name\":\"%s\",\"size\":%lu,\"is_dir\":%s,"
+                          "\"mtime\":\"%s\"}",
+                          finfo.fname, (unsigned long)size,
+                          is_dir ? "true" : "false", mtime);
+      } else {
+        ok = body_appendf(body, sizeof(body), &body_len,
+                          "{\"name\":\"%s\",\"size\":%lu,\"is_dir\":%s,"
+                          "\"mtime\":null}",
+                          finfo.fname, (unsigned long)size,
+                          is_dir ? "true" : "false");
+      }
+    }
+    if (!ok) {
+      body_len = saved_len;
+      truncated = true;
+      break;
+    }
+    first = false;
+    entry_count++;
+  }
+  f_closedir(&dir);
+  if (entry_count >= HTTP_LISTING_MAX_ENTRIES) truncated = true;
+
+  if (!body_appendf(body, sizeof(body), &body_len,
+                    "],\"truncated\":%s}\n",
+                    truncated ? "true" : "false")) {
+    // Trailer didn't fit — last-resort: cut some entries to make room.
+    // Worst case scenario; acknowledge by returning 500.
+    write_error(c, 500, "Internal Server Error", "internal_error",
+                "Response buffer overflow");
+    return;
+  }
+
+  write_response(c, 200, "OK", "application/json", body, body_len);
+}
+
+// --- Route table ---
+
+#define M_GET (1u << HM_GET)
+#define M_HEAD (1u << HM_HEAD)
+#define M_POST (1u << HM_POST)
+#define M_PUT (1u << HM_PUT)
+#define M_DELETE (1u << HM_DELETE)
+
+typedef void (*route_handler_fn)(http_conn_t *c);
+
+typedef struct {
+  const char *path;        // exact match
+  uint8_t methods_mask;    // bitmask of allowed verbs (M_*)
+  route_handler_fn handler;
+} route_t;
+
+static const route_t g_routes[] = {
+    {"/api/v1/ping", M_GET | M_HEAD, handle_ping},
+    {"/api/v1/volume", M_GET | M_HEAD, handle_volume},
+    {"/api/v1/files", M_GET | M_HEAD, handle_files_list},
+};
+
+#define ROUTES_COUNT (sizeof(g_routes) / sizeof(g_routes[0]))
+
+// Build an "Allow:" header value string from a methods mask.
+static void format_allow(uint8_t mask, char *out, size_t out_cap) {
+  out[0] = '\0';
+  size_t off = 0;
+  const struct {
+    uint8_t bit;
+    const char *name;
+  } table[] = {
+      {M_GET, "GET"},     {M_HEAD, "HEAD"},     {M_POST, "POST"},
+      {M_PUT, "PUT"},     {M_DELETE, "DELETE"},
+  };
+  for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+    if (mask & table[i].bit) {
+      int n = snprintf(out + off, out_cap - off, "%s%s",
+                       (off == 0) ? "" : ", ", table[i].name);
+      if (n < 0 || (size_t)n >= out_cap - off) return;
+      off += (size_t)n;
+    }
+  }
+}
+
+static void route(http_conn_t *c) {
+  // HEAD is treated as GET for matching purposes (the dispatcher
+  // suppresses the body during write).
+  uint8_t method_bit =
+      (uint8_t)(1u << (c->method == HM_HEAD ? (uint8_t)HM_GET
+                                            : (uint8_t)c->method));
+
+  for (size_t i = 0; i < ROUTES_COUNT; i++) {
+    if (strcmp(c->path, g_routes[i].path) != 0) continue;
+    // Path matched. Check verb. HEAD is allowed wherever GET is.
+    uint8_t allowed = g_routes[i].methods_mask;
+    bool verb_ok = false;
+    if (c->method == HM_HEAD) {
+      verb_ok = (allowed & M_GET) != 0;
+    } else {
+      verb_ok = (allowed & method_bit) != 0;
+    }
+    if (verb_ok) {
+      g_routes[i].handler(c);
+      return;
+    }
+    char allow[40];
+    format_allow(allowed, allow, sizeof(allow));
+    write_405(c, allow);
     return;
   }
 

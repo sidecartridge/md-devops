@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 DEFAULT_HOST = "sidecart.local"
@@ -165,6 +166,82 @@ def cmd_ping(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _format_bytes(n: int) -> str:
+    """Render a byte count as a short human-readable string."""
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(n)
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} {unit}"
+        size /= 1024.0
+    return f"{n} B"  # unreachable
+
+
+def cmd_volume(args: argparse.Namespace) -> int:
+    """GET /api/v1/volume → print free / total / fs_type."""
+    url = base_url(args.host) + "/api/v1/volume"
+    try:
+        status, parsed, raw = request_json("GET", url)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200 or parsed is None or parsed.get("ok") is not True:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        json.dump(parsed, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+    elif not args.quiet:
+        total_b = int(parsed.get("total_b", 0))
+        free_b = int(parsed.get("free_b", 0))
+        fs_type = parsed.get("fs_type", "?")
+        print(f"free {_format_bytes(free_b)} / "
+              f"total {_format_bytes(total_b)}  ({fs_type})")
+    return EXIT_OK
+
+
+def cmd_ls(args: argparse.Namespace) -> int:
+    """GET /api/v1/files?path=PATH → print entries."""
+    path = args.path or "/"
+    encoded = urllib.parse.quote(path, safe="/")
+    url = base_url(args.host) + f"/api/v1/files?path={encoded}"
+    try:
+        status, parsed, raw = request_json("GET", url)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200 or parsed is None or parsed.get("ok") is not True:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        json.dump(parsed, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return EXIT_OK
+
+    if args.quiet:
+        return EXIT_OK
+
+    entries = parsed.get("entries") or []
+    # Column widths: name padded so dirs and sizes align.
+    name_width = max((len(e.get("name", "")) for e in entries), default=4)
+    name_width = max(name_width, 4)
+    print(f"{'name'.ljust(name_width)}  {'size':>10}  type  mtime")
+    for entry in entries:
+        name = entry.get("name", "")
+        size = entry.get("size", 0)
+        is_dir = entry.get("is_dir", False)
+        mtime = entry.get("mtime") or "-"
+        kind = "dir" if is_dir else "file"
+        print(f"{name.ljust(name_width)}  {size:>10}  {kind:<4}  {mtime}")
+    if parsed.get("truncated"):
+        print(f"({len(entries)} entries shown — listing truncated)")
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="sidecart",
@@ -190,6 +267,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("ping", help="Health check; show version and uptime.")
+    sub.add_parser("volume", help="Show SD card total / free space.")
+    ls = sub.add_parser("ls", help="List a folder on the SD card.")
+    ls.add_argument("path", nargs="?", default="/",
+                    help="Folder path (default: /).")
     return p
 
 
@@ -200,6 +281,8 @@ def main(argv: list[str] | None = None) -> int:
 
     handlers = {
         "ping": cmd_ping,
+        "volume": cmd_volume,
+        "ls": cmd_ls,
     }
     handler = handlers.get(args.cmd)
     if handler is None:
