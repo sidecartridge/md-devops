@@ -1832,8 +1832,13 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
         char extra[64];
         snprintf(extra, sizeof(extra), "Content-Range: bytes */%lu\r\n",
                  (unsigned long)file_size);
-        write_error(c, 416, "Range Not Satisfiable", "range_invalid",
-                    "Suffix range exceeds file size");
+        char body[200];
+        int bn = snprintf(body, sizeof(body),
+                          "{\"ok\":false,\"code\":\"range_invalid\","
+                          "\"message\":\"Suffix range exceeds file size\"}\n");
+        if (bn < 0) bn = 0;
+        write_response_ex(c, 416, "Range Not Satisfiable", "application/json",
+                          extra, body, (size_t)bn);
         return;
       }
       if (n > file_size) n = file_size;

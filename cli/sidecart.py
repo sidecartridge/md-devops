@@ -2,17 +2,47 @@
 """
 sidecart — Python CLI for the md-devops Remote HTTP Management API.
 
-Single-file, stdlib-only (Python >= 3.10). See docs/epics/02-http-api.md
-for the full spec. Default host is sidecart.local (override with --host
-or the SIDECART_HOST env var).
+Single-file, stdlib-only (Python >= 3.10). Talks HTTP to a Pico W
+running the md-devops microfirmware. See docs/api.md for the full
+endpoint reference.
 
 Usage:
-    python3 cli/sidecart.py ping
-    python3 cli/sidecart.py --host 192.168.1.42 ping
-    SIDECART_HOST=192.168.1.42 python3 cli/sidecart.py ping --json
+    python3 cli/sidecart.py [--host HOST[:PORT]] [--json] [-q] <verb> [args]
 
-Subcommand coverage grows alongside the server (Epic 02 stories S1–S6).
-S1 ships only `ping`.
+Default host is `sidecart.local` (mDNS); override with `--host` or
+the `SIDECART_HOST` env var. `--json` emits the raw response envelope
+on stdout instead of human-readable output. `-q/--quiet` silences
+normal output; errors always go to stderr.
+
+Subcommands:
+    ping                                 GET  /api/v1/ping
+    volume                               GET  /api/v1/volume
+    ls [PATH]                            GET  /api/v1/files?path=...
+    get REMOTE [LOCAL] [-r/--resume]     GET  /api/v1/files/<rel>
+    put LOCAL [REMOTE] [-f/--force]      PUT  /api/v1/files/<rel>
+    rm REMOTE                            DEL  /api/v1/files/<rel>
+    mv FROM TO                           POST /api/v1/files/<from>/rename
+    mkdir REMOTE                         POST /api/v1/folders/<rel>
+    rmdir REMOTE                         DEL  /api/v1/folders/<rel>
+    mvdir FROM TO                        POST /api/v1/folders/<from>/rename
+
+Exit codes:
+    0  success
+    1  generic / unexpected
+    2  argparse usage error
+    3  server returned 404
+    4  server returned 409
+    5  server returned 400 / 422 / other 4xx
+    6  server returned 503 (busy or SD unmounted)
+    7  server returned 5xx other than 503
+    8  network / DNS error (couldn't reach the host)
+
+Examples:
+    python3 cli/sidecart.py ping
+    SIDECART_HOST=192.168.1.42 python3 cli/sidecart.py ls /games
+    python3 cli/sidecart.py get FILE.TOS -r
+    python3 cli/sidecart.py put LOCAL.PRG -f
+    python3 cli/sidecart.py mvdir OLDNAME NEWNAME
 """
 
 from __future__ import annotations

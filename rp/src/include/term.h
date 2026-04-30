@@ -181,6 +181,14 @@ void term_clearInputBuffer(void);
  */
 char *term_getInputBuffer(void);
 
+/**
+ * @brief Returns true if any keystroke has arrived since the last call
+ *        (consume-on-read). Used by the main loop to halt the
+ *        autoboot countdown on any key — bound or unbound — matching
+ *        md-drives-emulator's behavior.
+ */
+bool term_consumeAnyKeyPressed(void);
+
 // Generic commands to be used in the terminal
 // Manage application setttings
 void term_cmdSettings(const char *arg);
