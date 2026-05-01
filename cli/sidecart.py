@@ -449,6 +449,28 @@ def cmd_runner_run(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_runner_adv_reset(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/adv/reset — VBL-driven forced cold reset."""
+    url = base_url(args.host) + "/api/v1/runner/adv/reset"
+    try:
+        status, parsed, raw = request_json("POST", url, body=b"")
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 202:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        print("ok  ADV RESET sent (VBL-driven)")
+    return EXIT_OK
+
+
 def cmd_runner_adv_status(args: argparse.Namespace) -> int:
     """GET /api/v1/runner/adv — Advanced Runner VBL hook state."""
     url = base_url(args.host) + "/api/v1/runner/adv"
@@ -846,6 +868,10 @@ def build_parser() -> argparse.ArgumentParser:
     adv_sub.add_parser(
         "status",
         help="Show whether the Advanced Runner VBL hook is installed.")
+    adv_sub.add_parser(
+        "reset",
+        help="Forced cold reset driven from the VBL ISR — works "
+             "even when the foreground runner is wedged.")
     run_p = runner_sub.add_parser(
         "run", help="Run a .TOS / .PRG on the Atari ST.")
     run_p.add_argument("remote", help="Path to the program (relative to GEMDRIVE_FOLDER).")
@@ -885,6 +911,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.runner_cmd == "adv":
             adv_handlers = {
                 "status": cmd_runner_adv_status,
+                "reset": cmd_runner_adv_reset,
             }
             handler = adv_handlers.get(args.adv_cmd)
             if handler is None:

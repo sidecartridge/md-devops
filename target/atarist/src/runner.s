@@ -140,9 +140,9 @@ _memtop				equ $436
 
 ; Advanced Runner VBL command range. Reuses the existing sentinel;
 ; the foreground poll loop's cmp.l cascade only matches $05xx, so
-; $06xx codes pass through to the VBL handler. v1 commands land in
-; S2 — S1 only scaffolds the dispatch.
+; $06xx codes pass through to the VBL handler.
 APP_RUNNER_VBL			equ $0600
+RUNNER_ADV_CMD_RESET		equ ($01 + APP_RUNNER_VBL)	; forced cold reset
 RUNNER_VBL_RANGE_MASK		equ $FF00
 VEC_VBL_AUTO			equ $70
 
@@ -620,13 +620,32 @@ adv_vbl_handler:
 	andi.l	#$FFFFFF00, d1
 	cmpi.l	#APP_RUNNER_VBL, d1
 	bne	.adv_chain
-	; In our range. Stub dispatch — S2 fills in commands.
-	; Fall through and chain regardless so the rest of the VBL
-	; chain keeps running this frame.
+	; In our range. Compare against each known command code.
+	cmpi.l	#RUNNER_ADV_CMD_RESET, d0
+	beq	adv_force_reset
+	; Unknown $06xx command — ignore and chain. (Logging on the
+	; m68k from inside an ISR is a hazard; the RP-side handler
+	; already validated the command code before firing the sentinel.)
 .adv_chain:
 	movem.l	(sp)+, d0-d1/a0
 	move.l	old_vbl(pc), -(sp)
 	rts					; chain → previous handler does its work + rte
+
+; --- Forced cold reset (Epic 04 / S2). Mirrors the foreground
+; runner_reset's memvalid clear + jmp through the reset vector at
+; $4.w, but driven from inside the VBL ISR so it works even when
+; the foreground poll loop is wedged (program in an infinite loop,
+; bombs already painted, etc.). No register restore — the cold
+; reset wipes everything. No rte — control transfers to TOS' init
+; permanently. SR's IPL is reset by TOS' init early in its
+; sequence so the in-interrupt entry doesn't matter. ---
+adv_force_reset:
+	clr.l	$420.w			; memvalid
+	clr.l	$43A.w			; memval2
+	clr.l	$51A.w			; memval3
+	move.l	$4.w, a0		; reset vector
+	jmp	(a0)
+	; unreachable
 
 ; old_vbl: 4-byte cell holding the address of the prior $70 vector
 ; (saved at install time by runner_post_reloc). PC-relative read
