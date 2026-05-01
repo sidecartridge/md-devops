@@ -53,6 +53,7 @@ static void cmdGemdriveFolder(const char *arg);
 static void cmdGemdriveDrive(const char *arg);
 static void cmdGemdriveRelocAddr(const char *arg);
 static void cmdGemdriveMemtop(const char *arg);
+static void cmdAdvHookVector(const char *arg);
 static void cmdRunner(const char *arg);
 static void cmdHiddenSettings(const char *arg);
 static void cmdPrint(const char *arg);
@@ -74,6 +75,7 @@ static const Command commands[] = {
     {"d", cmdGemdriveDrive},
     {"r", cmdGemdriveRelocAddr},
     {"t", cmdGemdriveMemtop},
+    {"v", cmdAdvHookVector},
     {"u", cmdRunner},
     {"?", cmdHiddenSettings},
     {"print", cmdPrint},
@@ -131,6 +133,9 @@ static bool runnerMeminfoPending = false;
 // Epic 04 — Advanced Runner installation flag, set by the m68k's
 // HELLO payload byte after runner_post_reloc installs its VBL hook.
 static bool runnerAdvancedInstalled = false;
+// S4 — active hook vector ID reported by the m68k in the HELLO
+// payload. Default UNKNOWN until HELLO arrives.
+static uint8_t runnerAdvHookVector = RUNNER_HOOK_VECTOR_UNKNOWN;
 
 bool emul_isRunnerActive(void) { return runnerActive; }
 bool emul_isRunnerBusy(void) { return runnerBusy; }
@@ -309,6 +314,7 @@ void emul_resetRunnerSession(void) {
   runnerMeminfoPending = false;
   runnerMeminfoHasSnapshot = false;
   runnerAdvancedInstalled = false;
+  runnerAdvHookVector = RUNNER_HOOK_VECTOR_UNKNOWN;
 }
 
 bool emul_isRunnerAdvancedInstalled(void) {
@@ -317,6 +323,12 @@ bool emul_isRunnerAdvancedInstalled(void) {
 
 void emul_recordRunnerAdvancedInstalled(bool installed) {
   runnerAdvancedInstalled = installed;
+}
+
+uint8_t emul_getRunnerAdvHookVector(void) { return runnerAdvHookVector; }
+
+void emul_recordRunnerAdvHookVector(uint8_t vector_id) {
+  runnerAdvHookVector = vector_id;
 }
 
 void emul_onGemdriveHello(void) {
@@ -704,6 +716,23 @@ static void __not_in_flash_func(menu)(void) {
              (unsigned)memtop);
   }
   term_printString(memtopLine);
+
+  // Advanced Runner hook vector — Epic 04 / S4. Toggleable via [V].
+  SettingsConfigEntry *advHookEntry = settings_find_entry(
+      aconfig_getContext(), ACONFIG_PARAM_ADV_HOOK_VECTOR);
+  const char *advHookValue =
+      (advHookEntry != NULL && advHookEntry->value[0] != '\0')
+          ? advHookEntry->value
+          : "etv_timer";
+  char advHookLine[64];
+  if (strcmp(advHookValue, "vbl") == 0) {
+    snprintf(advHookLine, sizeof(advHookLine),
+             "\n  Adv [V]ector: vbl ($70)");
+  } else {
+    snprintf(advHookLine, sizeof(advHookLine),
+             "\n  Adv [V]ector: etv_timer ($400)");
+  }
+  term_printString(advHookLine);
   term_printString("\n\n");
 
   // Remote HTTP API endpoint (Epic 02). Show the leased IP and the
@@ -959,6 +988,28 @@ void cmdGemdriveMemtop(const char *arg) {
   }
   settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_DEVOPS_MEMTOP,
                        (int)value);
+  settings_save(aconfig_getContext(), true);
+  menu();
+}
+
+// Advanced Runner hook-vector toggle (Epic 04 / S4). Single keypress
+// cycles between "vbl" and "etv_timer" — no data-input flow because
+// only two values are valid. Effective on the next ST cold reset
+// (the m68k reads slot 16 once at runner_post_reloc); the menu
+// reflects the *new* setting immediately so the user knows the
+// toggle worked.
+void cmdAdvHookVector(const char *arg) {
+  (void)arg;
+  haltCountdown = true;
+  SettingsConfigEntry *entry = settings_find_entry(
+      aconfig_getContext(), ACONFIG_PARAM_ADV_HOOK_VECTOR);
+  const char *current = (entry != NULL && entry->value[0] != '\0')
+                            ? entry->value
+                            : "etv_timer";
+  const char *next =
+      (strcmp(current, "vbl") == 0) ? "etv_timer" : "vbl";
+  settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ADV_HOOK_VECTOR,
+                      next);
   settings_save(aconfig_getContext(), true);
   menu();
 }

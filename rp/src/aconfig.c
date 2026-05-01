@@ -13,6 +13,8 @@ static SettingsConfigEntry defaultEntries[] = {
     {ACONFIG_PARAM_GEMDRIVE_DRIVE, SETTINGS_TYPE_STRING, "C"},
     {ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR, SETTINGS_TYPE_INT, "0"},
     {ACONFIG_PARAM_DEVOPS_MEMTOP, SETTINGS_TYPE_INT, "0"},
+    // Advanced Runner — Epic 04 / S4. Default "etv_timer".
+    {ACONFIG_PARAM_ADV_HOOK_VECTOR, SETTINGS_TYPE_STRING, "etv_timer"},
 };
 
 // Create a global context for our settings

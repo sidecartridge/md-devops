@@ -195,6 +195,19 @@ bool emul_isRunnerAdvancedInstalled(void);
 void emul_recordRunnerAdvancedInstalled(bool installed);
 
 /**
+ * @brief Active hook vector ID reported by the m68k in the HELLO
+ *        payload. One of RUNNER_HOOK_VECTOR_VBL,
+ *        RUNNER_HOOK_VECTOR_ETV_TIMER, or RUNNER_HOOK_VECTOR_UNKNOWN.
+ *        Used by GET /api/v1/runner/adv.
+ */
+uint8_t emul_getRunnerAdvHookVector(void);
+
+/**
+ * @brief Stash the hook-vector ID from the HELLO payload byte.
+ */
+void emul_recordRunnerAdvHookVector(uint8_t vector_id);
+
+/**
  * @brief The m68k just ran gemdrive_init (CMD_GEMDRIVE_HELLO arrived).
  *        That is the unambiguous "ST cold-booted" signal — true for
  *        first power-on, `runner reset`, the ST's physical reset

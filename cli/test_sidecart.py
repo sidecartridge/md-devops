@@ -978,31 +978,44 @@ class RunnerAdvStatusTests(unittest.TestCase):
         self.server.state.next_headers = {
             "Content-Type": "application/json"}
 
-    def test_runner_adv_status_installed(self) -> None:
+    def test_runner_adv_status_installed_etv(self) -> None:
         self._set_response(200, {
             "ok": True, "active": True, "installed": True,
+            "hook_vector": "etv_timer",
         })
         code, out, _err = _run_cli(
             ["--host", self.server.host, "runner", "adv", "status"])
         self.assertEqual(code, sidecart.EXIT_OK)
         self.assertEqual(self.server.state.last_method, "GET")
         self.assertEqual(self.server.state.last_path, "/api/v1/runner/adv")
-        self.assertIn("VBL hook      : installed", out)
+        self.assertIn("hook vector   : installed (etv_timer @ $400)", out)
         self.assertIn("runner active : yes", out)
 
-    def test_runner_adv_status_inactive(self) -> None:
+    def test_runner_adv_status_installed_vbl(self) -> None:
         self._set_response(200, {
-            "ok": True, "active": False, "installed": False,
+            "ok": True, "active": True, "installed": True,
+            "hook_vector": "vbl",
         })
         code, out, _err = _run_cli(
             ["--host", self.server.host, "runner", "adv", "status"])
         self.assertEqual(code, sidecart.EXIT_OK)
-        self.assertIn("VBL hook      : not installed", out)
+        self.assertIn("hook vector   : installed (vbl @ $70)", out)
+
+    def test_runner_adv_status_inactive(self) -> None:
+        self._set_response(200, {
+            "ok": True, "active": False, "installed": False,
+            "hook_vector": "unknown",
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("hook vector   : not installed", out)
         self.assertIn("runner active : no", out)
 
     def test_runner_adv_status_json(self) -> None:
         self._set_response(200, {
             "ok": True, "active": True, "installed": True,
+            "hook_vector": "etv_timer",
         })
         code, out, _err = _run_cli(
             ["--host", self.server.host, "--json",
@@ -1010,6 +1023,7 @@ class RunnerAdvStatusTests(unittest.TestCase):
         self.assertEqual(code, sidecart.EXIT_OK)
         parsed = json.loads(out)
         self.assertTrue(parsed["installed"])
+        self.assertEqual(parsed["hook_vector"], "etv_timer")
 
 
 class RunnerAdvResetTests(unittest.TestCase):

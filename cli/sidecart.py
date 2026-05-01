@@ -493,8 +493,17 @@ def cmd_runner_adv_status(args: argparse.Namespace) -> int:
 
     active = parsed.get("active", False)
     installed = parsed.get("installed", False)
+    hook_vec = parsed.get("hook_vector", "unknown")
     print(f"runner active : {'yes' if active else 'no'}")
-    print(f"VBL hook      : {'installed' if installed else 'not installed'}")
+    if installed:
+        if hook_vec == "vbl":
+            print(f"hook vector   : installed (vbl @ $70)")
+        elif hook_vec == "etv_timer":
+            print(f"hook vector   : installed (etv_timer @ $400)")
+        else:
+            print(f"hook vector   : installed ({hook_vec})")
+    else:
+        print(f"hook vector   : not installed")
     return EXIT_OK
 
 

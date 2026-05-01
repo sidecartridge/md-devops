@@ -1676,22 +1676,31 @@ static void __not_in_flash_func(handle_runner_adv_reset)(http_conn_t *c) {
   write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
 }
 
-// GET /api/v1/runner/adv — Epic 04 / S1.
+// GET /api/v1/runner/adv — Epic 04 / S1+S4.
 //
 // Reports whether the m68k Runner has installed its Advanced Runner
-// VBL hook at $70. Set on every HELLO arrival from
-// runner_post_reloc; cleared by emul_resetRunnerSession when the
-// runner restarts. `installed` is true once the hook is live and
-// the m68k has confirmed; false in the brief window between
-// `[U]` press and HELLO arrival, or when Runner mode is inactive.
+// hook, and which vector it landed on ("vbl" at $70 or "etv_timer"
+// at $400 — chosen via the ACONFIG_PARAM_ADV_HOOK_VECTOR setting in
+// the setup menu). The flag and vector ID arrive together in the
+// HELLO payload; both clear on emul_resetRunnerSession.
 static void __not_in_flash_func(handle_runner_adv_status)(http_conn_t *c) {
   bool active = emul_isRunnerActive();
   bool installed = active && emul_isRunnerAdvancedInstalled();
-  char body[80];
-  int n = snprintf(body, sizeof(body),
-                   "{\"ok\":true,\"active\":%s,\"installed\":%s}\n",
-                   active ? "true" : "false",
-                   installed ? "true" : "false");
+  uint8_t vec = installed ? emul_getRunnerAdvHookVector()
+                          : RUNNER_HOOK_VECTOR_UNKNOWN;
+  const char *vec_str;
+  switch (vec) {
+    case RUNNER_HOOK_VECTOR_VBL:       vec_str = "vbl"; break;
+    case RUNNER_HOOK_VECTOR_ETV_TIMER: vec_str = "etv_timer"; break;
+    default:                           vec_str = "unknown"; break;
+  }
+  char body[128];
+  int n = snprintf(
+      body, sizeof(body),
+      "{\"ok\":true,\"active\":%s,\"installed\":%s,\"hook_vector\":\"%s\"}\n",
+      active ? "true" : "false",
+      installed ? "true" : "false",
+      vec_str);
   if (n < 0) n = 0;
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }

@@ -63,6 +63,21 @@
 #define APP_RUNNER_VBL 0x0600
 #define RUNNER_ADV_CMD_RESET (APP_RUNNER_VBL + 0x01)  // forced cold reset
 
+// Shared-variable slot 16 — Advanced Runner hook vector address.
+// RP publishes the resolved address ($70 for VBL, $400 for
+// etv_timer) at HELLO time based on the ACONFIG_PARAM_ADV_HOOK_VECTOR
+// aconfig setting; m68k's runner_post_reloc reads it to know where
+// to install adv_hook_handler. Slots 0..15 are claimed by chandler
+// framework + GEMDRIVE; 16 is the first runner-claimed slot.
+#define RUNNER_SVAR_ADV_HOOK_VECTOR 16
+
+// Hook vector identifiers used in the HELLO payload byte and in the
+// JSON envelope for GET /api/v1/runner/adv. 0xFF reserved for
+// "unknown" (m68k didn't report — older firmware or no HELLO yet).
+#define RUNNER_HOOK_VECTOR_VBL 0
+#define RUNNER_HOOK_VECTOR_ETV_TIMER 1
+#define RUNNER_HOOK_VECTOR_UNKNOWN 0xFF
+
 // m68k -> RP report commands (sent via send_sync from the Runner).
 // High bit set so they don't collide with the RP -> m68k sentinel
 // command IDs above.

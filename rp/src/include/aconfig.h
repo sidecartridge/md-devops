@@ -30,6 +30,12 @@
 #define ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR "GEMDRIVE_RELOC_ADDR"
 #define ACONFIG_PARAM_DEVOPS_MEMTOP "DEVOPS_MEMTOP"
 
+// Advanced Runner — Epic 04 / S4. Hook vector selector for the m68k
+// VBL / ETV handler. Valid values: "vbl" (install at $70, the VBL
+// autovector) or "etv_timer" (install at $400, TOS' MFP timer-C
+// ETV). Default "etv_timer" — harder for hostile programs to wipe.
+#define ACONFIG_PARAM_ADV_HOOK_VECTOR "ADV_HOOK_VECTOR"
+
 #define ACONFIG_SUCCESS 0
 #define ACONFIG_INIT_ERROR -1
 #define ACONFIG_MISMATCHED_APP -2

@@ -124,8 +124,10 @@ RUNNER_RES_ERR_BAD		equ -2	; requested rez out of range
 SHARED_VARIABLES_ADDR		equ (SHARED_BLOCK_ADDR + $10)	; $FA2810
 SHARED_VAR_GEMDRIVE_RELOC	equ 10
 SHARED_VAR_DRIVE_NUMBER		equ 12
+SHARED_VAR_ADV_HOOK_VECTOR	equ 16
 GEMDRIVE_RELOC_ADDR_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_GEMDRIVE_RELOC*4)
 DRIVE_NUMBER_ADDR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_DRIVE_NUMBER*4)
+ADV_HOOK_VECTOR_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_ADV_HOOK_VECTOR*4)
 
 ; Epic 04 — Advanced Runner. The runner blob now relocates itself
 ; to RAM at runner_entry so its VBL handler can run from a stable
@@ -242,26 +244,59 @@ runner_post_reloc:
 	trap	#1
 	addq.l	#6, sp
 
-	; --- Step 0.5 (Epic 04 / S1+S3): install the Advanced Runner
-	; hook at the vector chosen by ADV_HOOK_VECTOR ($70 VBL, $400
-	; etv_timer). We're already in supervisor mode (inherited from
+	; --- Step 0.5 (Epic 04 / S1+S3+S4): install the Advanced Runner
+	; hook at the vector chosen by the RP-side aconfig setting. The
+	; resolved vector address ($70 for VBL or $400 for etv_timer) is
+	; published to shared-var slot 16 by gemdrive_command_cb's HELLO
+	; handler before the runner is launched. We read it indirectly
+	; into a2; if the slot is zero (older RP firmware that doesn't
+	; publish it) we fall back to the build-time ADV_HOOK_VECTOR
+	; macro. We're already in supervisor mode (inherited from
 	; CA_INIT bit 27), so direct vector write is fine. Mask
 	; interrupts during the swap so we never run a partially-updated
-	; vector. The hook is part of the relocated blob so it survives
-	; cartridge-bus weirdness during the ISR. ---
+	; vector. ---
+	move.l	ADV_HOOK_VECTOR_VAR, d2
+	tst.l	d2
+	bne.s	.adv_have_addr
+	move.l	#ADV_HOOK_VECTOR, d2		; fallback to build-time choice
+.adv_have_addr:
+	move.l	d2, a2				; a2 = vector address (1024 max → indirect ok)
+	; Stash the resolved hook-vector address inside the relocated
+	; blob so the HELLO payload below can echo a vector ID back to
+	; the RP without re-reading the shared var.
+	lea	adv_active_vec(pc), a1
+	move.l	d2, (a1)
+
 	move.w	sr, -(sp)
 	or.w	#$0700, sr
 	lea	old_adv_hook(pc), a1		; PC-rel into the relocated blob
-	move.l	ADV_HOOK_VECTOR.w, (a1)
+	move.l	(a2), (a1)			; (a1) = old handler address
 	lea	adv_hook_handler(pc), a0	; relocated handler address
-	move.l	a0, ADV_HOOK_VECTOR.w
+	move.l	a0, (a2)			; install at the chosen vector
 	move.w	(sp)+, sr
 
 	; Tell the RP a fresh Runner session just started so it clears
 	; any stale busy lock / cwd mirror that survived a physical or
-	; cold reset. d3 carries an "Advanced installed" flag the RP
-	; surfaces via GET /api/v1/runner/adv.
-	moveq.l	#1, d3				; advanced_installed = 1
+	; cold reset. d3 layout:
+	;   bit 0      : advanced_installed (always 1 here)
+	;   bits 8..15 : hook_vector_id (0 = vbl @ $70,
+	;                                 1 = etv_timer @ $400,
+	;                                 0xFF = unknown — shouldn't happen)
+	moveq.l	#0, d3
+	move.b	#1, d3				; bit 0 = advanced installed
+	move.l	adv_active_vec(pc), d4
+	cmpi.l	#$70, d4
+	bne.s	.adv_hello_etv
+	; vector ID 0 — already in the high byte of d3 (still 0).
+	bra.s	.adv_hello_send
+.adv_hello_etv:
+	cmpi.l	#$400, d4
+	bne.s	.adv_hello_unknown
+	ori.l	#$0100, d3			; bits 8..15 = 1 (etv_timer)
+	bra.s	.adv_hello_send
+.adv_hello_unknown:
+	ori.l	#$FF00, d3			; bits 8..15 = 0xFF (unknown)
+.adv_hello_send:
 	send_sync RUNNER_CMD_DONE_HELLO, 4
 
 	; --- Step 1: clear screen + paint banner (single Cconws — the
@@ -678,13 +713,18 @@ adv_force_reset:
 ; old_adv_hook: 4-byte cell holding the address of the prior
 ; vector (saved at install time by runner_post_reloc — could be a
 ; previous VBL handler or a previous etv_timer ETV depending on
-; ADV_HOOK_VECTOR). PC-relative read works at runtime once the
-; blob is relocated; the cell lives in the relocated copy, NOT
-; the cartridge ROM original.
+; ADV_HOOK_VECTOR). adv_active_vec mirrors the vector address that
+; was actually installed (from shared-var slot 16, or the build-time
+; fallback) so the HELLO payload can echo a vector ID back to the
+; RP without re-reading the shared var. PC-relative reads work at
+; runtime once the blob is relocated; both cells live in the
+; relocated copy, NOT the cartridge ROM original.
 	cnop	0,4
 	dc.l	'XBRA'				; XBRA debug marker so chain
 	dc.l	'SDRA'				; walkers can identify our hook
 old_adv_hook:
+	dc.l	0
+adv_active_vec:
 	dc.l	0
 	even
 
