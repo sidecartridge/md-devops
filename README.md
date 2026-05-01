@@ -10,25 +10,41 @@ The process for creating a microfirmware app from this template is now documente
 
 The template now ships with a single source-of-truth layout for the 64 KB shared region (m68k `$FA0000`–`$FAFFFF`, mirrored at RP `0x20030000`):
 
-- The cartridge image (m68k header + code) lives in the first **8 KB** (`$FA0000`–`$FA1FFF`). `target/atarist/build.sh` enforces this with a hard size check on `BOOT.BIN`.
-- A small fixed-offset metadata block (`CMD_MAGIC_SENTINEL`, `RANDOM_TOKEN`, `RANDOM_TOKEN_SEED`, 60 × 4-byte indexed shared variables) sits at `$FA2000`.
-- The **APP_FREE** arena (~48 KB at `$FA2300`) is the contiguous space your app should use for its own buffers.
+- The cartridge image (m68k header + code) lives in the first **10 KB** (`$FA0000`–`$FA27FF`). `target/atarist/build.sh` enforces this with a hard size check on `BOOT.BIN`.
+- A small fixed-offset metadata block (`CMD_MAGIC_SENTINEL`, `RANDOM_TOKEN`, `RANDOM_TOKEN_SEED`, 60 × 4-byte indexed shared variables) sits at `$FA2800`.
+- The **APP_FREE** arena (~46 KB at `$FA2B00`) is the contiguous space your app should use for its own buffers.
 - The **framebuffer** (8000 B for 320×200 monochrome) sits at the very top of the region (`$FAE0C0`), so an overrun walks off the end of the 64 KB window instead of corrupting the metadata block.
 
 Both sides derive every offset symbolically from the constants in `rp/src/include/chandler.h` (RP-side) and `target/atarist/src/main.s` (m68k side). Apps must never hard-code an address inside the region — always reference the named offset/symbol so the layout stays the single source of truth.
 
 See `programming.md` for the full table and the budget rules.
 
-## User firmware module
+## Cartridge code layout
 
-The cartridge image is split via `target/atarist/src/userfw.ld` into two sections:
+The cartridge image is split via `target/atarist/src/devops.ld` into three sections:
 
 - `main.s` at offset `0x0000` (`$FA0000`, 2 KB) — boot, dispatch, terminal.
-- `userfw.s` at offset `0x0800` (`$FA0800`, 6 KB) — your app-specific m68k code.
+- `gemdrive.s` at offset `0x0800` (`$FA0800`, 5 KB) — GEMDOS hooks + protocol blob (relocated to RAM at boot).
+- `runner.s` at offset `0x1C00` (`$FA1C00`, 3 KB) — Runner foreground loop (Epic 03).
 
-`main.s` exposes the user firmware as `USERFW equ (ROM4_ADDR + $800)`. When the RP-side terminal command `f` (`[F]irmware`) is selected, the RP writes `CMD_START = 4` to the cartridge sentinel; the m68k's vsync-polled `check_commands` dispatches to `rom_function`, which `jmp`s to `USERFW`. The default `userfw.s` ships with a Cconws demo that prints `Example firmware load...` to the screen — replace the body with your own logic.
+`main.s`'s `check_commands` dispatch reads the cartridge sentinel and hands control to the right blob: `CMD_START = 4` jumps into `GEMDRIVE_BLOB+4` (diagnostic + memtop verify), and `CMD_START_RUNNER = 5` jumps into `RUNNER_BLOB` (the Runner's poll loop). Adding a new module follows the same pattern: place a new `.text_<name>` section in `devops.ld`, mirror the offset with an `equ` in `main.s`, and add the `.o` target to `target/atarist/Makefile`.
 
-Adding more modules follows the same `gemdrive.ld`-style pattern used by `md-drives-emulator`: place each new `.text` section in `userfw.ld`, mirror the offset with an `equ` in `main.s`, and add the `.o` target to `target/atarist/Makefile`.
+Both `gemdrive.s` and `runner.s` are 100 % relocatable and self-contained — they include `inc/sidecart_macros.s` and `inc/sidecart_functions.s` privately so the protocol `bsr`'s resolve locally inside their own object files. No `xref` / `xdef` cross-module references; no `jsr` / `jmp` to outside-module symbols (except the entry-point `jmp` from `main.s`'s dispatch). See `CLAUDE.md` for the full editing guardrails.
+
+## Runner mode
+
+Runner mode is the foreground execution path the firmware ships with. The user picks `[U]` at the setup terminal to launch it; the m68k Runner stays in a poll loop waiting for commands from the RP, while GEMDRIVE keeps servicing TOS file I/O so launched programs can use the emulated drive normally.
+
+The Runner exposes its own subset of the HTTP API (`/api/v1/runner/*`) and CLI (`sidecart runner …`) for cold-resetting the ST, executing programs, navigating the cwd, switching screen resolutions, and reading a live system-memory snapshot. See [`docs/api.md`](docs/api.md) for the full reference (curl + sidecart examples for every endpoint).
+
+```sh
+python3 cli/sidecart.py runner status
+python3 cli/sidecart.py runner cd /GAMES/ARKANOID
+python3 cli/sidecart.py runner run RUNME.TOS
+python3 cli/sidecart.py runner reset
+python3 cli/sidecart.py runner res low
+python3 cli/sidecart.py runner meminfo
+```
 
 ## Remote HTTP Management API
 

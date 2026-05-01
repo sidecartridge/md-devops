@@ -89,7 +89,8 @@ python3 cli/sidecart.py rm SWITCHER.TOS
 | `416 Range Not Satisfiable` | Range outside file bounds. Carries `Content-Range: bytes */<size>`. |
 | `422 Unprocessable Entity` | Malformed JSON body, missing required field, listing-on-file, rename-into-own-descendant. |
 | `500 Internal Server Error` | FatFs disk error. |
-| `503 Service Unavailable` | Body-stream lock held, or SD not mounted. Always carries `Retry-After: 1`. |
+| `503 Service Unavailable` | Body-stream lock held, SD not mounted, or Runner busy with another command. Always carries `Retry-After: 1`. |
+| `504 Gateway Timeout` | Runner endpoint waited > 1 s for the m68k to reply (`gateway_timeout`). |
 
 ## Error code vocabulary
 
@@ -99,7 +100,13 @@ Clients can switch on `code` reliably. All defined symbols:
 `is_directory`, `is_file`, `conflict`, `length_required`,
 `payload_too_large`, `range_invalid`, `bad_json`, `unprocessable`,
 `unsupported_media`, `method_not_allowed`, `busy`, `disk_error`,
-`internal_error`.
+`internal_error`, `runner_inactive`, `gateway_timeout`, `no_snapshot`.
+
+The last three are Runner-specific (see *Runner mode* below):
+`runner_inactive` means the user didn't pick `[U]` at boot,
+`gateway_timeout` means the Atari ST didn't reply within 1 s, and
+`no_snapshot` means the m68k handshake completed but no snapshot
+was recorded (should not happen in practice).
 
 ---
 
@@ -386,6 +393,235 @@ curl -X POST -H 'Content-Type: application/json' \
 ```sh
 python3 cli/sidecart.py mvdir OLDNAME NEWNAME
 ```
+
+---
+
+## Runner mode
+
+Runner mode is a foreground execution loop that runs on the Atari
+ST instead of the GEMDRIVE-only firmware. The user picks `[U]` at
+the setup terminal to launch it; the m68k Runner stays in a poll
+loop reading commands from the cartridge sentinel, while GEMDRIVE
+keeps servicing TOS file I/O so programs you launch can use the
+emulated drive normally.
+
+All Runner endpoints live under `/api/v1/runner/`. Most are fire-
+and-forget (`202 Accepted` — the m68k reports completion later via
+the cartridge protocol, surfaced via `runner status`). `meminfo` is
+synchronous and returns the live snapshot. Every Runner endpoint
+also returns `409 runner_inactive` when the user did not pick `[U]`
+at boot, and `409 busy` (with `Retry-After: 1`) when another Runner
+command is already in flight.
+
+---
+
+### `GET /api/v1/runner` — Runner state
+
+Reports whether Runner mode is active, whether a command is in
+flight, the last-known cwd, and the most-recent completion's
+metadata.
+
+**`curl`**:
+```sh
+curl http://sidecart.local/api/v1/runner
+```
+
+**Response (200 OK)**:
+```json
+{
+  "ok": true,
+  "active": true,
+  "busy": false,
+  "cwd": "/GAMES/ARKANOID",
+  "last_command": "EXECUTE",
+  "last_path": "/GAMES/ARKANOID/RUNME.TOS",
+  "last_exit_code": 0,
+  "last_cd_errno": null,
+  "last_res_errno": null,
+  "last_started_at_ms": 12345,
+  "last_finished_at_ms": 13002
+}
+```
+
+`last_command` is one of `null`, `RESET`, `EXECUTE`, `CD`, `RES`,
+or `MEMINFO`. The `last_cd_errno` / `last_res_errno` fields are
+`null` unless the most-recent command was a CD or RES respectively.
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py runner status        # human form
+python3 cli/sidecart.py runner status --json # raw envelope
+```
+
+---
+
+### `POST /api/v1/runner/reset` — cold-reset the ST
+
+Fires `RUNNER_CMD_RESET` at the m68k, which invalidates TOS' memory
+cookies and jumps through `$4.w`. The Runner re-launches itself
+automatically once the m68k cold-boot reaches `gemdrive_init`'s
+HELLO handshake — no operator action needed. Stale state on the
+RP side (busy lock, cwd mirror, last-cd / last-res errno) is
+cleared by the m68k's HELLO message at re-entry.
+
+**`curl`**:
+```sh
+curl -X POST http://sidecart.local/api/v1/runner/reset
+```
+
+**Response (202 Accepted)**: `{"ok":true,"accepted":true}`.
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py runner reset
+```
+
+---
+
+### `POST /api/v1/runner/run` — Pexec a TOS / PRG program
+
+Body: `{"path":"<rel>", "cmdline":"<≤127 chars>"}`. `cmdline` may be
+omitted (defaults to empty). The path is jailed under
+`GEMDRIVE_FOLDER` like every other API endpoint; relative paths
+resolve against the current `runner cd` cwd, so after `cd /GAMES`
+you can `run RUNME.TOS` without retyping the prefix.
+
+The handler validates the path exists and is a regular file before
+firing the sentinel, so 404 / 400 errors come back synchronously;
+the `202` only means the Pexec was successfully dispatched. The
+program's exit code shows up later in `runner status`.
+
+**`curl`**:
+```sh
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"path":"/GAMES/ARKANOID/RUNME.TOS","cmdline":""}' \
+     http://sidecart.local/api/v1/runner/run
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py runner run /GAMES/ARKANOID/RUNME.TOS
+python3 cli/sidecart.py runner run RUNME.TOS                    # if cwd is /GAMES/ARKANOID
+python3 cli/sidecart.py runner run PROG.TOS -- -v --file foo    # cmdline = "-v --file foo"
+```
+
+Common error codes: `404 not_found` (program file doesn't exist),
+`400 bad_path` (rejected name), `400 bad_request` (cmdline too
+long), `409 runner_inactive`, `409 busy`.
+
+---
+
+### `POST /api/v1/runner/cd` — change the Runner cwd
+
+Body: `{"path":"<rel>"}`. The m68k issues a GEMDOS `Dsetpath` and
+reports the GEMDOS errno via the cartridge protocol; the RP-side
+mirror updates so subsequent relative `runner run` / `runner cd`
+calls resolve from the new cwd. Allows `/` (Dsetpath to drive
+root); validates that other paths exist and are directories before
+firing.
+
+**`curl`**:
+```sh
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"path":"/GAMES/ARKANOID"}' \
+     http://sidecart.local/api/v1/runner/cd
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py runner cd /GAMES/ARKANOID
+python3 cli/sidecart.py runner cd ARKANOID         # relative to current cwd
+```
+
+Common error codes: `404 not_found`, `400 bad_path` (rejected name
+or "not a directory"), `409 runner_inactive`, `409 busy`.
+
+---
+
+### `POST /api/v1/runner/res` — change screen resolution
+
+Body: `{"rez":"low"|"med"}`. Stateless — the caller passes the
+target rez explicitly. The m68k inspects the current resolution
+and refuses on monochrome (high-rez) monitors, reporting an errno
+that surfaces as `last_res_errno` in `runner status` (`-1` =
+ignored on mono, `-2` = bad rez). On colour monitors, the handler
+calls XBIOS `Setscreen` followed by `Vsync`, restores the default
+TOS palette, and repaints the runner banner.
+
+**`curl`**:
+```sh
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"rez":"med"}' \
+     http://sidecart.local/api/v1/runner/res
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py runner res low
+python3 cli/sidecart.py runner res med
+```
+
+Common error codes: `400 bad_request` (unknown rez), `409
+runner_inactive`, `409 busy`.
+
+---
+
+### `GET /api/v1/runner/meminfo` — system memory snapshot
+
+Synchronous read of the ST's TOS memory cookies and the MMU
+bank-config register. The handler fires `RUNNER_CMD_MEMINFO` and
+spins on the chandler loop until the m68k replies, with a 1-second
+timeout (returned as `504 gateway_timeout` if the m68k is wedged).
+
+Reported addresses:
+
+| Field       | ST sysvar    | Meaning |
+| ----------- | ------------ | ------- |
+| `membottom` | `$432`       | `_membot` — start of usable RAM after TOS reservations. |
+| `memtop`    | `$436`       | `_memtop` — top of TPA memory available to processes. |
+| `phystop`   | `$42E`       | `_phystop` — top of physical RAM. |
+| `screenmem` | `$44E`       | `_v_bas_ad` — logical screen base. |
+| `basepage`  | `$4F2`       | `_run` — current process basepage (TOS ≥ 1.04; 0 on older TOS). |
+| `bank0_kb`, `bank1_kb` | `$FFFF8001` lower nibble | MMU bank sizes in KB. `0/0` when the nibble is unrecognised. |
+| `decoded`   | derived | `true` when at least one bank size is non-zero. |
+
+Bank decode table (matches Atari ST hardware):
+
+| Nibble (bin) | bank0 | bank1 |
+| ------------ | ----- | ----- |
+| `0000`       | 128   | 128   |
+| `0100`       | 512   | 128   |
+| `0101`       | 512   | 512   |
+| `1000`       | 2048  | 128   |
+| `1010`       | 2048  | 2048  |
+
+**`curl`**:
+```sh
+curl http://sidecart.local/api/v1/runner/meminfo
+```
+
+**Response (200 OK)**:
+```json
+{
+  "ok": true,
+  "membottom": 37544,
+  "memtop": 3670016,
+  "phystop": 4194304,
+  "screenmem": 4161664,
+  "basepage": 0,
+  "bank0_kb": 2048,
+  "bank1_kb": 2048,
+  "decoded": true
+}
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py runner meminfo
+```
+
+Common error codes: `409 runner_inactive`, `409 busy`,
+`504 gateway_timeout`.
 
 ---
 
