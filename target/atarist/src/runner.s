@@ -138,13 +138,37 @@ RUNNER_BLOB_SIZE_BYTES		equ $C00			; matches devops.ld slot
 RUNNER_RELOC_OFFSET		equ $1000			; runner sits 4 KB below gemdrive
 _memtop				equ $436
 
-; Advanced Runner VBL command range. Reuses the existing sentinel;
-; the foreground poll loop's cmp.l cascade only matches $05xx, so
-; $06xx codes pass through to the VBL handler.
+; Advanced Runner command range. Reuses the existing sentinel; the
+; foreground poll loop's cmp.l cascade only matches $05xx, so $06xx
+; codes pass through to the Advanced handler.
 APP_RUNNER_VBL			equ $0600
 RUNNER_ADV_CMD_RESET		equ ($01 + APP_RUNNER_VBL)	; forced cold reset
 RUNNER_VBL_RANGE_MASK		equ $FF00
-VEC_VBL_AUTO			equ $70
+
+; --- Hook-vector selector (Epic 04 / S3) ---
+; The Advanced handler can be installed at one of two vectors.
+; Both are simple long pointers and accept the same chain pattern
+; (`move.l old(pc), -(sp); rts`), so the handler body is identical;
+; only the install address differs.
+;
+;   $70  — VBL autovector. Fires every vsync (50/60 Hz). Default.
+;          Polite to chain, but a program that does
+;          `move.l #my_handler, $70.w` without saving the previous
+;          value DESTROYS our hook completely — the VBL-driven
+;          `adv reset` cannot recover such a program.
+;   $400 — etv_timer ETV vector. Fires every 200 Hz from TOS' MFP
+;          timer-C handler. Higher rate (5 ms) but our handler is
+;          minimal so the overhead is negligible. Much harder for
+;          a wedged program to break — TOS' keyboard, mouse and
+;          sound subsystems all chain through this vector, so a
+;          wholesale replacement breaks the program itself before
+;          it can wedge anything else.
+;
+; Toggle by changing ADV_HOOK_VECTOR below. No other code change
+; needed — install / chain / uninstall all use this constant.
+ADV_HOOK_VECTOR_VBL		equ $70
+ADV_HOOK_VECTOR_ETV_TIMER	equ $400
+ADV_HOOK_VECTOR			equ ADV_HOOK_VECTOR_ETV_TIMER
 
 ; runner.s must be 100% relocatable and self-contained — no xref /
 ; xdef cross-module references, no jsr / jmp to symbols outside
@@ -218,18 +242,19 @@ runner_post_reloc:
 	trap	#1
 	addq.l	#6, sp
 
-	; --- Step 0.5 (Epic 04 / S1): install the Advanced Runner VBL
-	; hook at $70. We're already in supervisor mode (inherited from
+	; --- Step 0.5 (Epic 04 / S1+S3): install the Advanced Runner
+	; hook at the vector chosen by ADV_HOOK_VECTOR ($70 VBL, $400
+	; etv_timer). We're already in supervisor mode (inherited from
 	; CA_INIT bit 27), so direct vector write is fine. Mask
 	; interrupts during the swap so we never run a partially-updated
 	; vector. The hook is part of the relocated blob so it survives
 	; cartridge-bus weirdness during the ISR. ---
 	move.w	sr, -(sp)
 	or.w	#$0700, sr
-	lea	old_vbl(pc), a1			; PC-rel into the relocated blob
-	move.l	$70.w, (a1)
-	lea	adv_vbl_handler(pc), a0		; relocated handler address
-	move.l	a0, $70.w
+	lea	old_adv_hook(pc), a1		; PC-rel into the relocated blob
+	move.l	ADV_HOOK_VECTOR.w, (a1)
+	lea	adv_hook_handler(pc), a0	; relocated handler address
+	move.l	a0, ADV_HOOK_VECTOR.w
 	move.w	(sp)+, sr
 
 	; Tell the RP a fresh Runner session just started so it clears
@@ -596,16 +621,19 @@ runner_reset:
 	nop
 
 ; ---------------------------------------------------------------
-; Advanced Runner VBL hook (Epic 04 / S1).
+; Advanced Runner hook (Epic 04 / S1+S2+S3).
 ;
-; Installed at $70 by runner_post_reloc. Runs at every vsync — must
-; be tight, must be position-independent, must chain cleanly to
-; whatever was at $70 before us so TOS' own VBL chain keeps firing.
+; Installed at ADV_HOOK_VECTOR ($70 VBL or $400 etv_timer) by
+; runner_post_reloc. Same handler body services both — the chain
+; pattern (`move.l old(pc), -(sp); rts`) works for an autovectored
+; interrupt (rts → chained handler → rte) and for an ETV-style
+; subroutine (rts → chained handler → rts back to TOS' MFP ISR
+; which then rte's). ETV convention says d0/d1/a0/a1 are scratch,
+; which our save list (d0/d1/a0) is a strict subset of.
 ;
 ; Read the cartridge sentinel and check whether the upper byte of
-; the command code matches APP_RUNNER_VBL ($0600). If so, dispatch
-; (S2 lands the actual commands — for now this is a stub). Then
-; fall through to the saved handler regardless.
+; the command code matches APP_RUNNER_VBL ($0600). If so, dispatch.
+; Then fall through to the saved handler regardless.
 ;
 ; The sentinel is written by the RP via SEND_COMMAND_TO_DISPLAY;
 ; values in the $05xx range belong to the foreground poll loop,
@@ -613,7 +641,7 @@ runner_reset:
 ; collide so the poll loop's existing cmp.l cascade ignores us
 ; and we ignore everything outside $06xx.
 ; ---------------------------------------------------------------
-adv_vbl_handler:
+adv_hook_handler:
 	movem.l	d0-d1/a0, -(sp)			; ISR prologue — minimal save
 	move.l	CMD_MAGIC_SENTINEL_ADDR, d0
 	move.l	d0, d1
@@ -628,8 +656,8 @@ adv_vbl_handler:
 	; already validated the command code before firing the sentinel.)
 .adv_chain:
 	movem.l	(sp)+, d0-d1/a0
-	move.l	old_vbl(pc), -(sp)
-	rts					; chain → previous handler does its work + rte
+	move.l	old_adv_hook(pc), -(sp)
+	rts					; chain → previous handler
 
 ; --- Forced cold reset (Epic 04 / S2). Mirrors the foreground
 ; runner_reset's memvalid clear + jmp through the reset vector at
@@ -647,14 +675,16 @@ adv_force_reset:
 	jmp	(a0)
 	; unreachable
 
-; old_vbl: 4-byte cell holding the address of the prior $70 vector
-; (saved at install time by runner_post_reloc). PC-relative read
-; works at runtime once the blob is relocated; the cell lives in
-; the relocated copy, NOT the cartridge ROM original.
+; old_adv_hook: 4-byte cell holding the address of the prior
+; vector (saved at install time by runner_post_reloc — could be a
+; previous VBL handler or a previous etv_timer ETV depending on
+; ADV_HOOK_VECTOR). PC-relative read works at runtime once the
+; blob is relocated; the cell lives in the relocated copy, NOT
+; the cartridge ROM original.
 	cnop	0,4
-	dc.l	'XBRA'				; XBRA debug marker so VBL-chain
+	dc.l	'XBRA'				; XBRA debug marker so chain
 	dc.l	'SDRA'				; walkers can identify our hook
-old_vbl:
+old_adv_hook:
 	dc.l	0
 	even
 
