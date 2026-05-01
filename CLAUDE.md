@@ -37,7 +37,7 @@ For pure Atari-side edits (`target/atarist/src/*.s`, `*.ld`, `Makefile`, `inc/*.
 cd target/atarist && ./build.sh "$(pwd)" release
 ```
 
-The top-level `./build.sh` also re-pins SDK submodules and rebuilds the full RP firmware (CMake configure + lwIP/cyw43/mbedtls + UF2), which is minutes of work for a m68k syntax check. The atarist script alone enforces the 8 KB `BOOT.BIN` cap and prints `Cartridge code: N / 8192 bytes` — exactly what the iteration loop needs. Reserve the top-level build for RP-side changes or both-sides changes.
+The top-level `./build.sh` also re-pins SDK submodules and rebuilds the full RP firmware (CMake configure + lwIP/cyw43/mbedtls + UF2), which is minutes of work for a m68k syntax check. The atarist script alone enforces the 10 KB `BOOT.BIN` cap and prints `Cartridge code: N / 10240 bytes` — exactly what the iteration loop needs. Reserve the top-level build for RP-side changes or both-sides changes.
 
 ### Build gotchas
 - **CMake always builds with `-DCMAKE_BUILD_TYPE=MinSizeRel`** regardless of the `<build_type>` argument. A full `Release` previously caused breakage (memory/over-optimization). The legacy line is left commented in `rp/build.sh`. `<build_type>` only controls the `DEBUG_MODE` macro and the dist filename.
@@ -69,10 +69,10 @@ The Atari ST sees a 64 KB window at `$FA0000`–`$FAFFFF` (mirrored RP-side at `
 
 | Offset | Symbol | Size | Purpose |
 | --- | --- | --- | --- |
-| `$FA0000` | cartridge image | 8 KB | m68k header + all `.text_*` sections (hard limit) |
-| `$FA2000` | `CMD_MAGIC_SENTINEL` | 4 B | m68k polls here for NOP/RESET/command words |
-| `$FA2004` | `RANDOM_TOKEN`, `RANDOM_TOKEN_SEED`, 60 × 4 B indexed shared variables | ~768 B | fixed-offset metadata block (first 512 B until `$FA2300`) |
-| `$FA2300` | `APP_FREE` | ~48 KB | contiguous arena for app buffers |
+| `$FA0000` | cartridge image | 10 KB | m68k header + all `.text_*` sections (hard limit) |
+| `$FA2800` | `CMD_MAGIC_SENTINEL` | 4 B | m68k polls here for NOP/RESET/command words |
+| `$FA2804` | `RANDOM_TOKEN`, `RANDOM_TOKEN_SEED`, 60 × 4 B indexed shared variables | ~768 B | fixed-offset metadata block (first 512 B until `$FA2B00`) |
+| `$FA2B00` | `APP_FREE` | ~46 KB | contiguous arena for app buffers |
 | `$FAE0C0` | `FRAMEBUFFER` | 8000 B | 320×200 monochrome framebuffer; sits at the top of the region so an overrun walks off the end of the 64 KB window instead of corrupting the metadata block |
 
 See `programming.md` for the full table and budget rules.
@@ -111,6 +111,9 @@ The build assumes Core 0 owns flash writes (`PICO_FLASH_ASSUME_CORE0_SAFE=1`). T
 - **Never modify** `pico-sdk/`, `pico-extras/`, or `fatfs-sdk/` — they are git submodules pinned to specific upstream revisions, and the build re-pins them on every run. To change FatFs configuration, edit `rp/src/ff/ffconf.h` (project-owned override); the include path is set up so this file wins over the submodule's default.
 - Don't touch `main.c` for feature work — start in `emul.c`.
 - Match the existing C style (clang-format config in `.clang-format`, clang-tidy in `.clang-tidy` — both wired up via CMake when the binaries are on `PATH`).
+- **m68k modules `gemdrive.s` and `runner.s` MUST be 100% relocatable and self-contained.** They cannot rely on any cross-module symbol from `main.o` or each other. Concretely:
+  - **No `xref` / `xdef`.** Every macro and helper they call must be defined inside the same assembly unit. The protocol macros live in `inc/sidecart_macros.s` and `bsr.w` into functions defined in `inc/sidecart_functions.s`; both files are `include`'d verbatim at the top/bottom of each module so the bsr's resolve to a private local copy. vasm doesn't export plain labels so vlink doesn't see duplicates between main.o, gemdrive.o, and runner.o.
+  - **No `jsr` / `jmp` to outside-module symbols.** Both instructions emit absolute addresses, which freezes the call site to a specific runtime address — incompatible with relocation. Use `bsr` / `bra` (PC-relative) for all intra-module control flow. The single allowed exception is the entry-point `jmp` from `main.s`'s `check_commands` dispatch into the relocated blob (e.g. `jmp RUNNER_BLOB`); any future `jsr`/`jmp` to a non-local symbol from inside `gemdrive.s` or `runner.s` requires explicit user approval.
 
 ---
 

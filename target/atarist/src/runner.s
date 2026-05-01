@@ -3,7 +3,7 @@
 ; License: GPL v3
 ;
 ; The cartridge image places this module at offset $1C00 inside the
-; 8 KB cartridge code section (RUNNER_BLOB = $FA1C00) via
+; 10 KB cartridge code section (RUNNER_BLOB = $FA1C00) via
 ; target/atarist/src/devops.ld. main.s reaches it through
 ; `runner_function: jmp RUNNER_BLOB` when CMD_START_RUNNER (5)
 ; arrives at the sentinel — i.e. the user pressed [U] in the setup
@@ -31,9 +31,13 @@
 ; ---------------------------------------------------------------
 
 ROM4_ADDR			equ $FA0000
-SHARED_BLOCK_ADDR		equ (ROM4_ADDR + $2000)		; $FA2000
-CMD_MAGIC_SENTINEL_ADDR		equ SHARED_BLOCK_ADDR		; $FA2000
-APP_FREE_ADDR			equ (ROM4_ADDR + $2300)		; $FA2300
+CARTRIDGE_CODE_SIZE		equ $2800			; 10 KB cartridge code budget
+SHARED_BLOCK_ADDR		equ (ROM4_ADDR + CARTRIDGE_CODE_SIZE)	; $FA2800
+CMD_MAGIC_SENTINEL_ADDR		equ SHARED_BLOCK_ADDR		; $FA2800
+; APP_BUFFERS starts at SHARED_BLOCK + $100; APP_FREE starts $200
+; further in (after the high-res TRANSTABLE used by main.s' boot
+; framebuffer code). So APP_FREE = SHARED_BLOCK + $300.
+APP_FREE_ADDR			equ (SHARED_BLOCK_ADDR + $300)	; $FA2B00
 
 ; Runner sub-region inside APP_FREE. The base is positioned past
 ; GEMDRIVE's existing allocation (highest offset $162C; we leave
@@ -75,9 +79,10 @@ PRE_RESET_WAIT			equ $FFFFF
 
 ; Constants required by inc/sidecart_macros.s when send_sync expands.
 ; main.s defines these too; we need our own local copies because
-; runner.s is its own assembly unit.
-RANDOM_TOKEN_ADDR		equ $FA2004
-RANDOM_TOKEN_SEED_ADDR		equ $FA2008
+; runner.s is its own assembly unit. Derived from SHARED_BLOCK_ADDR
+; so a future cartridge cap bump only touches one constant.
+RANDOM_TOKEN_ADDR		equ (SHARED_BLOCK_ADDR + 4)	; $FA2804
+RANDOM_TOKEN_SEED_ADDR		equ (SHARED_BLOCK_ADDR + 8)	; $FA2808
 RANDOM_TOKEN_POST_WAIT		equ $1
 ROMCMD_START_ADDR		equ $FB0000
 CMD_MAGIC_NUMBER		equ $ABCD
@@ -113,32 +118,21 @@ RUNNER_RES_ERR_BAD		equ -2	; requested rez out of range
 ; .Pexec/detect_emulated_drive macro sees a current drive that matches
 ; SHARED_VAR_DRIVE_NUMBER and stays on the GEMDRIVE-handled path
 ; instead of chaining to TOS native (which would EFILNF on C:\).
-SHARED_VARIABLES_ADDR		equ $FA2010
+SHARED_VARIABLES_ADDR		equ (SHARED_BLOCK_ADDR + $10)	; $FA2810
 SHARED_VAR_DRIVE_NUMBER		equ 12
 DRIVE_NUMBER_ADDR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_DRIVE_NUMBER*4)
 
-; main.s' send_sync_command_to_sidecart lives ~6 KB away from this
-; module's BSR sites; that fits BSR.W's ±32 KB range, but vlink emits
-; an absolute relocation for cross-module references and tries to
-; squeeze the 32-bit absolute address into the BSR.W's 16-bit slot,
-; which fails. Substitute a private send_sync macro that uses JSR
-; (absolute long) instead — same semantics, just 4 bytes more per
-; call site.
-	xref	send_sync_command_to_sidecart
-
-runner_send_sync	macro
-	move.w	#CMD_RETRIES_COUNT, d7
-.\@retry:
-	movem.l	d1-d7, -(sp)
-	moveq.l	#\2, d1
-	move.w	#\1, d0
-	jsr	send_sync_command_to_sidecart
-	movem.l	(sp)+, d1-d7
-	tst.w	d0
-	beq.s	.\@ok
-	dbf	d7, .\@retry
-.\@ok:
-	endm
+; runner.s must be 100% relocatable and self-contained — no xref /
+; xdef cross-module references, no jsr / jmp to symbols outside
+; this assembly unit. The protocol macros (send_sync,
+; send_write_sync) live in inc/sidecart_macros.s and bsr.w into
+; functions defined in inc/sidecart_functions.s; both files are
+; included verbatim below so runner.o gets its own private copies
+; of those functions and the bsr's resolve locally. vasm doesn't
+; export plain labels, so vlink doesn't see duplicates against
+; main.o or gemdrive.o's copies. Same pattern gemdrive.s uses.
+	include	"inc/sidecart_macros.s"
+	include	"inc/tos.s"
 
 ; ---------------------------------------------------------------
 ; Entry point — offset 0 of the runner blob. Reached via
@@ -178,7 +172,7 @@ runner_entry:
 	; Tell the RP a fresh Runner session just started so it clears
 	; any stale busy lock / cwd mirror that survived a physical or
 	; cold reset (where the RP itself didn't see the reset event).
-	runner_send_sync RUNNER_CMD_DONE_HELLO, 0
+	send_sync RUNNER_CMD_DONE_HELLO, 0
 
 	; --- Step 1: clear screen + paint banner (single Cconws — the
 	; banner_text string leads with VT52 ESC E). ---
@@ -279,7 +273,7 @@ runner_execute:
 
 	; Recover exit code and ship it to the RP.
 	move.l	(sp)+, d3
-	runner_send_sync RUNNER_CMD_DONE_EXECUTE, 4
+	send_sync RUNNER_CMD_DONE_EXECUTE, 4
 	bra	runner_poll_loop
 
 ; RUNNER_CMD_CD handler. Reads RUNNER_PATH (NUL-terminated) and calls
@@ -318,7 +312,7 @@ runner_cd:
 
 	; Ship errno to the RP.
 	move.l	d0, d3
-	runner_send_sync RUNNER_CMD_DONE_CD, 4
+	send_sync RUNNER_CMD_DONE_CD, 4
 	bra	runner_poll_loop
 
 ; RUNNER_CMD_RES handler. Stateless screen-resolution change for
@@ -398,7 +392,7 @@ runner_res:
 	moveq	#RUNNER_RES_ERR_BAD, d3
 
 .runner_res_done:
-	runner_send_sync RUNNER_CMD_DONE_RES, 4
+	send_sync RUNNER_CMD_DONE_RES, 4
 	bra	runner_poll_loop
 
 ; Cold reset — same sequence as main.s' .reset. Waits briefly,
@@ -488,6 +482,16 @@ runner_print_dec_d3:
 	lea	12(sp), sp
 	movem.l	(sp)+, d0-d2/d4-d5/a0-a1
 	rts
+
+; ---------------------------------------------------------------
+; Private copy of the shared sidecart protocol functions
+; (send_sync_command_to_sidecart + send_sync_write_command_to_sidecart),
+; included so the bsr's emitted by send_sync / send_write_sync from
+; inc/sidecart_macros.s resolve inside this assembly unit. Same
+; pattern as gemdrive.s — vasm doesn't export plain labels so this
+; doesn't conflict with main.o's or gemdrive.o's copies.
+; ---------------------------------------------------------------
+	include	"inc/sidecart_functions.s"
 
 ; ---------------------------------------------------------------
 ; Read-only data (lives in cartridge ROM alongside the code).

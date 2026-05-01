@@ -718,24 +718,24 @@ The 64 KB `ROM_IN_RAM` region is mirrored 1:1 into the Atari ST address space at
 
 | m68k addr | RP addr      | Size       | Region                                    |
 | --------- | ------------ | ---------- | ----------------------------------------- |
-| `$FA0000` | `0x20030000` | 8 KB max   | **CARTRIDGE** — m68k header + code        |
-| `$FA2000` | `0x20032000` | 4 B        | **CMD_MAGIC_SENTINEL** — m68k polls here for `CMD_NOP` / `CMD_RESET` / `CMD_BOOT_GEM` / `CMD_TERMINAL` |
-| `$FA2004` | `0x20032004` | 4 B        | **RANDOM_TOKEN** — chandler echoes the request token here so `send_sync` returns |
-| `$FA2008` | `0x20032008` | 4 B        | **RANDOM_TOKEN_SEED**                     |
-| `$FA200C` | `0x2003200C` | 4 B        | reserved for framework use (zeroed by `chandler_init`) |
-| `$FA2010` | `0x20032010` | 240 B      | **SHARED_VARIABLES** — 60 indexed 4-byte slots |
-| `$FA2100` | `0x20032100` | 512 B      | **TRANSTABLE** — high-res mask table written by `display_setupU8g2()` |
-| `$FA2300` | `0x20032300` | ~48 KB     | **APP_FREE** — free arena for app-specific buffers |
+| `$FA0000` | `0x20030000` | 10 KB max  | **CARTRIDGE** — m68k header + code        |
+| `$FA2800` | `0x20032800` | 4 B        | **CMD_MAGIC_SENTINEL** — m68k polls here for `CMD_NOP` / `CMD_RESET` / `CMD_BOOT_GEM` / `CMD_TERMINAL` |
+| `$FA2804` | `0x20032804` | 4 B        | **RANDOM_TOKEN** — chandler echoes the request token here so `send_sync` returns |
+| `$FA2808` | `0x20032808` | 4 B        | **RANDOM_TOKEN_SEED**                     |
+| `$FA280C` | `0x2003280C` | 4 B        | reserved for framework use (zeroed by `chandler_init`) |
+| `$FA2810` | `0x20032810` | 240 B      | **SHARED_VARIABLES** — 60 indexed 4-byte slots |
+| `$FA2900` | `0x20032900` | 512 B      | **TRANSTABLE** — high-res mask table written by `display_setupU8g2()` |
+| `$FA2B00` | `0x20032B00` | ~46 KB     | **APP_FREE** — free arena for app-specific buffers |
 | `$FAE0C0` | `0x2003E0C0` | 8000 B     | **FRAMEBUFFER** (320×200 monochrome)      |
 | `$FAFFFF` | `0x2003FFFF` | —          | end of region                             |
 
 Why the framebuffer sits at the top:
-- Apps get a single contiguous 48 KB arena (`APP_FREE`) instead of the previous fragmented "above the framebuffer / below the tokens" hole.
+- Apps get a single contiguous 46 KB arena (`APP_FREE`) instead of the previous fragmented "above the framebuffer / below the tokens" hole.
 - A framebuffer overrun walks off the end of the 64 KB region into unused RP RAM rather than corrupting the random-token slot or the shared-variables block.
 
 Cartridge code budget:
-- The cartridge image (header + m68k code) MUST fit in the first 8 KB of the region (`$FA0000`–`$FA1FFF`). Anything larger overlaps the shared block and breaks the protocol.
-- `target/atarist/build.sh` enforces this against `BOOT.BIN` after `vlink` and aborts with a clear error if the image exceeds 8192 bytes. Direct `vasm`/`vlink` invocations bypass the check, so prefer the build script.
+- The cartridge image (header + m68k code) MUST fit in the first 10 KB of the region (`$FA0000`–`$FA27FF`). Anything larger overlaps the shared block and breaks the protocol.
+- `target/atarist/build.sh` enforces this against `BOOT.BIN` after `vlink` and aborts with a clear error if the image exceeds 10240 bytes. Direct `vasm`/`vlink` invocations bypass the check, so prefer the build script.
 
 Constants — each row is the same value seen from both sides. RP-side
 names live in `rp/src/include/chandler.h`; m68k-side names live in
@@ -744,18 +744,18 @@ hard-code the literal address.
 
 | Purpose                                     | RP (chandler.h)                       | m68k (main.s)                | Value      |
 | ------------------------------------------- | ------------------------------------- | ---------------------------- | ---------- |
-| Cartridge code size budget                  | `CHANDLER_CARTRIDGE_CODE_SIZE`        | `CARTRIDGE_CODE_SIZE`        | 8 KB       |
-| Base of the shared block                    | (= `CHANDLER_CMD_SENTINEL_OFFSET`)    | `SHARED_BLOCK_ADDR`          | `$FA2000`  |
-| Command sentinel slot                       | `CHANDLER_CMD_SENTINEL_OFFSET`        | `CMD_MAGIC_SENTINEL_ADDR`    | `$FA2000`  |
-| Random-token reply slot                     | `CHANDLER_RANDOM_TOKEN_OFFSET`        | `RANDOM_TOKEN_ADDR`          | `$FA2004`  |
-| Random-token seed slot                      | `CHANDLER_RANDOM_TOKEN_SEED_OFFSET`   | `RANDOM_TOKEN_SEED_ADDR`     | `$FA2008`  |
-| Reserved (zeroed by `chandler_init`)        | `CHANDLER_RESERVED_OFFSET`            | `RESERVED_SLOT_ADDR`         | `$FA200C`  |
-| Shared variables base (60 × 4 B slots)      | `CHANDLER_SHARED_VARIABLES_OFFSET`    | `SHARED_VARIABLES`           | `$FA2010`  |
+| Cartridge code size budget                  | `CHANDLER_CARTRIDGE_CODE_SIZE`        | `CARTRIDGE_CODE_SIZE`        | 10 KB      |
+| Base of the shared block                    | (= `CHANDLER_CMD_SENTINEL_OFFSET`)    | `SHARED_BLOCK_ADDR`          | `$FA2800`  |
+| Command sentinel slot                       | `CHANDLER_CMD_SENTINEL_OFFSET`        | `CMD_MAGIC_SENTINEL_ADDR`    | `$FA2800`  |
+| Random-token reply slot                     | `CHANDLER_RANDOM_TOKEN_OFFSET`        | `RANDOM_TOKEN_ADDR`          | `$FA2804`  |
+| Random-token seed slot                      | `CHANDLER_RANDOM_TOKEN_SEED_OFFSET`   | `RANDOM_TOKEN_SEED_ADDR`     | `$FA2808`  |
+| Reserved (zeroed by `chandler_init`)        | `CHANDLER_RESERVED_OFFSET`            | `RESERVED_SLOT_ADDR`         | `$FA280C`  |
+| Shared variables base (60 × 4 B slots)      | `CHANDLER_SHARED_VARIABLES_OFFSET`    | `SHARED_VARIABLES`           | `$FA2810`  |
 | Shared-variables slot count                 | `CHANDLER_SHARED_VARIABLES_SLOTS`     | (implicit: 60)               | 60         |
-| App buffers base (TRANSTABLE + APP_FREE)    | `CHANDLER_APP_BUFFERS_OFFSET`         | `APP_BUFFERS_ADDR`           | `$FA2100`  |
-| High-res mask table base                    | `CHANDLER_HIGHRES_TRANSTABLE_OFFSET`  | `TRANSTABLE`                 | `$FA2100`  |
+| App buffers base (TRANSTABLE + APP_FREE)    | `CHANDLER_APP_BUFFERS_OFFSET`         | `APP_BUFFERS_ADDR`           | `$FA2900`  |
+| High-res mask table base                    | `CHANDLER_HIGHRES_TRANSTABLE_OFFSET`  | `TRANSTABLE`                 | `$FA2900`  |
 | High-res mask table size                    | `CHANDLER_HIGHRES_TRANSTABLE_SIZE`    | `TRANSTABLE_SIZE`            | 512 B      |
-| Free arena for app-specific buffers         | `CHANDLER_APP_FREE_OFFSET`            | `APP_FREE_ADDR`              | `$FA2300`  |
+| Free arena for app-specific buffers         | `CHANDLER_APP_FREE_OFFSET`            | `APP_FREE_ADDR`              | `$FA2B00`  |
 | Framebuffer base                            | `CHANDLER_FRAMEBUFFER_OFFSET`         | `FRAMEBUFFER_ADDR`           | `$FAE0C0`  |
 | Framebuffer size                            | `CHANDLER_FRAMEBUFFER_SIZE`           | `FRAMEBUFFER_SIZE`           | 8000 B     |
 

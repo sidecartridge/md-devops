@@ -2,13 +2,13 @@
  *
  * The cartridge image is loaded verbatim at $FA0000 by the cartridge
  * port hardware, so the offsets below become runtime addresses by
- * adding ROM4_ADDR. The 8 KB cartridge code budget
- * (CARTRIDGE_CODE_SIZE = $2000) is split:
+ * adding ROM4_ADDR. The 10 KB cartridge code budget
+ * (CARTRIDGE_CODE_SIZE = $2800) is split:
  *
  *   $0000..$07FF  main.s     2 KB   boot, dispatch, terminal
  *   $0800..$1BFF  gemdrive.s 5 KB   GEMDOS hooks + protocol blob
  *                                   (relocated to RAM at boot)
- *   $1C00..$1FFF  runner.s   1 KB   Runner foreground loop (Epic 03)
+ *   $1C00..$27FF  runner.s   3 KB   Runner foreground loop (Epic 03)
  *
  * The gemdrive blob is copied at boot to a configurable RAM address
  * (default screen_base - 8 KB) by main.s's gemdrive_init; the Runner

@@ -70,9 +70,10 @@
 #define GEMDRIVE_SVAR_FIRST_FILE_DESCRIPTOR 15  // base file handle (Phase 2)
 
 // Per-handler scratch state lives in the cartridge APP_FREE region
-// ($FA2300+) so the m68k can read it via absolute addressing without
-// burning shared-variable slots. Offsets are relative to APP_FREE base
-// (CHANDLER_APP_FREE_OFFSET in chandler.h).
+// (currently $FA2B00+; CHANDLER_APP_FREE_OFFSET in chandler.h is the
+// authoritative offset within the shared region) so the m68k can read
+// it via absolute addressing without burning shared-variable slots.
+// Offsets below are relative to the APP_FREE base.
 #define GEMDRIVE_DEFAULT_PATH_OFFSET 0x000
 #define GEMDRIVE_DEFAULT_PATH_LEN 128
 #define GEMDRIVE_DFREE_STATUS_OFFSET 0x080

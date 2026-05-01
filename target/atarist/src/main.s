@@ -28,29 +28,29 @@ ROM4_ADDR			equ $FA0000
 
 ; Shared 64 KB region layout (must match rp/src/include/chandler.h).
 ;
-;   $FA0000  CARTRIDGE			m68k header + code (max 8 KB)
-;   $FA2000  CMD_MAGIC_SENTINEL_ADDR	4 B
-;   $FA2004  RANDOM_TOKEN_ADDR		4 B
-;   $FA2008  RANDOM_TOKEN_SEED_ADDR	4 B
-;   $FA200C  reserved			4 B
-;   $FA2010  SHARED_VARIABLES		240 B (60 x 4-byte slots)
-;   $FA2100  APP_BUFFERS_ADDR	       ~48 KB free arena (TRANSTABLE etc.)
+;   $FA0000  CARTRIDGE			m68k header + code (max 10 KB)
+;   $FA2800  CMD_MAGIC_SENTINEL_ADDR	4 B
+;   $FA2804  RANDOM_TOKEN_ADDR		4 B
+;   $FA2808  RANDOM_TOKEN_SEED_ADDR	4 B
+;   $FA280C  reserved			4 B
+;   $FA2810  SHARED_VARIABLES		240 B (60 x 4-byte slots)
+;   $FA2900  APP_BUFFERS_ADDR	       ~46 KB free arena (TRANSTABLE etc.)
 ;   $FAE0C0  FRAMEBUFFER_ADDR		8000 B (320x200 mono, at the top)
 ;   $FAFFFF  end of region
 
-CARTRIDGE_CODE_SIZE	equ $2000	; 8 KB max for cartridge header + code
-SHARED_BLOCK_ADDR	equ (ROM4_ADDR + CARTRIDGE_CODE_SIZE)		; $FA2000
-CMD_MAGIC_SENTINEL_ADDR	equ SHARED_BLOCK_ADDR				; $FA2000
+CARTRIDGE_CODE_SIZE	equ $2800	; 10 KB max for cartridge header + code
+SHARED_BLOCK_ADDR	equ (ROM4_ADDR + CARTRIDGE_CODE_SIZE)		; $FA2800
+CMD_MAGIC_SENTINEL_ADDR	equ SHARED_BLOCK_ADDR				; $FA2800
 
 FRAMEBUFFER_SIZE	equ 8000	; 8000 bytes of a 320x200 monochrome screen
 FRAMEBUFFER_ADDR	equ (ROM4_ADDR + $10000 - FRAMEBUFFER_SIZE)	; $FAE040
-APP_BUFFERS_ADDR	equ (SHARED_BLOCK_ADDR + $100)			; $FA2100
+APP_BUFFERS_ADDR	equ (SHARED_BLOCK_ADDR + $100)			; $FA2900
 TRANSTABLE		equ APP_BUFFERS_ADDR				; high-res translation table
 
-; Cartridge code layout (devops.ld; CARTRIDGE_CODE_SIZE = 8 KB):
+; Cartridge code layout (devops.ld; CARTRIDGE_CODE_SIZE = 10 KB):
 ;   $0000..$07FF  main.s     2 KB   boot + dispatch + terminal
 ;   $0800..$1BFF  gemdrive.s 5 KB   GEMDRIVE blob (relocated to RAM)
-;   $1C00..$1FFF  runner.s   1 KB   Epic 03 Runner foreground loop
+;   $1C00..$27FF  runner.s   3 KB   Epic 03 Runner foreground loop
 ; At boot, gemdrive_init copies GEMDRIVE_BLOB_SIZE bytes from
 ; GEMDRIVE_BLOB into a configurable RAM address (default
 ; screen_base - 8 KB) so the resident GEMDRIVE code can survive past
@@ -60,7 +60,7 @@ TRANSTABLE		equ APP_BUFFERS_ADDR				; high-res translation table
 GEMDRIVE_BLOB		equ (ROM4_ADDR + $800)			; $FA0800
 GEMDRIVE_BLOB_SIZE	equ $1400				; 5 KB allocated by devops.ld
 RUNNER_BLOB		equ (ROM4_ADDR + $1C00)			; $FA1C00
-RUNNER_BLOB_SIZE	equ $400				; 1 KB allocated by devops.ld
+RUNNER_BLOB_SIZE	equ $C00				; 3 KB allocated by devops.ld
 
 SCREEN_SIZE			equ (-4096)	; Use the memory before the screen memory to store the copied code
 COLS_HIGH			equ 20		; 16 bit columns in the ST
@@ -102,16 +102,16 @@ _conterm			equ $484	; Conterm device number
 
 
 ; Constants needed for the commands
-RANDOM_TOKEN_ADDR:        equ (CMD_MAGIC_SENTINEL_ADDR + 4)  ; $FA2004
-RANDOM_TOKEN_SEED_ADDR:   equ (RANDOM_TOKEN_ADDR + 4)        ; $FA2008
-; $FA200C: 4-byte slot reserved for future framework use. chandler_init
+RANDOM_TOKEN_ADDR:        equ (CMD_MAGIC_SENTINEL_ADDR + 4)  ; $FA2804
+RANDOM_TOKEN_SEED_ADDR:   equ (RANDOM_TOKEN_ADDR + 4)        ; $FA2808
+; $FA280C: 4-byte slot reserved for future framework use. chandler_init
 ; zeroes it at boot; apps must not write here.
-RESERVED_SLOT_ADDR:       equ (RANDOM_TOKEN_SEED_ADDR + 4)   ; $FA200C
+RESERVED_SLOT_ADDR:       equ (RANDOM_TOKEN_SEED_ADDR + 4)   ; $FA280C
 RANDOM_TOKEN_POST_WAIT:   equ $1                             ; Wait cycles after the RNG is ready
 COMMAND_TIMEOUT           equ $0000FFFF                      ; Timeout for the command
 COMMAND_WRITE_TIMEOUT     equ COMMAND_TIMEOUT                ; Timeout for write commands
 
-SHARED_VARIABLES:         equ (RESERVED_SLOT_ADDR + 4)       ; $FA2010 (60 indexed 4-byte slots)
+SHARED_VARIABLES:         equ (RESERVED_SLOT_ADDR + 4)       ; $FA2810 (60 indexed 4-byte slots)
 
 ROMCMD_START_ADDR:        equ $FB0000					  ; We are going to use ROM3 address
 CMD_MAGIC_NUMBER    	  equ ($ABCD) 					  ; Magic number header to identify a command
@@ -224,7 +224,7 @@ check_commands		macro
 
 ;Rom cartridge
 ; The cartridge image (header + code below) MUST fit in
-; CARTRIDGE_CODE_SIZE = $2000 (8 KB). The hard limit is enforced by
+; CARTRIDGE_CODE_SIZE = $2800 (10 KB). The hard limit is enforced by
 ; target/atarist/build.sh after vlink emits BOOT.BIN; any direct vasm /
 ; vlink invocation that bypasses the build script is unchecked, so keep
 ; an eye on BOOT.BIN's size when iterating outside ./build.sh.

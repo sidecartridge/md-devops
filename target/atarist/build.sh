@@ -27,13 +27,13 @@ if [ "$make_status" -ne 0 ]; then
     exit $make_status
 fi
 
-# Cartridge code budget: header + code must fit in 8 KB
+# Cartridge code budget: header + code must fit in 10 KB
 # (CHANDLER_CARTRIDGE_CODE_SIZE in rp/src/include/chandler.h, mirrored as
 # CARTRIDGE_CODE_SIZE in target/atarist/src/main.s). Enforce here so the
 # build fails fast instead of silently overlapping the shared block.
 # stat directly on the host to avoid the stcmd banner contaminating stdout.
 boot_bin="$working_folder/dist/BOOT.BIN"
-cartridge_max=8192
+cartridge_max=10240
 if [ ! -f "$boot_bin" ]; then
     echo "ERROR: $boot_bin not produced by stcmd make"
     exit 4
