@@ -647,6 +647,323 @@ class PutTests(unittest.TestCase):
         self.assertIn("busy", err)
 
 
+class RunnerStatusTests(unittest.TestCase):
+    """Epic 03 / S1 — `sidecart runner status`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_status_inactive(self) -> None:
+        self._set_response(200, {
+            "ok": True, "active": False, "busy": False, "cwd": "",
+            "last_command": None, "last_path": None,
+            "last_exit_code": None, "last_started_at_ms": None,
+            "last_finished_at_ms": None,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "GET")
+        self.assertEqual(self.server.state.last_path, "/api/v1/runner")
+        self.assertIn("not active", out)
+
+    def test_runner_status_active(self) -> None:
+        self._set_response(200, {
+            "ok": True, "active": True, "busy": False, "cwd": "/games",
+            "last_command": "EXECUTE", "last_path": "/games/prog.tos",
+            "last_exit_code": 0, "last_started_at_ms": 1,
+            "last_finished_at_ms": 2,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("active   : true", out)
+        self.assertIn("busy     : no", out)
+        self.assertIn("/games", out)
+        self.assertIn("EXECUTE", out)
+
+    def test_runner_status_json(self) -> None:
+        payload = {"ok": True, "active": True, "busy": False, "cwd": "",
+                   "last_command": None, "last_path": None,
+                   "last_exit_code": None, "last_started_at_ms": None,
+                   "last_finished_at_ms": None}
+        self._set_response(200, payload)
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "--json", "runner", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(json.loads(out)["active"], True)
+
+
+class RunnerResetTests(unittest.TestCase):
+    """Epic 03 / S2 — `sidecart runner reset`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_reset_202(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "reset"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path, "/api/v1/runner/reset")
+        self.assertIn("RESET sent", out)
+
+    def test_runner_reset_409_runner_inactive(self) -> None:
+        self._set_response(409, {"ok": False, "code": "runner_inactive",
+                                 "message": "Runner mode is not active"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "reset"])
+        self.assertEqual(code, sidecart.EXIT_CONFLICT)
+        self.assertIn("runner_inactive", err)
+
+
+class RunnerRunTests(unittest.TestCase):
+    """Epic 03 / S3 — `sidecart runner run`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_run_202_no_cmdline(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "run", "/PROG.TOS"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path,
+                         "/api/v1/runner/run")
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body["path"], "/PROG.TOS")
+        self.assertEqual(body["cmdline"], "")
+        self.assertIn("EXECUTE", out)
+
+    def test_runner_run_202_with_cmdline(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "run",
+             "/PROG.TOS", "-v", "--file", "foo.txt"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body["cmdline"], "-v --file foo.txt")
+
+    def test_runner_run_503_busy(self) -> None:
+        self._set_response(503, {"ok": False, "code": "busy",
+                                 "message": "Runner busy"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "run", "/PROG.TOS"])
+        self.assertEqual(code, sidecart.EXIT_BUSY)
+        self.assertIn("busy", err)
+
+    def test_runner_run_404_not_found(self) -> None:
+        self._set_response(404, {"ok": False, "code": "not_found",
+                                 "message": "Program file not found"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "run", "/MISSING.TOS"])
+        self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
+        self.assertIn("not_found", err)
+
+
+class RunnerCdTests(unittest.TestCase):
+    """Epic 03 / S4 — `sidecart runner cd`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_cd_202(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "cd", "/GAMES"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path,
+                         "/api/v1/runner/cd")
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body["path"], "/GAMES")
+        self.assertNotIn("cmdline", body)
+        self.assertIn("CD", out)
+
+    def test_runner_cd_404_not_found(self) -> None:
+        self._set_response(404, {"ok": False, "code": "not_found",
+                                 "message": "Directory not found"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "cd", "/NOPE"])
+        self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
+        self.assertIn("not_found", err)
+
+    def test_runner_cd_400_not_a_directory(self) -> None:
+        self._set_response(400, {"ok": False, "code": "bad_path",
+                                 "message": "Path is not a directory"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "cd", "/PROG.TOS"])
+        self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
+        self.assertIn("bad_path", err)
+
+    def test_runner_cd_409_runner_inactive(self) -> None:
+        self._set_response(409, {"ok": False, "code": "runner_inactive",
+                                 "message": "Runner not active"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "cd", "/GAMES"])
+        self.assertIn("runner_inactive", err)
+
+
+class RunnerResTests(unittest.TestCase):
+    """Epic 03 / S5 — `sidecart runner res`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_res_low_202(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "res", "low"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path, "/api/v1/runner/res")
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body, {"rez": "low"})
+        self.assertIn("RES", out)
+
+    def test_runner_res_med_202(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "res", "med"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body, {"rez": "med"})
+
+    def test_runner_res_rejects_unknown_rez(self) -> None:
+        # argparse `choices` rejects before the request leaves the CLI.
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "res", "high"])
+        self.assertNotEqual(code, sidecart.EXIT_OK)
+        self.assertIn("invalid choice", err)
+
+    def test_runner_res_409_runner_inactive(self) -> None:
+        self._set_response(409, {"ok": False, "code": "runner_inactive",
+                                 "message": "Runner not active"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "res", "low"])
+        self.assertIn("runner_inactive", err)
+
+
+class RunnerMeminfoTests(unittest.TestCase):
+    """Epic 03 / S6 — `sidecart runner meminfo`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_meminfo_human(self) -> None:
+        self._set_response(200, {
+            "ok": True,
+            "membottom": 0x000900,
+            "memtop": 0x100000,
+            "phystop": 0x100000,
+            "screenmem": 0x0F8000,
+            "basepage": 0x000C00,
+            "bank0_kb": 512,
+            "bank1_kb": 512,
+            "decoded": True,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "meminfo"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "GET")
+        self.assertEqual(self.server.state.last_path, "/api/v1/runner/meminfo")
+        self.assertIn("0x00100000", out)
+        self.assertIn("512 KB", out)
+        self.assertIn("total RAM         : 1024 KB", out)
+        self.assertIn("[$432]", out)
+        self.assertIn("[$FF8001 nibble]", out)
+
+    def test_runner_meminfo_unknown_mmu(self) -> None:
+        self._set_response(200, {
+            "ok": True,
+            "membottom": 0, "memtop": 0, "phystop": 0,
+            "screenmem": 0, "basepage": 0,
+            "bank0_kb": 0, "bank1_kb": 0,
+            "decoded": False,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "meminfo"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("unrecognised MMU config", out)
+
+    def test_runner_meminfo_json(self) -> None:
+        self._set_response(200, {
+            "ok": True, "membottom": 0x900, "memtop": 0x100000,
+            "phystop": 0x100000, "screenmem": 0xF8000, "basepage": 0xC00,
+            "bank0_kb": 512, "bank1_kb": 512, "decoded": True,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "--json", "runner", "meminfo"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        parsed = json.loads(out)
+        self.assertEqual(parsed["bank0_kb"], 512)
+
+    def test_runner_meminfo_504_timeout(self) -> None:
+        self._set_response(504, {"ok": False, "code": "gateway_timeout",
+                                 "message": "Runner did not respond"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "meminfo"])
+        self.assertNotEqual(code, sidecart.EXIT_OK)
+        self.assertIn("gateway_timeout", err)
+
+    def test_runner_meminfo_409_runner_inactive(self) -> None:
+        self._set_response(409, {"ok": False, "code": "runner_inactive",
+                                 "message": "Runner not active"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "meminfo"])
+        self.assertIn("runner_inactive", err)
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:

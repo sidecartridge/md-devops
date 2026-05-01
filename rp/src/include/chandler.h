@@ -26,15 +26,15 @@
 // ROM4_ADDR ($FA0000) on the m68k side. Layout (single source of truth,
 // must match target/atarist/src/main.s):
 //
-//   $FA0000  CARTRIDGE             m68k header + code (max 8 KB)
-//   $FA2000  CMD_MAGIC_SENTINEL    4 B  (m68k polls here for NOP/RESET/
+//   $FA0000  CARTRIDGE             m68k header + code (max 10 KB)
+//   $FA2800  CMD_MAGIC_SENTINEL    4 B  (m68k polls here for NOP/RESET/
 //                                        BOOT_GEM/TERMINAL)
-//   $FA2004  RANDOM_TOKEN          4 B  (chandler echoes the request token)
-//   $FA2008  RANDOM_TOKEN_SEED     4 B
-//   $FA200C  reserved              4 B
-//   $FA2010  SHARED_VARIABLES    240 B  (60 indexed 4-byte slots)
-//   $FA2100  APP_BUFFERS              ~48 KB arena
-//                                      The first 512 bytes (until $FA2300)
+//   $FA2804  RANDOM_TOKEN          4 B  (chandler echoes the request token)
+//   $FA2808  RANDOM_TOKEN_SEED     4 B
+//   $FA280C  reserved              4 B
+//   $FA2810  SHARED_VARIABLES    240 B  (60 indexed 4-byte slots)
+//   $FA2900  APP_BUFFERS              ~46 KB arena
+//                                      The first 512 bytes (until $FA2B00)
 //                                      are written by display_setupU8g2()
 //                                      with the high-res mask table the
 //                                      cartridge uses to render the
@@ -44,14 +44,14 @@
 //                                      that do must skip the first
 //                                      CHANDLER_HIGHRES_TRANSTABLE_SIZE
 //                                      bytes of APP_BUFFERS.
-//   $FA2300  APP_FREE                 free for app-specific use until the
-//                                      framebuffer (~48 KB)
+//   $FA2B00  APP_FREE                 free for app-specific use until the
+//                                      framebuffer (~46 KB)
 //   $FAE0C0  FRAMEBUFFER         8000 B  (320x200 mono; sits at the top
 //                                         so an overrun walks off the end
 //                                         of the 64 KB region and into
 //                                         unused RP RAM)
 //   $FAFFFF  end of region
-#define CHANDLER_CARTRIDGE_CODE_SIZE       0x2000  /* 8 KB cartridge budget */
+#define CHANDLER_CARTRIDGE_CODE_SIZE       0x2800  /* 10 KB cartridge budget */
 #define CHANDLER_SHARED_BLOCK_OFFSET       CHANDLER_CARTRIDGE_CODE_SIZE
 #define CHANDLER_CMD_SENTINEL_OFFSET       CHANDLER_SHARED_BLOCK_OFFSET
 #define CHANDLER_RANDOM_TOKEN_OFFSET       (CHANDLER_CMD_SENTINEL_OFFSET + 4)

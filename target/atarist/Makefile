@@ -54,7 +54,7 @@ release: prepare dist
 prepare: clean
 	mkdir -p $(BUILD_DIR)
 
-clean-compile : clean main.o gemdrive.o
+clean-compile : clean main.o gemdrive.o runner.o
 
 main.o: prepare
 	$(VASM) $(VASMFLAGS) $(SOURCES_DIR)/main.s -o $(BUILD_DIR)/main.o
@@ -62,8 +62,11 @@ main.o: prepare
 gemdrive.o: prepare
 	$(VASM) $(VASMFLAGS) $(SOURCES_DIR)/gemdrive.s -o $(BUILD_DIR)/gemdrive.o
 
+runner.o: prepare
+	$(VASM) $(VASMFLAGS) $(SOURCES_DIR)/runner.s -o $(BUILD_DIR)/runner.o
+
 .PHONY: build
-build: main.o gemdrive.o
+build: main.o gemdrive.o runner.o
 	$(VLINK) $(addprefix $(BUILD_DIR)/,$^) $(VLINKFLAGS) -o $(BUILD_DIR)/$(BIN)
 
 

@@ -77,6 +77,7 @@
 #define DISPLAY_COMMAND_TERMINAL \
   0x3                              //  Terminal. Not used from RP to Computer.
 #define DISPLAY_COMMAND_START 0x4  // Continue boot process and emulation
+#define DISPLAY_COMMAND_START_RUNNER 0x5  // Hand control to the Runner blob (Epic 03)
 
 /**
  * @brief Sends a command to the display.

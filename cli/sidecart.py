@@ -422,6 +422,197 @@ def _split_host(host: str) -> tuple[str, int]:
     return host, DEFAULT_PORT
 
 
+def cmd_runner_run(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/run — fire-and-forget Pexec."""
+    cmdline = " ".join(args.cmdline) if args.cmdline else ""
+    body_json = {"path": args.remote, "cmdline": cmdline}
+    body = json.dumps(body_json, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    url = base_url(args.host) + "/api/v1/runner/run"
+    try:
+        status, parsed, raw = request_json(
+            "POST", url, body=body, headers=headers)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 202:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        print(f"ok  EXECUTE {args.remote} sent")
+    return EXIT_OK
+
+
+def cmd_runner_meminfo(args: argparse.Namespace) -> int:
+    """GET /api/v1/runner/meminfo — synchronous system memory snapshot."""
+    url = base_url(args.host) + "/api/v1/runner/meminfo"
+    try:
+        status, parsed, raw = request_json("GET", url)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200 or parsed is None or parsed.get("ok") is not True:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        json.dump(parsed, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return EXIT_OK
+    if args.quiet:
+        return EXIT_OK
+
+    # ST sysvar addresses each field is read from (TOS docs).
+    print(f"membottom [$432]  : 0x{parsed.get('membottom', 0):08X}")
+    print(f"memtop    [$436]  : 0x{parsed.get('memtop', 0):08X}")
+    print(f"phystop   [$42E]  : 0x{parsed.get('phystop', 0):08X}")
+    print(f"screenmem [$44E]  : 0x{parsed.get('screenmem', 0):08X}")
+    bp = parsed.get('basepage', 0)
+    if bp:
+        print(f"basepage  [$4F2]  : 0x{bp:08X}")
+    else:
+        print(f"basepage  [$4F2]  : 0 (TOS < 1.04 or unset)")
+    b0 = parsed.get('bank0_kb', 0)
+    b1 = parsed.get('bank1_kb', 0)
+    if parsed.get('decoded'):
+        print(f"bank 0    [$FF8001 nibble] : {b0} KB")
+        print(f"bank 1    [$FF8001 nibble] : {b1} KB")
+        print(f"total RAM         : {b0 + b1} KB")
+    else:
+        print(f"banks     [$FF8001 nibble] : (unrecognised MMU config)")
+    return EXIT_OK
+
+
+def cmd_runner_res(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/res — fire-and-forget XBIOS Setscreen."""
+    body_json = {"rez": args.rez}
+    body = json.dumps(body_json, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    url = base_url(args.host) + "/api/v1/runner/res"
+    try:
+        status, parsed, raw = request_json(
+            "POST", url, body=body, headers=headers)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 202:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        print(f"ok  RES {args.rez} sent")
+    return EXIT_OK
+
+
+def cmd_runner_cd(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/cd — fire-and-forget GEMDOS Dsetpath."""
+    body_json = {"path": args.remote}
+    body = json.dumps(body_json, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    url = base_url(args.host) + "/api/v1/runner/cd"
+    try:
+        status, parsed, raw = request_json(
+            "POST", url, body=body, headers=headers)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 202:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        print(f"ok  CD {args.remote} sent")
+    return EXIT_OK
+
+
+def cmd_runner_reset(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/reset — fire-and-forget cold reset."""
+    url = base_url(args.host) + "/api/v1/runner/reset"
+    try:
+        status, parsed, raw = request_json("POST", url, body=b"")
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 202:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        print("ok  RESET sent")
+    return EXIT_OK
+
+
+def cmd_runner_status(args: argparse.Namespace) -> int:
+    """GET /api/v1/runner — Epic 03 Runner state."""
+    url = base_url(args.host) + "/api/v1/runner"
+    try:
+        status, parsed, raw = request_json("GET", url)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200 or parsed is None or parsed.get("ok") is not True:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        json.dump(parsed, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return EXIT_OK
+    if args.quiet:
+        return EXIT_OK
+
+    active = parsed.get("active", False)
+    if not active:
+        print("Runner mode is not active. Boot via [U] to enable.")
+        return EXIT_OK
+
+    busy = parsed.get("busy", False)
+    cwd = parsed.get("cwd", "") or "(unset)"
+    last_cmd = parsed.get("last_command")
+    last_path = parsed.get("last_path")
+    last_exit = parsed.get("last_exit_code")
+    last_cd_errno = parsed.get("last_cd_errno")
+    print(f"active   : true")
+    print(f"busy     : {'yes' if busy else 'no'}")
+    print(f"cwd      : {cwd}")
+    last_res_errno = parsed.get("last_res_errno")
+    if last_cmd is None:
+        print(f"last     : (no command run yet)")
+    elif last_cmd == "CD":
+        target = last_path if last_path is not None else "?"
+        print(f"last     : CD {target} (errno={last_cd_errno})")
+    elif last_cmd == "RES":
+        print(f"last     : RES (errno={last_res_errno})")
+    elif last_path is None:
+        print(f"last     : {last_cmd} (exit={last_exit})")
+    else:
+        print(f"last     : {last_cmd} {last_path} (exit={last_exit})")
+    return EXIT_OK
+
+
 def cmd_put(args: argparse.Namespace) -> int:
     """PUT /api/v1/files/<remote>?overwrite=0|1 — stream LOCAL up.
 
@@ -605,6 +796,30 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Remote destination (default: basename of LOCAL).")
     put.add_argument("-f", "--force", action="store_true",
                      help="Overwrite if the remote file exists.")
+
+    runner = sub.add_parser("runner", help="Runner mode (Epic 03).")
+    runner_sub = runner.add_subparsers(dest="runner_cmd", required=True)
+    runner_sub.add_parser("status", help="Show Runner state and last completion.")
+    runner_sub.add_parser("reset", help="Cold-reset the Atari ST.")
+    cd_p = runner_sub.add_parser(
+        "cd", help="GEMDOS Dsetpath — change the Runner's cwd.")
+    cd_p.add_argument(
+        "remote", help="Directory (relative to GEMDRIVE_FOLDER).")
+    res_p = runner_sub.add_parser(
+        "res", help="XBIOS Setscreen — change ST screen rez (colour only).")
+    res_p.add_argument(
+        "rez", choices=["low", "med"],
+        help="Target rez. Ignored on monochrome monitors.")
+    runner_sub.add_parser(
+        "meminfo",
+        help="System memory snapshot from the live ST (synchronous).")
+    run_p = runner_sub.add_parser(
+        "run", help="Run a .TOS / .PRG on the Atari ST.")
+    run_p.add_argument("remote", help="Path to the program (relative to GEMDRIVE_FOLDER).")
+    run_p.add_argument("cmdline", nargs=argparse.REMAINDER,
+                       help="Command-line arguments (joined with spaces, ≤127 chars). "
+                            "Everything after REMOTE is captured verbatim, including "
+                            "leading dashes — no need for --.")
     return p
 
 
@@ -625,6 +840,20 @@ def main(argv: list[str] | None = None) -> int:
         "get": cmd_get,
         "put": cmd_put,
     }
+    if args.cmd == "runner":
+        runner_handlers = {
+            "status": cmd_runner_status,
+            "reset": cmd_runner_reset,
+            "run": cmd_runner_run,
+            "cd": cmd_runner_cd,
+            "res": cmd_runner_res,
+            "meminfo": cmd_runner_meminfo,
+        }
+        handler = runner_handlers.get(args.runner_cmd)
+        if handler is None:
+            parser.error(f"unknown runner subcommand: {args.runner_cmd}")
+            return EXIT_USAGE
+        return handler(args)
     handler = handlers.get(args.cmd)
     if handler is None:
         parser.error(f"unknown subcommand: {args.cmd}")

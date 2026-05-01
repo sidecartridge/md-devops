@@ -8,7 +8,10 @@
 #include <string.h>
 
 #include "aconfig.h"
+#include "chandler.h"
 #include "debug.h"
+#include "display.h"
+#include "emul.h"
 #include "ff.h"
 #include "gconfig.h"
 #include "lwip/err.h"
@@ -16,7 +19,13 @@
 #include "lwip/tcp.h"
 #include "pico/cyw43_arch.h"
 #include "pico/time.h"
+#include "runner.h"
 #include "settings.h"
+
+// Cartridge shared-region mirror in RP RAM (memmap_rp.ld). Used by
+// the Runner endpoints to write path / cmdline buffers the m68k
+// Runner reads directly via cartridge bus.
+extern unsigned int __rom_in_ram_start__;
 
 // Per-conn response buffer. Sized to comfortably hold a full status
 // line + headers + the largest non-streaming body we emit. RAM is
@@ -1101,6 +1110,641 @@ static void __not_in_flash_func(handle_volume)(http_conn_t *c) {
                    (unsigned long long)free_bytes, fat_type_name(fs->fs_type));
   if (n < 0) n = 0;
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
+static const char *runner_last_command_str(runner_last_command_t cmd) {
+  switch (cmd) {
+    case RUNNER_LAST_RESET: return "RESET";
+    case RUNNER_LAST_EXECUTE: return "EXECUTE";
+    case RUNNER_LAST_CD: return "CD";
+    case RUNNER_LAST_RES: return "RES";
+    case RUNNER_LAST_MEMINFO: return "MEMINFO";
+    default: return NULL;  // RUNNER_LAST_NONE → JSON null
+  }
+}
+
+// GET /api/v1/runner — Epic 03 / S1+S2.
+//
+// Reports whether the user picked Runner mode at boot (the cmdRunner
+// menu handler flips emul_isRunnerActive() the moment it sends
+// DISPLAY_COMMAND_START_RUNNER) and the most-recent Runner command
+// the RP submitted.
+//
+// The active flag is owned RP-side because the m68k Runner cannot
+// write to the cartridge address space (read-only ROM emulation),
+// so an m68k → RP handshake via the shared region is impossible.
+//
+// In S1+S2 the busy / cwd / exit-code fields are placeholders (always
+// false / empty / null); they get populated as RUNNER_EXECUTE / CD
+// land in S3/S4.
+static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
+  bool active = emul_isRunnerActive();
+  bool busy = emul_isRunnerBusy();
+  const char *last_cmd = runner_last_command_str(emul_getRunnerLastCommand());
+  const char *last_path = emul_getRunnerLastPath();
+  const char *cwd = emul_getRunnerCwd();
+  int32_t exit_code = 0;
+  bool has_exit = emul_getRunnerLastExitCode(&exit_code);
+  int32_t cd_errno = 0;
+  bool has_cd_errno = emul_getRunnerLastCdErrno(&cd_errno);
+  int32_t res_errno = 0;
+  bool has_res_errno = emul_getRunnerLastResErrno(&res_errno);
+
+  char last_started_buf[24];
+  char last_finished_buf[24];
+  if (last_cmd != NULL) {
+    snprintf(last_started_buf, sizeof(last_started_buf), "%lu",
+             (unsigned long)emul_getRunnerLastStartedMs());
+    uint32_t finished = emul_getRunnerLastFinishedMs();
+    if (finished == 0) {
+      snprintf(last_finished_buf, sizeof(last_finished_buf), "null");
+    } else {
+      snprintf(last_finished_buf, sizeof(last_finished_buf), "%lu",
+               (unsigned long)finished);
+    }
+  } else {
+    snprintf(last_started_buf, sizeof(last_started_buf), "null");
+    snprintf(last_finished_buf, sizeof(last_finished_buf), "null");
+  }
+
+  char last_exit_buf[24];
+  if (has_exit) {
+    snprintf(last_exit_buf, sizeof(last_exit_buf), "%ld", (long)exit_code);
+  } else {
+    snprintf(last_exit_buf, sizeof(last_exit_buf), "null");
+  }
+
+  char last_cd_errno_buf[24];
+  if (has_cd_errno) {
+    snprintf(last_cd_errno_buf, sizeof(last_cd_errno_buf), "%ld",
+             (long)cd_errno);
+  } else {
+    snprintf(last_cd_errno_buf, sizeof(last_cd_errno_buf), "null");
+  }
+
+  char last_res_errno_buf[24];
+  if (has_res_errno) {
+    snprintf(last_res_errno_buf, sizeof(last_res_errno_buf), "%ld",
+             (long)res_errno);
+  } else {
+    snprintf(last_res_errno_buf, sizeof(last_res_errno_buf), "null");
+  }
+
+  char body[512];
+  int n = snprintf(
+      body, sizeof(body),
+      "{\"ok\":true,\"active\":%s,\"busy\":%s,\"cwd\":\"%s\","
+      "\"last_command\":%s%s%s,"
+      "\"last_path\":%s%s%s,"
+      "\"last_exit_code\":%s,"
+      "\"last_cd_errno\":%s,"
+      "\"last_res_errno\":%s,"
+      "\"last_started_at_ms\":%s,\"last_finished_at_ms\":%s}\n",
+      active ? "true" : "false",
+      busy ? "true" : "false",
+      (cwd != NULL) ? cwd : "",
+      (last_cmd != NULL) ? "\"" : "",
+      (last_cmd != NULL) ? last_cmd : "null",
+      (last_cmd != NULL) ? "\"" : "",
+      (last_path != NULL && last_path[0] != '\0') ? "\"" : "",
+      (last_path != NULL && last_path[0] != '\0') ? last_path : "null",
+      (last_path != NULL && last_path[0] != '\0') ? "\"" : "",
+      last_exit_buf,
+      last_cd_errno_buf,
+      last_res_errno_buf,
+      last_started_buf, last_finished_buf);
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
+// Forward decls for path-resolution helpers defined further down
+// (with the file-mutation handlers from S3-S4).
+static void write_path_error(http_conn_t *c, norm_status_t s);
+static norm_status_t resolve_pair(const char *url_rel, char *norm,
+                                  size_t norm_cap, char *abs,
+                                  size_t abs_cap);
+static bool finfo_is_dir(const FILINFO *info);
+
+// If `input` doesn't start with '/' it's interpreted as relative to
+// the Runner's current cwd (Epic 03 / S4). Compose "<cwd>/<input>"
+// into `out`. Absolute paths and paths with no cwd in effect are
+// copied verbatim. Returns true on success, false if the resolved
+// string would overflow `out_cap`.
+static bool __not_in_flash_func(runner_resolve_relative)(const char *input,
+                                                          char *out,
+                                                          size_t out_cap) {
+  if (input == NULL || out == NULL || out_cap == 0) return false;
+  size_t in_len = strlen(input);
+  if (input[0] == '/') {
+    if (in_len + 1 > out_cap) return false;
+    memcpy(out, input, in_len + 1);
+    return true;
+  }
+  const char *cwd = emul_getRunnerCwd();
+  if (cwd == NULL || cwd[0] == '\0' || strcmp(cwd, "/") == 0) {
+    // No cwd (or cwd == root) → treat as root-relative.
+    if (1 + in_len + 1 > out_cap) return false;
+    out[0] = '/';
+    memcpy(out + 1, input, in_len + 1);
+    return true;
+  }
+  size_t cwd_len = strlen(cwd);
+  bool need_sep = (cwd[cwd_len - 1] != '/');
+  size_t total = cwd_len + (need_sep ? 1 : 0) + in_len + 1;
+  if (total > out_cap) return false;
+  memcpy(out, cwd, cwd_len);
+  size_t pos = cwd_len;
+  if (need_sep) out[pos++] = '/';
+  memcpy(out + pos, input, in_len + 1);
+  return true;
+}
+
+// Runner sub-region writers. m68k can only READ the cartridge area;
+// the RP populates path / cmdline buffers in APP_FREE so the m68k
+// Runner can dereference them directly when it runs Pexec.
+static uint32_t __not_in_flash_func(runner_app_free_address)(void) {
+  return (uint32_t)&__rom_in_ram_start__ + CHANDLER_APP_FREE_OFFSET;
+}
+
+// Byte-pair-swapped write into the cartridge mirror. The bus
+// emulator presents 16-bit words to the m68k in BE order, so RP
+// little-endian byte-storage at offset 0,1 appears at m68k addr+1,+0
+// for byte reads. We pre-swap each pair so the m68k's byte reads
+// land in the right order. Same idea as writeAppFreeBytesSwapped in
+// gemdrive.c.
+static void __not_in_flash_func(runner_memcpy_swapped)(uint8_t *dst,
+                                                       const char *src,
+                                                       size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    dst[i ^ 1u] = (uint8_t)src[i];
+  }
+}
+
+static void __not_in_flash_func(runner_write_path)(const char *path) {
+  uint8_t *dst = (uint8_t *)(runner_app_free_address() + RUNNER_PATH_OFFSET);
+  size_t n = strlen(path);
+  if (n >= RUNNER_PATH_LEN - 1) n = RUNNER_PATH_LEN - 2;
+  // Zero the buffer first so any stale bytes don't leak through.
+  memset(dst, 0, RUNNER_PATH_LEN);
+  runner_memcpy_swapped(dst, path, n);
+  // NUL terminator at swapped offset for the (n)th byte.
+  dst[n ^ 1u] = '\0';
+}
+
+// TOS Pexec cmdline format: <u8 length><bytes...>, no NUL. The
+// length byte is BYTE 0; the m68k passes a pointer to this buffer
+// straight to GEMDOS Pexec. Same byte-pair swap as the path.
+static void __not_in_flash_func(runner_write_cmdline)(const char *cmdline) {
+  uint8_t *dst =
+      (uint8_t *)(runner_app_free_address() + RUNNER_CMDLINE_OFFSET);
+  size_t n = strlen(cmdline);
+  if (n > 127) n = 127;
+  memset(dst, 0, RUNNER_CMDLINE_LEN);
+  // Length byte at logical offset 0 → swapped offset 1.
+  dst[1] = (uint8_t)n;
+  // Payload bytes at logical offsets 1..n → each XOR'd with 1.
+  for (size_t i = 0; i < n; i++) {
+    dst[(1 + i) ^ 1u] = (uint8_t)cmdline[i];
+  }
+}
+
+// POST /api/v1/runner/run — Epic 03 / S3.
+//
+// JSON body: {"path": "<rel>", "cmdline": "<≤127>"}.
+// Validates active + not busy + path jailed under GEMDRIVE_FOLDER +
+// path exists + cmdline ≤127 chars. Writes path + cmdline into the
+// Runner sub-region of APP_FREE so the m68k can read them, marks
+// the Runner busy, fires RUNNER_CMD_EXECUTE on the cartridge
+// sentinel. The m68k's Pexec result is reported asynchronously via
+// the chandler RUNNER_CMD_DONE_EXECUTE callback (runner.c).
+static void __not_in_flash_func(handle_runner_run)(http_conn_t *c) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return;
+  }
+  if (emul_isRunnerBusy()) {
+    write_response_ex(c, 503, "Service Unavailable", "application/json",
+                      "Retry-After: 1\r\n",
+                      "{\"ok\":false,\"code\":\"busy\","
+                      "\"message\":\"Runner is busy with another command\"}\n",
+                      0);
+    return;
+  }
+  if (c->content_length == 0) {
+    write_error(c, 411, "Length Required", "length_required",
+                "JSON body required");
+    return;
+  }
+  if (!c->content_type_json) {
+    write_error(c, 415, "Unsupported Media Type", "unsupported_media",
+                "Content-Type must be application/json");
+    return;
+  }
+
+  char path[RUNNER_PATH_LEN];
+  json_status_t js = json_extract_string(c->body, c->body_received, "path",
+                                         path, sizeof(path));
+  if (js == JSON_BAD) {
+    write_error(c, 422, "Unprocessable Entity", "bad_json",
+                "Malformed JSON body");
+    return;
+  }
+  if (js != JSON_OK) {
+    write_error(c, 422, "Unprocessable Entity", "unprocessable",
+                "Missing or non-string `path` field");
+    return;
+  }
+
+  char cmdline[128] = {0};
+  js = json_extract_string(c->body, c->body_received, "cmdline", cmdline,
+                           sizeof(cmdline));
+  if (js == JSON_BAD) {
+    write_error(c, 422, "Unprocessable Entity", "bad_json",
+                "Malformed JSON body");
+    return;
+  }
+  // cmdline missing is fine — empty string by default.
+  if (js != JSON_OK) {
+    cmdline[0] = '\0';
+  }
+  if (strlen(cmdline) > 127) {
+    write_error(c, 400, "Bad Request", "bad_request",
+                "cmdline exceeds 127 chars");
+    return;
+  }
+
+  // For server-side validation: resolve relative paths against the
+  // Runner's cwd so we can jail-check + f_stat the right file. The
+  // rebased form is *only* used for validation — the path written
+  // for the m68k stays in user-supplied form (see below) so a bare
+  // filename gets resolved by GEMDOS against the m68k's TOS cwd
+  // (which the previous Dsetpath kept in sync with our cwd mirror).
+  char rebased[RUNNER_PATH_LEN];
+  if (!runner_resolve_relative(path, rebased, sizeof(rebased))) {
+    write_error(c, 400, "Bad Request", "name_too_long",
+                "Path too long after cwd resolution");
+    return;
+  }
+  char norm[HTTP_PATH_BUF_BYTES];
+  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  norm_status_t s = resolve_pair(rebased, norm, sizeof(norm), abs_path,
+                                 sizeof(abs_path));
+  if (s != NORM_OK) {
+    write_path_error(c, s);
+    return;
+  }
+  if (strcmp(norm, "/") == 0) {
+    write_error(c, 400, "Bad Request", "bad_path",
+                "Cannot execute root");
+    return;
+  }
+  FILINFO info;
+  FRESULT fr = f_stat(abs_path, &info);
+  if (fr == FR_NO_FILE || fr == FR_NO_PATH) {
+    write_error(c, 404, "Not Found", "not_found", "Program file not found");
+    return;
+  }
+  if (fr != FR_OK) {
+    write_error(c, 500, "Internal Server Error", "disk_error",
+                "f_stat failed");
+    return;
+  }
+  if (finfo_is_dir(&info)) {
+    write_error(c, 404, "Not Found", "is_directory",
+                "Path is a directory; cannot execute");
+    return;
+  }
+
+  // Pass the user-supplied path verbatim to the m68k (just '/' -> '\').
+  // If the user gave a relative path, GEMDOS Pexec resolves it against
+  // the m68k's TOS cwd, which the previous CD's Dsetpath set. Absolute
+  // paths still work — they just don't depend on cwd. The Runner
+  // Dsetdrvs to the emulated drive before each Pexec, so a bare
+  // backslash form (no drive letter) resolves on our drive.
+  char st_path[RUNNER_PATH_LEN];
+  size_t out = 0;
+  for (size_t i = 0; path[i] != '\0' && out < sizeof(st_path) - 1; i++) {
+    char ch = path[i];
+    st_path[out++] = (ch == '/') ? '\\' : ch;
+  }
+  st_path[out] = '\0';
+
+  // Stage path + cmdline into APP_FREE for the m68k.
+  runner_write_path(st_path);
+  runner_write_cmdline(cmdline);
+
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  emul_recordRunnerExecuteSubmit(norm, now_ms);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_CMD_EXECUTE);
+
+  char body[80];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"accepted\":true}\n");
+  if (n < 0) n = 0;
+  write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
+}
+
+// POST /api/v1/runner/cd — Epic 03 / S4.
+//
+// JSON body: {"path": "<rel>"}.
+// Validates active + not busy + path jailed under GEMDRIVE_FOLDER +
+// path exists + path is a directory. Writes the bare backslash-form
+// path into the Runner sub-region of APP_FREE (no drive letter — the
+// m68k Runner Dsetdrvs to the emulated drive before Dsetpath, so a
+// path like "\\GAMES" resolves against the right drive). Marks the
+// Runner busy and fires RUNNER_CMD_CD on the cartridge sentinel; the
+// m68k's Dsetpath result lands asynchronously via the chandler
+// RUNNER_CMD_DONE_CD callback (runner.c).
+static void __not_in_flash_func(handle_runner_cd)(http_conn_t *c) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return;
+  }
+  if (emul_isRunnerBusy()) {
+    write_response_ex(c, 503, "Service Unavailable", "application/json",
+                      "Retry-After: 1\r\n",
+                      "{\"ok\":false,\"code\":\"busy\","
+                      "\"message\":\"Runner is busy with another command\"}\n",
+                      0);
+    return;
+  }
+  if (c->content_length == 0) {
+    write_error(c, 411, "Length Required", "length_required",
+                "JSON body required");
+    return;
+  }
+  if (!c->content_type_json) {
+    write_error(c, 415, "Unsupported Media Type", "unsupported_media",
+                "Content-Type must be application/json");
+    return;
+  }
+
+  char path[RUNNER_PATH_LEN];
+  json_status_t js = json_extract_string(c->body, c->body_received, "path",
+                                         path, sizeof(path));
+  if (js == JSON_BAD) {
+    write_error(c, 422, "Unprocessable Entity", "bad_json",
+                "Malformed JSON body");
+    return;
+  }
+  if (js != JSON_OK) {
+    write_error(c, 422, "Unprocessable Entity", "unprocessable",
+                "Missing or non-string `path` field");
+    return;
+  }
+
+  // Resolve relative paths against the current cwd so e.g. `cd SUB`
+  // from /TEST lands on /TEST/SUB.
+  char rebased[RUNNER_PATH_LEN];
+  if (!runner_resolve_relative(path, rebased, sizeof(rebased))) {
+    write_error(c, 400, "Bad Request", "name_too_long",
+                "Path too long after cwd resolution");
+    return;
+  }
+  char norm[HTTP_PATH_BUF_BYTES];
+  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  norm_status_t s = resolve_pair(rebased, norm, sizeof(norm), abs_path,
+                                 sizeof(abs_path));
+  if (s != NORM_OK) {
+    write_path_error(c, s);
+    return;
+  }
+  // Allow "/" — that's a Dsetpath to the GEMDRIVE drive root.
+  if (strcmp(norm, "/") != 0) {
+    FILINFO info;
+    FRESULT fr = f_stat(abs_path, &info);
+    if (fr == FR_NO_FILE || fr == FR_NO_PATH) {
+      write_error(c, 404, "Not Found", "not_found", "Directory not found");
+      return;
+    }
+    if (fr != FR_OK) {
+      write_error(c, 500, "Internal Server Error", "disk_error",
+                  "f_stat failed");
+      return;
+    }
+    if (!finfo_is_dir(&info)) {
+      write_error(c, 400, "Bad Request", "bad_path",
+                  "Path is not a directory");
+      return;
+    }
+  }
+
+  // Pass the user-supplied path verbatim to the m68k Dsetpath ('/'
+  // -> '\\'). For relative inputs, GEMDOS Dsetpath resolves against
+  // the m68k's existing TOS cwd, which the previous CD kept in sync
+  // with our cwd mirror — so `cd /TEST` then `cd ARKANOID` lands the
+  // m68k on /TEST/ARKANOID just like our mirror. Absolute inputs work
+  // independently of cwd. The Runner Dsetdrvs before Dsetpath so a
+  // bare backslash path resolves on the GEMDRIVE drive.
+  char st_path[RUNNER_PATH_LEN];
+  size_t out = 0;
+  for (size_t i = 0; path[i] != '\0' && out < sizeof(st_path) - 1; i++) {
+    char ch = path[i];
+    st_path[out++] = (ch == '/') ? '\\' : ch;
+  }
+  st_path[out] = '\0';
+
+  runner_write_path(st_path);
+
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  // Mirror updates with the *resolved* canonical form so the status
+  // endpoint always shows the absolute cwd, no matter whether the
+  // user typed a relative or absolute target.
+  emul_recordRunnerCdSubmit(norm, now_ms);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_CMD_CD);
+
+  char body[80];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"accepted\":true}\n");
+  if (n < 0) n = 0;
+  write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
+}
+
+// Stage the requested rez (low | med) into the RUNNER_REZ slot of
+// APP_FREE so the m68k handler can read it. u16 in the low half of
+// the longword. Byte-pair-swapped so the m68k's word-load lands
+// the right value (cartridge-bus quirk — same as runner_write_path).
+static void __not_in_flash_func(runner_write_rez)(uint16_t rez) {
+  uint8_t *dst = (uint8_t *)(runner_app_free_address() + RUNNER_REZ_OFFSET);
+  // Zero the 4-byte slot, then write the u16 swapped.
+  uint8_t hi = (uint8_t)((rez >> 8) & 0xFF);
+  uint8_t lo = (uint8_t)(rez & 0xFF);
+  dst[0 ^ 1u] = hi;
+  dst[1 ^ 1u] = lo;
+  dst[2 ^ 1u] = 0;
+  dst[3 ^ 1u] = 0;
+}
+
+// POST /api/v1/runner/res — Epic 03 / S5.
+//
+// JSON body: {"rez": "low"|"med"}. Stateless — caller passes the
+// target. The m68k Runner reads RUNNER_REZ, calls XBIOS Getrez to
+// detect monochrome (rez == 2) and refuse, otherwise XBIOS Setscreen
+// with the requested rez. Errno (i32) returns via RUNNER_CMD_DONE_RES
+// and surfaces as `last_res_errno` in the status envelope.
+static void __not_in_flash_func(handle_runner_res)(http_conn_t *c) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return;
+  }
+  if (emul_isRunnerBusy()) {
+    write_response_ex(c, 503, "Service Unavailable", "application/json",
+                      "Retry-After: 1\r\n",
+                      "{\"ok\":false,\"code\":\"busy\","
+                      "\"message\":\"Runner is busy with another command\"}\n",
+                      0);
+    return;
+  }
+  if (c->content_length == 0) {
+    write_error(c, 411, "Length Required", "length_required",
+                "JSON body required");
+    return;
+  }
+  if (!c->content_type_json) {
+    write_error(c, 415, "Unsupported Media Type", "unsupported_media",
+                "Content-Type must be application/json");
+    return;
+  }
+
+  char rez_str[8];
+  json_status_t js = json_extract_string(c->body, c->body_received, "rez",
+                                         rez_str, sizeof(rez_str));
+  if (js == JSON_BAD) {
+    write_error(c, 422, "Unprocessable Entity", "bad_json",
+                "Malformed JSON body");
+    return;
+  }
+  if (js != JSON_OK) {
+    write_error(c, 422, "Unprocessable Entity", "unprocessable",
+                "Missing or non-string `rez` field");
+    return;
+  }
+  uint16_t rez;
+  if (strcmp(rez_str, "low") == 0) {
+    rez = 0;
+  } else if (strcmp(rez_str, "med") == 0) {
+    rez = 1;
+  } else {
+    write_error(c, 400, "Bad Request", "bad_request",
+                "rez must be \"low\" or \"med\"");
+    return;
+  }
+
+  runner_write_rez(rez);
+
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  emul_recordRunnerResSubmit(now_ms);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_CMD_RES);
+
+  char body[80];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"accepted\":true}\n");
+  if (n < 0) n = 0;
+  write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
+}
+
+// GET /api/v1/runner/meminfo — Epic 03 / S6.
+//
+// Synchronous: writes RUNNER_CMD_MEMINFO to the cartridge sentinel,
+// then spins on chandler_loop until the m68k Runner replies with
+// RUNNER_CMD_DONE_MEMINFO (handled by runner.c, which stashes the
+// 24-byte snapshot via emul_recordRunnerMeminfoDone). Times out
+// after ~1 s so a wedged m68k doesn't lock the HTTP server forever.
+// Inactive runner / busy lock return early without firing the
+// sentinel. The handler emits a JSON envelope with the 5 u32 system
+// addresses, the two decoded bank sizes (0/0 = unrecognised MMU
+// config), and a simple "decoded" boolean derived from the banks.
+#define RUNNER_MEMINFO_TIMEOUT_US 1000000
+static void __not_in_flash_func(handle_runner_meminfo)(http_conn_t *c) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return;
+  }
+  if (emul_isRunnerBusy()) {
+    write_response_ex(c, 503, "Service Unavailable", "application/json",
+                      "Retry-After: 1\r\n",
+                      "{\"ok\":false,\"code\":\"busy\","
+                      "\"message\":\"Runner is busy with another command\"}\n",
+                      0);
+    return;
+  }
+
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  emul_recordRunnerMeminfoSubmit(now_ms);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_CMD_MEMINFO);
+
+  absolute_time_t deadline =
+      delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
+  while (!emul_isRunnerMeminfoReady()) {
+    chandler_loop();
+    if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+      // Timeout — clear busy and report.
+      uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+      runner_meminfo_t empty = {0};
+      emul_recordRunnerMeminfoDone(&empty, fail_ms);  // unblocks busy
+      write_error(c, 504, "Gateway Timeout", "gateway_timeout",
+                  "Runner did not respond within 1 s");
+      return;
+    }
+  }
+
+  runner_meminfo_t snap;
+  if (!emul_getRunnerMeminfo(&snap)) {
+    write_error(c, 500, "Internal Server Error", "no_snapshot",
+                "Runner returned but no snapshot recorded");
+    return;
+  }
+
+  bool decoded = (snap.bank0_kb != 0) || (snap.bank1_kb != 0);
+  char body[400];
+  int n = snprintf(
+      body, sizeof(body),
+      "{\"ok\":true,"
+      "\"membottom\":%lu,\"memtop\":%lu,\"phystop\":%lu,"
+      "\"screenmem\":%lu,\"basepage\":%lu,"
+      "\"bank0_kb\":%u,\"bank1_kb\":%u,\"decoded\":%s}\n",
+      (unsigned long)snap.membot, (unsigned long)snap.memtop,
+      (unsigned long)snap.phystop, (unsigned long)snap.screenmem,
+      (unsigned long)snap.basepage,
+      (unsigned)snap.bank0_kb, (unsigned)snap.bank1_kb,
+      decoded ? "true" : "false");
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
+// POST /api/v1/runner/reset — Epic 03 / S2.
+//
+// Fire-and-forget: writes RUNNER_CMD_RESET into the cartridge
+// sentinel; the m68k Runner's poll loop sees it and cold-resets the
+// machine. The Runner can't reply (the machine is rebooting), so the
+// RP records last_command=RESET locally and answers 202 Accepted
+// immediately. If Runner mode wasn't selected at boot, return
+// 409 runner_inactive.
+static void __not_in_flash_func(handle_runner_reset)(http_conn_t *c) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return;
+  }
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  emul_recordRunnerCommand(RUNNER_LAST_RESET, now_ms);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_CMD_RESET);
+  // Schedule the auto-relaunch into Runner mode once the ST has
+  // had time to cold-boot back to its CA_INIT polling loop. 3 s is
+  // generous; TOS typically reaches CA_INIT well within 1.5 s. This
+  // is what keeps Runner mode sticky across resets so the dev
+  // iteration loop (upload → run → reset on failure) doesn't need
+  // the operator to re-press [U].
+  emul_scheduleRunnerRelaunch(now_ms + 3000);
+  char body[80];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"accepted\":true}\n");
+  if (n < 0) n = 0;
+  write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
 }
 
 // Append printf-formatted text to the response body buffer, advancing
@@ -2381,6 +3025,7 @@ static const route_t g_routes[] = {
     {"/api/v1/ping", M_GET | M_HEAD, handle_ping},
     {"/api/v1/volume", M_GET | M_HEAD, handle_volume},
     {"/api/v1/files", M_GET | M_HEAD, handle_files_list},
+    {"/api/v1/runner", M_GET | M_HEAD, handle_runner_status},
 };
 
 #define ROUTES_COUNT (sizeof(g_routes) / sizeof(g_routes[0]))
@@ -2504,6 +3149,57 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
     }
     // S6 will add PUT (upload) here.
     write_405(c, "GET, HEAD, DELETE");
+    return;
+  }
+
+  // Prefix routes: /api/v1/runner/<action> (Epic 03). The exact-match
+  // /api/v1/runner endpoint (status query) is in g_routes above; only
+  // the slash-prefixed action paths fall through here.
+  static const char runner_prefix[] = "/api/v1/runner/";
+  static const size_t runner_prefix_len = sizeof(runner_prefix) - 1;
+  if (strncmp(c->path, runner_prefix, runner_prefix_len) == 0) {
+    const char *action = c->path + runner_prefix_len;
+    if (strcmp(action, "reset") == 0) {
+      if (c->method == HM_POST) {
+        handle_runner_reset(c);
+        return;
+      }
+      write_405(c, "POST");
+      return;
+    }
+    if (strcmp(action, "run") == 0) {
+      if (c->method == HM_POST) {
+        handle_runner_run(c);
+        return;
+      }
+      write_405(c, "POST");
+      return;
+    }
+    if (strcmp(action, "cd") == 0) {
+      if (c->method == HM_POST) {
+        handle_runner_cd(c);
+        return;
+      }
+      write_405(c, "POST");
+      return;
+    }
+    if (strcmp(action, "res") == 0) {
+      if (c->method == HM_POST) {
+        handle_runner_res(c);
+        return;
+      }
+      write_405(c, "POST");
+      return;
+    }
+    if (strcmp(action, "meminfo") == 0) {
+      if (c->method == HM_GET || c->method == HM_HEAD) {
+        handle_runner_meminfo(c);
+        return;
+      }
+      write_405(c, "GET");
+      return;
+    }
+    write_error(c, 404, "Not Found", "not_found", "Route not found");
     return;
   }
 

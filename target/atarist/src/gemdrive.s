@@ -25,10 +25,15 @@
 
 ; --- Constants required by inc/sidecart_functions.s when it lands at
 ; the end of this file. Same values as main.s; defined here so the
-; include can compile cleanly inside this assembly unit. ---
+; include can compile cleanly inside this assembly unit. Shared-block
+; addresses are derived from CARTRIDGE_CODE_SIZE so a cap bump only
+; touches one constant. ---
 _dskbufp		equ $4C6
-RANDOM_TOKEN_ADDR	equ $FA2004
-RANDOM_TOKEN_SEED_ADDR	equ $FA2008
+ROM4_ADDR		equ $FA0000
+CARTRIDGE_CODE_SIZE	equ $2800
+SHARED_BLOCK_ADDR	equ (ROM4_ADDR + CARTRIDGE_CODE_SIZE)	; $FA2800
+RANDOM_TOKEN_ADDR	equ (SHARED_BLOCK_ADDR + 4)		; $FA2804
+RANDOM_TOKEN_SEED_ADDR	equ (SHARED_BLOCK_ADDR + 8)		; $FA2808
 RANDOM_TOKEN_POST_WAIT	equ $1
 ROMCMD_START_ADDR	equ $FB0000
 CMD_MAGIC_NUMBER	equ $ABCD
@@ -106,10 +111,11 @@ GEMDOS_EIO_WRITE	equ -92
 DTA_SIZE		equ 44
 BUFFER_READ_SIZE	equ 4096
 
-; --- Shared region addresses (must match rp/src/include/gemdrive.h) ---
-ROM4_ADDR			equ $FA0000
-SHARED_VARIABLES		equ (ROM4_ADDR + $2010)
-APP_FREE_ADDR			equ (ROM4_ADDR + $2300)
+; --- Shared region addresses (must match rp/src/include/gemdrive.h).
+; ROM4_ADDR / SHARED_BLOCK_ADDR were defined at the top of this file
+; for the inc/sidecart_functions.s include; reuse them here.
+SHARED_VARIABLES		equ (SHARED_BLOCK_ADDR + $10)	; $FA2810
+APP_FREE_ADDR			equ (SHARED_BLOCK_ADDR + $300)	; $FA2B00
 
 SHARED_VAR_DRIVE_NUMBER		equ 12
 SHARED_VAR_DRIVE_LETTER		equ 13
