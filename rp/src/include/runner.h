@@ -48,7 +48,9 @@
 // (CHANDLER_CMD_SENTINEL_OFFSET) to dispatch a command; the Runner's
 // poll loop reads and acts on it.
 #define APP_RUNNER 0x0500
-#define RUNNER_CMD_RESET (APP_RUNNER + 0x01)    // cold reset
+// Note: APP_RUNNER + 0x01 was the foreground RUNNER_CMD_RESET; retired
+// in Epic 04 / S5 in favour of RUNNER_ADV_CMD_RESET (VBL-driven). Slot
+// kept reserved so future stories don't reuse it accidentally.
 #define RUNNER_CMD_EXECUTE (APP_RUNNER + 0x02)  // Pexec mode 0
 #define RUNNER_CMD_CD (APP_RUNNER + 0x03)       // Dsetpath
 #define RUNNER_CMD_RES (APP_RUNNER + 0x04)      // XBIOS Setscreen

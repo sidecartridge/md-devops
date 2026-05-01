@@ -62,7 +62,6 @@ RUNNER_PROTO_VERSION		equ $00010001	; min=1, max=1
 ; commands live at $0500 + N to avoid collisions.
 CMD_NOP				equ 0
 APP_RUNNER			equ $0500
-RUNNER_CMD_RESET		equ ($01 + APP_RUNNER)	; cold reset
 RUNNER_CMD_EXECUTE		equ ($02 + APP_RUNNER)	; Pexec mode 0
 RUNNER_CMD_CD			equ ($03 + APP_RUNNER)	; Dsetpath
 RUNNER_CMD_RES			equ ($04 + APP_RUNNER)	; XBIOS Setscreen — rez at RUNNER_REZ
@@ -73,11 +72,6 @@ RUNNER_CMD_DONE_CD		equ ($83 + APP_RUNNER)	; payload: i32 GEMDOS errno
 RUNNER_CMD_DONE_HELLO		equ ($84 + APP_RUNNER)	; no payload — runner entered loop
 RUNNER_CMD_DONE_RES		equ ($85 + APP_RUNNER)	; payload: i32 errno (0 = OK, -1 = mono, -2 = bad rez)
 RUNNER_CMD_DONE_MEMINFO		equ ($86 + APP_RUNNER)	; payload: 24-byte meminfo struct
-
-; Wait between the RUNNER_RESET sentinel sighting and the actual
-; reset trampoline — gives any in-flight cartridge bus traffic time
-; to drain. Mirrors main.s' PRE_RESET_WAIT.
-PRE_RESET_WAIT			equ $FFFFF
 
 ; Constants required by inc/sidecart_macros.s when send_sync expands.
 ; main.s defines these too; we need our own local copies because
@@ -310,9 +304,12 @@ runner_post_reloc:
 	; the RP writes to dispatch Runner commands. RUNNER_CMD_EXECUTE
 	; / RUNNER_CMD_CD land in S3/S4. ---
 runner_poll_loop:
+	; Cold reset is handled by the Advanced Runner VBL hook
+	; (RUNNER_ADV_CMD_RESET in the $06xx range — see adv_hook_handler
+	; below). The foreground RUNNER_CMD_RESET dispatch was retired
+	; in Epic 04 / S5 because the VBL path also escapes wedged
+	; programs that the foreground poll can't reach.
 	move.l	CMD_MAGIC_SENTINEL_ADDR, d6
-	cmp.l	#RUNNER_CMD_RESET, d6
-	beq	runner_reset
 	cmp.l	#RUNNER_CMD_EXECUTE, d6
 	beq	runner_execute
 	cmp.l	#RUNNER_CMD_CD, d6
@@ -631,30 +628,6 @@ runner_meminfo:
 	lea	24(sp), sp			; pop struct
 	bra	runner_poll_loop
 
-; Cold reset — same sequence as main.s' .reset. Waits briefly,
-; invalidates TOS' memory-system "valid" cookies (so the next boot
-; rebuilds RAM tables instead of trusting stale ones), then jumps
-; through the reset vector at $00000004.
-runner_reset:
-	; Trace before the wait so the user sees something even if the
-	; reset itself takes a moment.
-	pea	text_reset(pc)
-	move.w	#GEMDOS_Cconws, -(sp)
-	trap	#1
-	addq.l	#6, sp
-
-	move.l	#PRE_RESET_WAIT, d6
-.runner_reset_wait:
-	subq.l	#1, d6
-	bne.s	.runner_reset_wait
-
-	clr.l	$420.w			; memvalid
-	clr.l	$43A.w			; memval2
-	clr.l	$51A.w			; memval3
-	move.l	$4.w, a0		; reset vector
-	jmp	(a0)
-	nop
-
 ; ---------------------------------------------------------------
 ; Advanced Runner hook (Epic 04 / S1+S2+S3).
 ;
@@ -858,9 +831,6 @@ banner_text:
 ; Per-command trace strings. Cconws prints these alongside the path
 ; (read straight from RUNNER_PATH in APP_FREE) so the operator can see
 ; on the ST screen exactly which command landed and which program ran.
-text_reset:
-	dc.b	13, 10, "[RESET] - Received Cold Reset command", 13, 10, 0
-	even
 text_run:
 	dc.b	13, 10, "[RUN  ] - Launching ", 0
 	even

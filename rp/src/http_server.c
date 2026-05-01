@@ -1646,36 +1646,6 @@ static void __not_in_flash_func(handle_runner_res)(http_conn_t *c) {
   write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
 }
 
-// POST /api/v1/runner/adv/reset — Epic 04 / S2.
-//
-// Forced cold reset driven from inside the m68k's VBL ISR. Works
-// even when the foreground poll loop is wedged (program in an
-// infinite loop, bombs already painted, traps disabled), which is
-// what the foreground runner_reset can't escape. We deliberately
-// DON'T gate on emul_isRunnerBusy() — the busy lock is exactly
-// the state we're trying to escape. Inactive Runner mode still
-// 409s though; firing this at a non-Runner ST would just write a
-// random value to the cartridge that nothing's listening for.
-static void __not_in_flash_func(handle_runner_adv_reset)(http_conn_t *c) {
-  if (!emul_isRunnerActive()) {
-    write_error(c, 409, "Conflict", "runner_inactive",
-                "Runner mode is not active; boot via [U] first");
-    return;
-  }
-  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
-  emul_recordRunnerCommand(RUNNER_LAST_RESET, now_ms);
-  SEND_COMMAND_TO_DISPLAY(RUNNER_ADV_CMD_RESET);
-  // Same 3 s grace as the foreground reset — gives the ST time to
-  // cold-boot back through CA_INIT and reach gemdrive_init's HELLO,
-  // which restarts the relaunch ticker via emul_onGemdriveHello.
-  emul_scheduleRunnerRelaunch(now_ms + 3000);
-  char body[80];
-  int n = snprintf(body, sizeof(body),
-                   "{\"ok\":true,\"accepted\":true}\n");
-  if (n < 0) n = 0;
-  write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
-}
-
 // GET /api/v1/runner/adv — Epic 04 / S1+S4.
 //
 // Reports whether the m68k Runner has installed its Advanced Runner
@@ -1775,14 +1745,20 @@ static void __not_in_flash_func(handle_runner_meminfo)(http_conn_t *c) {
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
-// POST /api/v1/runner/reset — Epic 03 / S2.
+// POST /api/v1/runner/reset — Epic 03 / S2, rewired in Epic 04 / S5.
 //
-// Fire-and-forget: writes RUNNER_CMD_RESET into the cartridge
-// sentinel; the m68k Runner's poll loop sees it and cold-resets the
-// machine. The Runner can't reply (the machine is rebooting), so the
-// RP records last_command=RESET locally and answers 202 Accepted
-// immediately. If Runner mode wasn't selected at boot, return
-// 409 runner_inactive.
+// Fire-and-forget. Writes RUNNER_ADV_CMD_RESET into the cartridge
+// sentinel; the m68k Runner's VBL hook (installed at $70 or $400
+// per the ACONFIG_PARAM_ADV_HOOK_VECTOR aconfig setting) sees it
+// from inside the ISR and jumps through the reset vector at $4.w.
+// This replaced the previous foreground RUNNER_CMD_RESET dispatch
+// because the VBL path also escapes wedged programs (infinite
+// loops, bombs already painted) that the foreground poll loop
+// can't reach.
+//
+// Intentionally no busy-lock gate — the busy state is exactly what
+// we want to escape. 409 runner_inactive when the user hasn't
+// picked [U] at boot.
 static void __not_in_flash_func(handle_runner_reset)(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
@@ -1791,7 +1767,7 @@ static void __not_in_flash_func(handle_runner_reset)(http_conn_t *c) {
   }
   uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
   emul_recordRunnerCommand(RUNNER_LAST_RESET, now_ms);
-  SEND_COMMAND_TO_DISPLAY(RUNNER_CMD_RESET);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_ADV_CMD_RESET);
   // Schedule the auto-relaunch into Runner mode once the ST has
   // had time to cold-boot back to its CA_INIT polling loop. 3 s is
   // generous; TOS typically reaches CA_INIT well within 1.5 s. This
@@ -3264,14 +3240,6 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
         return;
       }
       write_405(c, "GET");
-      return;
-    }
-    if (strcmp(action, "adv/reset") == 0) {
-      if (c->method == HM_POST) {
-        handle_runner_adv_reset(c);
-        return;
-      }
-      write_405(c, "POST");
       return;
     }
     write_error(c, 404, "Not Found", "not_found", "Route not found");
