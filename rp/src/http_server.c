@@ -1646,6 +1646,26 @@ static void __not_in_flash_func(handle_runner_res)(http_conn_t *c) {
   write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
 }
 
+// GET /api/v1/runner/adv — Epic 04 / S1.
+//
+// Reports whether the m68k Runner has installed its Advanced Runner
+// VBL hook at $70. Set on every HELLO arrival from
+// runner_post_reloc; cleared by emul_resetRunnerSession when the
+// runner restarts. `installed` is true once the hook is live and
+// the m68k has confirmed; false in the brief window between
+// `[U]` press and HELLO arrival, or when Runner mode is inactive.
+static void __not_in_flash_func(handle_runner_adv_status)(http_conn_t *c) {
+  bool active = emul_isRunnerActive();
+  bool installed = active && emul_isRunnerAdvancedInstalled();
+  char body[80];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"active\":%s,\"installed\":%s}\n",
+                   active ? "true" : "false",
+                   installed ? "true" : "false");
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
 // GET /api/v1/runner/meminfo — Epic 03 / S6.
 //
 // Synchronous: writes RUNNER_CMD_MEMINFO to the cartridge sentinel,
@@ -3194,6 +3214,14 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
     if (strcmp(action, "meminfo") == 0) {
       if (c->method == HM_GET || c->method == HM_HEAD) {
         handle_runner_meminfo(c);
+        return;
+      }
+      write_405(c, "GET");
+      return;
+    }
+    if (strcmp(action, "adv") == 0) {
+      if (c->method == HM_GET || c->method == HM_HEAD) {
+        handle_runner_adv_status(c);
         return;
       }
       write_405(c, "GET");

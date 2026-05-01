@@ -128,6 +128,9 @@ static int32_t runnerLastResErrno = 0;
 static runner_meminfo_t runnerMeminfo = {0};
 static bool runnerMeminfoHasSnapshot = false;
 static bool runnerMeminfoPending = false;
+// Epic 04 — Advanced Runner installation flag, set by the m68k's
+// HELLO payload byte after runner_post_reloc installs its VBL hook.
+static bool runnerAdvancedInstalled = false;
 
 bool emul_isRunnerActive(void) { return runnerActive; }
 bool emul_isRunnerBusy(void) { return runnerBusy; }
@@ -305,6 +308,15 @@ void emul_resetRunnerSession(void) {
   runnerLastResErrno = 0;
   runnerMeminfoPending = false;
   runnerMeminfoHasSnapshot = false;
+  runnerAdvancedInstalled = false;
+}
+
+bool emul_isRunnerAdvancedInstalled(void) {
+  return runnerAdvancedInstalled;
+}
+
+void emul_recordRunnerAdvancedInstalled(bool installed) {
+  runnerAdvancedInstalled = installed;
 }
 
 void emul_onGemdriveHello(void) {

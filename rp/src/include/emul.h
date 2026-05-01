@@ -179,6 +179,22 @@ bool emul_getRunnerMeminfo(runner_meminfo_t *out);
 void emul_resetRunnerSession(void);
 
 /**
+ * @brief Whether the m68k Runner has confirmed its Advanced Runner
+ *        VBL hook (Epic 04) is installed at $70. Set via the HELLO
+ *        message's payload byte every time runner_post_reloc runs;
+ *        cleared on emul_resetRunnerSession() (which fires on the
+ *        next HELLO too, so the value is effectively replaced
+ *        atomically per session). Used by GET /api/v1/runner/adv.
+ */
+bool emul_isRunnerAdvancedInstalled(void);
+
+/**
+ * @brief Stash the Advanced-installed flag from the HELLO payload.
+ *        Called by runner_command_cb on every HELLO arrival.
+ */
+void emul_recordRunnerAdvancedInstalled(bool installed);
+
+/**
  * @brief The m68k just ran gemdrive_init (CMD_GEMDRIVE_HELLO arrived).
  *        That is the unambiguous "ST cold-booted" signal — true for
  *        first power-on, `runner reset`, the ST's physical reset

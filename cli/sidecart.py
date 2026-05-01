@@ -449,6 +449,33 @@ def cmd_runner_run(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_runner_adv_status(args: argparse.Namespace) -> int:
+    """GET /api/v1/runner/adv — Advanced Runner VBL hook state."""
+    url = base_url(args.host) + "/api/v1/runner/adv"
+    try:
+        status, parsed, raw = request_json("GET", url)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200 or parsed is None or parsed.get("ok") is not True:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        json.dump(parsed, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return EXIT_OK
+    if args.quiet:
+        return EXIT_OK
+
+    active = parsed.get("active", False)
+    installed = parsed.get("installed", False)
+    print(f"runner active : {'yes' if active else 'no'}")
+    print(f"VBL hook      : {'installed' if installed else 'not installed'}")
+    return EXIT_OK
+
+
 def cmd_runner_meminfo(args: argparse.Namespace) -> int:
     """GET /api/v1/runner/meminfo — synchronous system memory snapshot."""
     url = base_url(args.host) + "/api/v1/runner/meminfo"
@@ -813,6 +840,12 @@ def build_parser() -> argparse.ArgumentParser:
     runner_sub.add_parser(
         "meminfo",
         help="System memory snapshot from the live ST (synchronous).")
+    adv_p = runner_sub.add_parser(
+        "adv", help="Advanced Runner (Epic 04) — VBL-driven commands.")
+    adv_sub = adv_p.add_subparsers(dest="adv_cmd", required=True)
+    adv_sub.add_parser(
+        "status",
+        help="Show whether the Advanced Runner VBL hook is installed.")
     run_p = runner_sub.add_parser(
         "run", help="Run a .TOS / .PRG on the Atari ST.")
     run_p.add_argument("remote", help="Path to the program (relative to GEMDRIVE_FOLDER).")
@@ -849,6 +882,15 @@ def main(argv: list[str] | None = None) -> int:
             "res": cmd_runner_res,
             "meminfo": cmd_runner_meminfo,
         }
+        if args.runner_cmd == "adv":
+            adv_handlers = {
+                "status": cmd_runner_adv_status,
+            }
+            handler = adv_handlers.get(args.adv_cmd)
+            if handler is None:
+                parser.error(f"unknown runner adv subcommand: {args.adv_cmd}")
+                return EXIT_USAGE
+            return handler(args)
         handler = runner_handlers.get(args.runner_cmd)
         if handler is None:
             parser.error(f"unknown runner subcommand: {args.runner_cmd}")

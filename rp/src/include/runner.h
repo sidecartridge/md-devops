@@ -54,6 +54,14 @@
 #define RUNNER_CMD_RES (APP_RUNNER + 0x04)      // XBIOS Setscreen
 #define RUNNER_CMD_MEMINFO (APP_RUNNER + 0x05)  // system memory snapshot
 
+// Epic 04 — Advanced Runner. Commands in this range are dispatched
+// by the m68k's VBL ISR (installed at $70 by runner_post_reloc) so
+// they keep working when the foreground poll loop is wedged. The
+// existing $05xx foreground range is unaffected — the poll loop's
+// cmp.l cascade only matches $05xx codes, so $06xx values fall
+// through to the VBL handler.
+#define APP_RUNNER_VBL 0x0600
+
 // m68k -> RP report commands (sent via send_sync from the Runner).
 // High bit set so they don't collide with the RP -> m68k sentinel
 // command IDs above.

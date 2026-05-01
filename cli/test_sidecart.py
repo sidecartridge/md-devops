@@ -964,6 +964,54 @@ class RunnerMeminfoTests(unittest.TestCase):
         self.assertIn("runner_inactive", err)
 
 
+class RunnerAdvStatusTests(unittest.TestCase):
+    """Epic 04 / S1 — `sidecart runner adv status`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_adv_status_installed(self) -> None:
+        self._set_response(200, {
+            "ok": True, "active": True, "installed": True,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "GET")
+        self.assertEqual(self.server.state.last_path, "/api/v1/runner/adv")
+        self.assertIn("VBL hook      : installed", out)
+        self.assertIn("runner active : yes", out)
+
+    def test_runner_adv_status_inactive(self) -> None:
+        self._set_response(200, {
+            "ok": True, "active": False, "installed": False,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("VBL hook      : not installed", out)
+        self.assertIn("runner active : no", out)
+
+    def test_runner_adv_status_json(self) -> None:
+        self._set_response(200, {
+            "ok": True, "active": True, "installed": True,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "--json",
+             "runner", "adv", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        parsed = json.loads(out)
+        self.assertTrue(parsed["installed"])
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:

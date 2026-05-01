@@ -122,8 +122,29 @@ RUNNER_RES_ERR_BAD		equ -2	; requested rez out of range
 ; SHARED_VAR_DRIVE_NUMBER and stays on the GEMDRIVE-handled path
 ; instead of chaining to TOS native (which would EFILNF on C:\).
 SHARED_VARIABLES_ADDR		equ (SHARED_BLOCK_ADDR + $10)	; $FA2810
+SHARED_VAR_GEMDRIVE_RELOC	equ 10
 SHARED_VAR_DRIVE_NUMBER		equ 12
+GEMDRIVE_RELOC_ADDR_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_GEMDRIVE_RELOC*4)
 DRIVE_NUMBER_ADDR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_DRIVE_NUMBER*4)
+
+; Epic 04 — Advanced Runner. The runner blob now relocates itself
+; to RAM at runner_entry so its VBL handler can run from a stable
+; RAM address (cartridge ROM is fine for instructions but the VBL
+; ISR fires every frame — RAM is safer). Target address is
+; gemdrive_reloc - RUNNER_RELOC_OFFSET, leaving $400 of slack
+; between the two relocated blobs.
+RUNNER_BLOB_CART_ADDR		equ (ROM4_ADDR + $1C00)		; cartridge source
+RUNNER_BLOB_SIZE_BYTES		equ $C00			; matches devops.ld slot
+RUNNER_RELOC_OFFSET		equ $1000			; runner sits 4 KB below gemdrive
+_memtop				equ $436
+
+; Advanced Runner VBL command range. Reuses the existing sentinel;
+; the foreground poll loop's cmp.l cascade only matches $05xx, so
+; $06xx codes pass through to the VBL handler. v1 commands land in
+; S2 — S1 only scaffolds the dispatch.
+APP_RUNNER_VBL			equ $0600
+RUNNER_VBL_RANGE_MASK		equ $FF00
+VEC_VBL_AUTO			equ $70
 
 ; runner.s must be 100% relocatable and self-contained — no xref /
 ; xdef cross-module references, no jsr / jmp to symbols outside
@@ -143,17 +164,42 @@ DRIVE_NUMBER_ADDR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_DRIVE_NUMBER*4)
 ; ---------------------------------------------------------------
 
 runner_entry:
+	; --- Stage 0: relocation harness — runs ONCE from cartridge
+	; ROM at $FA1C00. Copies the entire runner blob to RAM
+	; (gemdrive_reloc - RUNNER_RELOC_OFFSET), lowers _memtop to
+	; protect both blobs, then jmps into the relocated copy at
+	; runner_post_reloc. The cartridge-ROM source is unused after
+	; the copy; the RAM copy is what actually executes for the
+	; lifetime of this Runner session. The whole module is
+	; PC-relative so labels resolve correctly post-relocation. ---
+	move.l	GEMDRIVE_RELOC_ADDR_VAR, d0
+	sub.l	#RUNNER_RELOC_OFFSET, d0	; d0 = runner_reloc
+	move.l	d0, _memtop.w			; lower _memtop to protect us
+
+	move.l	d0, a1				; dest
+	move.l	#RUNNER_BLOB_CART_ADDR, a0	; source
+	move.l	#RUNNER_BLOB_SIZE_BYTES, d1
+	lsr.l	#2, d1
+	subq.l	#1, d1
+.runner_copy:
+	move.l	(a0)+, (a1)+
+	dbf	d1, .runner_copy
+
+	; Compute relocated runner_post_reloc and jump.
+	move.l	d0, a0
+	add.l	#(runner_post_reloc - runner_entry), a0
+	jmp	(a0)
+
+; --- Stage 1+: post-relocation. Everything below runs from the
+; relocated RAM copy. ---
+runner_post_reloc:
 	; The cartridge address space ($FA0000-$FAFFFF) is read-only
 	; from the m68k — the cartridge port has no write strobe and
-	; any store there bus-errors (two bombs). The Runner therefore
-	; never writes to the shared region directly. The RP-side
-	; cmdRunner handler flips an in-memory `runner_active` flag the
-	; moment it sends DISPLAY_COMMAND_START_RUNNER, so
-	; `GET /api/v1/runner` knows the user chose Runner mode without
-	; a handshake from the m68k. Future stories will push richer
-	; state (exit codes, cwd) up to the RP via the cartridge
-	; protocol (send_sync with APP_RUNNER command IDs), where the
-	; RP-side runner_command_cb stashes it in RP RAM.
+	; any store there bus-errors. The Runner therefore never writes
+	; to the shared region directly; cross-target state lives in
+	; APP_FREE (RP writes), shared variables (RP writes via
+	; chandler), or the RP's in-memory mirror (set by cmdRunner /
+	; the chandler callbacks).
 
 	; --- Step 0: known cwd baseline. Whether we landed here from a
 	; cold boot, a runner reset, or the [U] menu pick, force the
@@ -172,10 +218,26 @@ runner_entry:
 	trap	#1
 	addq.l	#6, sp
 
+	; --- Step 0.5 (Epic 04 / S1): install the Advanced Runner VBL
+	; hook at $70. We're already in supervisor mode (inherited from
+	; CA_INIT bit 27), so direct vector write is fine. Mask
+	; interrupts during the swap so we never run a partially-updated
+	; vector. The hook is part of the relocated blob so it survives
+	; cartridge-bus weirdness during the ISR. ---
+	move.w	sr, -(sp)
+	or.w	#$0700, sr
+	lea	old_vbl(pc), a1			; PC-rel into the relocated blob
+	move.l	$70.w, (a1)
+	lea	adv_vbl_handler(pc), a0		; relocated handler address
+	move.l	a0, $70.w
+	move.w	(sp)+, sr
+
 	; Tell the RP a fresh Runner session just started so it clears
 	; any stale busy lock / cwd mirror that survived a physical or
-	; cold reset (where the RP itself didn't see the reset event).
-	send_sync RUNNER_CMD_DONE_HELLO, 0
+	; cold reset. d3 carries an "Advanced installed" flag the RP
+	; surfaces via GET /api/v1/runner/adv.
+	moveq.l	#1, d3				; advanced_installed = 1
+	send_sync RUNNER_CMD_DONE_HELLO, 4
 
 	; --- Step 1: clear screen + paint banner (single Cconws — the
 	; banner_text string leads with VT52 ESC E). ---
@@ -532,6 +594,50 @@ runner_reset:
 	move.l	$4.w, a0		; reset vector
 	jmp	(a0)
 	nop
+
+; ---------------------------------------------------------------
+; Advanced Runner VBL hook (Epic 04 / S1).
+;
+; Installed at $70 by runner_post_reloc. Runs at every vsync — must
+; be tight, must be position-independent, must chain cleanly to
+; whatever was at $70 before us so TOS' own VBL chain keeps firing.
+;
+; Read the cartridge sentinel and check whether the upper byte of
+; the command code matches APP_RUNNER_VBL ($0600). If so, dispatch
+; (S2 lands the actual commands — for now this is a stub). Then
+; fall through to the saved handler regardless.
+;
+; The sentinel is written by the RP via SEND_COMMAND_TO_DISPLAY;
+; values in the $05xx range belong to the foreground poll loop,
+; values in the $06xx range belong to us. The two ranges never
+; collide so the poll loop's existing cmp.l cascade ignores us
+; and we ignore everything outside $06xx.
+; ---------------------------------------------------------------
+adv_vbl_handler:
+	movem.l	d0-d1/a0, -(sp)			; ISR prologue — minimal save
+	move.l	CMD_MAGIC_SENTINEL_ADDR, d0
+	move.l	d0, d1
+	andi.l	#$FFFFFF00, d1
+	cmpi.l	#APP_RUNNER_VBL, d1
+	bne	.adv_chain
+	; In our range. Stub dispatch — S2 fills in commands.
+	; Fall through and chain regardless so the rest of the VBL
+	; chain keeps running this frame.
+.adv_chain:
+	movem.l	(sp)+, d0-d1/a0
+	move.l	old_vbl(pc), -(sp)
+	rts					; chain → previous handler does its work + rte
+
+; old_vbl: 4-byte cell holding the address of the prior $70 vector
+; (saved at install time by runner_post_reloc). PC-relative read
+; works at runtime once the blob is relocated; the cell lives in
+; the relocated copy, NOT the cartridge ROM original.
+	cnop	0,4
+	dc.l	'XBRA'				; XBRA debug marker so VBL-chain
+	dc.l	'SDRA'				; walkers can identify our hook
+old_vbl:
+	dc.l	0
+	even
 
 ; ---------------------------------------------------------------
 ; runner_print_dec_d3 — print signed 32-bit value in d3 as ASCII

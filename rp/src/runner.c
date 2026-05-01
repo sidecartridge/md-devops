@@ -78,8 +78,17 @@ static void __not_in_flash_func(runner_command_cb)(
       return;
     }
     case RUNNER_CMD_DONE_HELLO: {
-      DPRINTF("Runner: HELLO — clearing session state\n");
+      // d3 payload byte 0 = "Advanced Runner VBL hook installed?"
+      // (Epic 04 / S1). Older firmwares without S1 still send HELLO
+      // with size 0, in which case d3 reads as 0 and we report
+      // installed=false. emul_resetRunnerSession() also clears the
+      // flag, so the order here matters: reset first, then record.
+      uint32_t flags = TPROTO_GET_PAYLOAD_PARAM32(payload);
+      bool adv = (flags & 1u) != 0;
+      DPRINTF("Runner: HELLO — clearing session state, advanced=%d\n",
+              adv ? 1 : 0);
       emul_resetRunnerSession();
+      emul_recordRunnerAdvancedInstalled(adv);
       // The runner is confirmed back on the air. Cancel any pending
       // relaunch retry storm and clear the sentinel back to NOP so a
       // late-firing CMD_START_RUNNER write doesn't get re-read by the
