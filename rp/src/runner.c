@@ -40,6 +40,15 @@ static void __not_in_flash_func(runner_command_cb)(
       SEND_COMMAND_TO_DISPLAY(0);
       return;
     }
+    case RUNNER_CMD_DONE_RES: {
+      uint32_t raw = TPROTO_GET_PAYLOAD_PARAM32(payload);
+      int32_t errnum = (int32_t)raw;
+      uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+      DPRINTF("Runner: RES done, errno=%ld\n", (long)errnum);
+      emul_recordRunnerResDone(errnum, now_ms);
+      SEND_COMMAND_TO_DISPLAY(0);
+      return;
+    }
     case RUNNER_CMD_DONE_HELLO: {
       DPRINTF("Runner: HELLO — clearing session state\n");
       emul_resetRunnerSession();

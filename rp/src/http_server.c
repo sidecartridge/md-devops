@@ -1117,6 +1117,7 @@ static const char *runner_last_command_str(runner_last_command_t cmd) {
     case RUNNER_LAST_RESET: return "RESET";
     case RUNNER_LAST_EXECUTE: return "EXECUTE";
     case RUNNER_LAST_CD: return "CD";
+    case RUNNER_LAST_RES: return "RES";
     default: return NULL;  // RUNNER_LAST_NONE → JSON null
   }
 }
@@ -1145,6 +1146,8 @@ static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
   bool has_exit = emul_getRunnerLastExitCode(&exit_code);
   int32_t cd_errno = 0;
   bool has_cd_errno = emul_getRunnerLastCdErrno(&cd_errno);
+  int32_t res_errno = 0;
+  bool has_res_errno = emul_getRunnerLastResErrno(&res_errno);
 
   char last_started_buf[24];
   char last_finished_buf[24];
@@ -1178,7 +1181,15 @@ static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
     snprintf(last_cd_errno_buf, sizeof(last_cd_errno_buf), "null");
   }
 
-  char body[480];
+  char last_res_errno_buf[24];
+  if (has_res_errno) {
+    snprintf(last_res_errno_buf, sizeof(last_res_errno_buf), "%ld",
+             (long)res_errno);
+  } else {
+    snprintf(last_res_errno_buf, sizeof(last_res_errno_buf), "null");
+  }
+
+  char body[512];
   int n = snprintf(
       body, sizeof(body),
       "{\"ok\":true,\"active\":%s,\"busy\":%s,\"cwd\":\"%s\","
@@ -1186,6 +1197,7 @@ static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
       "\"last_path\":%s%s%s,"
       "\"last_exit_code\":%s,"
       "\"last_cd_errno\":%s,"
+      "\"last_res_errno\":%s,"
       "\"last_started_at_ms\":%s,\"last_finished_at_ms\":%s}\n",
       active ? "true" : "false",
       busy ? "true" : "false",
@@ -1198,6 +1210,7 @@ static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
       (last_path != NULL && last_path[0] != '\0') ? "\"" : "",
       last_exit_buf,
       last_cd_errno_buf,
+      last_res_errno_buf,
       last_started_buf, last_finished_buf);
   if (n < 0) n = 0;
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
@@ -1540,6 +1553,90 @@ static void __not_in_flash_func(handle_runner_cd)(http_conn_t *c) {
   // user typed a relative or absolute target.
   emul_recordRunnerCdSubmit(norm, now_ms);
   SEND_COMMAND_TO_DISPLAY(RUNNER_CMD_CD);
+
+  char body[80];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"accepted\":true}\n");
+  if (n < 0) n = 0;
+  write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
+}
+
+// Stage the requested rez (low | med) into the RUNNER_REZ slot of
+// APP_FREE so the m68k handler can read it. u16 in the low half of
+// the longword. Byte-pair-swapped so the m68k's word-load lands
+// the right value (cartridge-bus quirk — same as runner_write_path).
+static void __not_in_flash_func(runner_write_rez)(uint16_t rez) {
+  uint8_t *dst = (uint8_t *)(runner_app_free_address() + RUNNER_REZ_OFFSET);
+  // Zero the 4-byte slot, then write the u16 swapped.
+  uint8_t hi = (uint8_t)((rez >> 8) & 0xFF);
+  uint8_t lo = (uint8_t)(rez & 0xFF);
+  dst[0 ^ 1u] = hi;
+  dst[1 ^ 1u] = lo;
+  dst[2 ^ 1u] = 0;
+  dst[3 ^ 1u] = 0;
+}
+
+// POST /api/v1/runner/res — Epic 03 / S5.
+//
+// JSON body: {"rez": "low"|"med"}. Stateless — caller passes the
+// target. The m68k Runner reads RUNNER_REZ, calls XBIOS Getrez to
+// detect monochrome (rez == 2) and refuse, otherwise XBIOS Setscreen
+// with the requested rez. Errno (i32) returns via RUNNER_CMD_DONE_RES
+// and surfaces as `last_res_errno` in the status envelope.
+static void __not_in_flash_func(handle_runner_res)(http_conn_t *c) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return;
+  }
+  if (emul_isRunnerBusy()) {
+    write_response_ex(c, 503, "Service Unavailable", "application/json",
+                      "Retry-After: 1\r\n",
+                      "{\"ok\":false,\"code\":\"busy\","
+                      "\"message\":\"Runner is busy with another command\"}\n",
+                      0);
+    return;
+  }
+  if (c->content_length == 0) {
+    write_error(c, 411, "Length Required", "length_required",
+                "JSON body required");
+    return;
+  }
+  if (!c->content_type_json) {
+    write_error(c, 415, "Unsupported Media Type", "unsupported_media",
+                "Content-Type must be application/json");
+    return;
+  }
+
+  char rez_str[8];
+  json_status_t js = json_extract_string(c->body, c->body_received, "rez",
+                                         rez_str, sizeof(rez_str));
+  if (js == JSON_BAD) {
+    write_error(c, 422, "Unprocessable Entity", "bad_json",
+                "Malformed JSON body");
+    return;
+  }
+  if (js != JSON_OK) {
+    write_error(c, 422, "Unprocessable Entity", "unprocessable",
+                "Missing or non-string `rez` field");
+    return;
+  }
+  uint16_t rez;
+  if (strcmp(rez_str, "low") == 0) {
+    rez = 0;
+  } else if (strcmp(rez_str, "med") == 0) {
+    rez = 1;
+  } else {
+    write_error(c, 400, "Bad Request", "bad_request",
+                "rez must be \"low\" or \"med\"");
+    return;
+  }
+
+  runner_write_rez(rez);
+
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  emul_recordRunnerResSubmit(now_ms);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_CMD_RES);
 
   char body[80];
   int n = snprintf(body, sizeof(body),
@@ -3010,6 +3107,14 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
     if (strcmp(action, "cd") == 0) {
       if (c->method == HM_POST) {
         handle_runner_cd(c);
+        return;
+      }
+      write_405(c, "POST");
+      return;
+    }
+    if (strcmp(action, "res") == 0) {
+      if (c->method == HM_POST) {
+        handle_runner_res(c);
         return;
       }
       write_405(c, "POST");

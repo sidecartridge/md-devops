@@ -449,6 +449,32 @@ def cmd_runner_run(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_runner_res(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/res — fire-and-forget XBIOS Setscreen."""
+    body_json = {"rez": args.rez}
+    body = json.dumps(body_json, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    url = base_url(args.host) + "/api/v1/runner/res"
+    try:
+        status, parsed, raw = request_json(
+            "POST", url, body=body, headers=headers)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 202:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        print(f"ok  RES {args.rez} sent")
+    return EXIT_OK
+
+
 def cmd_runner_cd(args: argparse.Namespace) -> int:
     """POST /api/v1/runner/cd — fire-and-forget GEMDOS Dsetpath."""
     body_json = {"path": args.remote}
@@ -531,11 +557,14 @@ def cmd_runner_status(args: argparse.Namespace) -> int:
     print(f"active   : true")
     print(f"busy     : {'yes' if busy else 'no'}")
     print(f"cwd      : {cwd}")
+    last_res_errno = parsed.get("last_res_errno")
     if last_cmd is None:
         print(f"last     : (no command run yet)")
     elif last_cmd == "CD":
         target = last_path if last_path is not None else "?"
         print(f"last     : CD {target} (errno={last_cd_errno})")
+    elif last_cmd == "RES":
+        print(f"last     : RES (errno={last_res_errno})")
     elif last_path is None:
         print(f"last     : {last_cmd} (exit={last_exit})")
     else:
@@ -735,6 +764,11 @@ def build_parser() -> argparse.ArgumentParser:
         "cd", help="GEMDOS Dsetpath — change the Runner's cwd.")
     cd_p.add_argument(
         "remote", help="Directory (relative to GEMDRIVE_FOLDER).")
+    res_p = runner_sub.add_parser(
+        "res", help="XBIOS Setscreen — change ST screen rez (colour only).")
+    res_p.add_argument(
+        "rez", choices=["low", "med"],
+        help="Target rez. Ignored on monochrome monitors.")
     run_p = runner_sub.add_parser(
         "run", help="Run a .TOS / .PRG on the Atari ST.")
     run_p.add_argument("remote", help="Path to the program (relative to GEMDRIVE_FOLDER).")
@@ -768,6 +802,7 @@ def main(argv: list[str] | None = None) -> int:
             "reset": cmd_runner_reset,
             "run": cmd_runner_run,
             "cd": cmd_runner_cd,
+            "res": cmd_runner_res,
         }
         handler = runner_handlers.get(args.runner_cmd)
         if handler is None:

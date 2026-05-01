@@ -838,6 +838,54 @@ class RunnerCdTests(unittest.TestCase):
         self.assertIn("runner_inactive", err)
 
 
+class RunnerResTests(unittest.TestCase):
+    """Epic 03 / S5 — `sidecart runner res`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_res_low_202(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "res", "low"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path, "/api/v1/runner/res")
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body, {"rez": "low"})
+        self.assertIn("RES", out)
+
+    def test_runner_res_med_202(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "res", "med"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body, {"rez": "med"})
+
+    def test_runner_res_rejects_unknown_rez(self) -> None:
+        # argparse `choices` rejects before the request leaves the CLI.
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "res", "high"])
+        self.assertNotEqual(code, sidecart.EXIT_OK)
+        self.assertIn("invalid choice", err)
+
+    def test_runner_res_409_runner_inactive(self) -> None:
+        self._set_response(409, {"ok": False, "code": "runner_inactive",
+                                 "message": "Runner not active"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "res", "low"])
+        self.assertIn("runner_inactive", err)
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:

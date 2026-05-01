@@ -28,6 +28,9 @@
 #define RUNNER_CWD_LEN 128
 #define RUNNER_HELLO_OFFSET (RUNNER_BASE_OFFSET + 0x188)        // 4 B
 #define RUNNER_PROTO_VER_OFFSET (RUNNER_BASE_OFFSET + 0x18C)    // 4 B
+// Stateless target rez for RUNNER_CMD_RES (u16 in low half;
+// 0=low, 1=med). Stored as 4 B for word-aligned access.
+#define RUNNER_REZ_OFFSET (RUNNER_BASE_OFFSET + 0x190)          // 4 B
 
 // Magic the m68k Runner publishes at boot so the RP can detect that
 // Runner mode is active. ASCII 'RNV1' big-endian. Reserved for
@@ -48,6 +51,7 @@
 #define RUNNER_CMD_RESET (APP_RUNNER + 0x01)    // cold reset
 #define RUNNER_CMD_EXECUTE (APP_RUNNER + 0x02)  // Pexec mode 0
 #define RUNNER_CMD_CD (APP_RUNNER + 0x03)       // Dsetpath
+#define RUNNER_CMD_RES (APP_RUNNER + 0x04)      // XBIOS Setscreen
 
 // m68k -> RP report commands (sent via send_sync from the Runner).
 // High bit set so they don't collide with the RP -> m68k sentinel
@@ -59,6 +63,7 @@
 // menu re-entry. RP clears the session-transient state (busy, cwd
 // mirror) so a status query right after a reset reflects "idle".
 #define RUNNER_CMD_DONE_HELLO (APP_RUNNER + 0x84)    // no payload
+#define RUNNER_CMD_DONE_RES (APP_RUNNER + 0x85)      // payload: i32 errno
 
 // RP-side state machine mirror. cmdRunner sets ACTIVE; per-command
 // handlers update last_command. Used by GET /api/v1/runner.
@@ -67,6 +72,7 @@ typedef enum {
   RUNNER_LAST_RESET = 1,
   RUNNER_LAST_EXECUTE = 2,
   RUNNER_LAST_CD = 3,
+  RUNNER_LAST_RES = 4,
 } runner_last_command_t;
 
 /**

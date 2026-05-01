@@ -119,6 +119,25 @@ const char *emul_getRunnerCwd(void);
 bool emul_getRunnerLastCdErrno(int32_t *out);
 
 /**
+ * @brief Record a RUNNER_RES submission. Sets last_command=RES,
+ *        timestamps, busy=true.
+ */
+void emul_recordRunnerResSubmit(uint32_t now_ms);
+
+/**
+ * @brief Record a RUNNER_RES completion (RUNNER_CMD_DONE_RES).
+ *        Stores the m68k-side errno (0 = applied, -1 = monochrome
+ *        ignored, -2 = bad rez). Clears busy.
+ */
+void emul_recordRunnerResDone(int32_t errnum, uint32_t now_ms);
+
+/**
+ * @brief Last RES errno, if available. Returns true and writes the
+ *        i32 into *out when a RES completion has been recorded.
+ */
+bool emul_getRunnerLastResErrno(int32_t *out);
+
+/**
  * @brief Wipe session-transient Runner state (busy lock, cwd mirror,
  *        last cd-errno). Called when the m68k Runner reports it has
  *        (re)entered its poll loop via RUNNER_CMD_DONE_HELLO — covers

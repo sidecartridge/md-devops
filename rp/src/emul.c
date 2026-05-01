@@ -123,6 +123,8 @@ static char runnerCwd[RUNNER_CWD_LEN] = {0};
 static char runnerCwdPrev[RUNNER_CWD_LEN] = {0};
 static bool runnerLastHasCdErrno = false;
 static int32_t runnerLastCdErrno = 0;
+static bool runnerLastHasResErrno = false;
+static int32_t runnerLastResErrno = 0;
 
 bool emul_isRunnerActive(void) { return runnerActive; }
 bool emul_isRunnerBusy(void) { return runnerBusy; }
@@ -234,12 +236,41 @@ bool emul_getRunnerLastCdErrno(int32_t *out) {
   return runnerLastHasCdErrno;
 }
 
+void emul_recordRunnerResSubmit(uint32_t now_ms) {
+  runnerLastCommand = RUNNER_LAST_RES;
+  runnerLastStartedMs = now_ms;
+  runnerLastFinishedMs = 0;
+  runnerLastHasResErrno = false;
+  runnerLastResErrno = 0;
+  // RES doesn't operate on a path; clear the path mirror so the
+  // status endpoint doesn't show a stale EXECUTE/CD path against an
+  // RES last_command.
+  runnerLastPath[0] = '\0';
+  runnerBusy = true;
+}
+
+void emul_recordRunnerResDone(int32_t errnum, uint32_t now_ms) {
+  runnerLastResErrno = errnum;
+  runnerLastHasResErrno = true;
+  runnerLastFinishedMs = now_ms;
+  runnerBusy = false;
+}
+
+bool emul_getRunnerLastResErrno(int32_t *out) {
+  if (runnerLastHasResErrno && out != NULL) {
+    *out = runnerLastResErrno;
+  }
+  return runnerLastHasResErrno;
+}
+
 void emul_resetRunnerSession(void) {
   runnerBusy = false;
   runnerCwd[0] = '\0';
   runnerCwdPrev[0] = '\0';
   runnerLastHasCdErrno = false;
   runnerLastCdErrno = 0;
+  runnerLastHasResErrno = false;
+  runnerLastResErrno = 0;
 }
 
 void emul_onGemdriveHello(void) {
