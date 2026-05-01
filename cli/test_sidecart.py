@@ -886,6 +886,84 @@ class RunnerResTests(unittest.TestCase):
         self.assertIn("runner_inactive", err)
 
 
+class RunnerMeminfoTests(unittest.TestCase):
+    """Epic 03 / S6 — `sidecart runner meminfo`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_meminfo_human(self) -> None:
+        self._set_response(200, {
+            "ok": True,
+            "membottom": 0x000900,
+            "memtop": 0x100000,
+            "phystop": 0x100000,
+            "screenmem": 0x0F8000,
+            "basepage": 0x000C00,
+            "bank0_kb": 512,
+            "bank1_kb": 512,
+            "decoded": True,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "meminfo"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "GET")
+        self.assertEqual(self.server.state.last_path, "/api/v1/runner/meminfo")
+        self.assertIn("0x00100000", out)
+        self.assertIn("512 KB", out)
+        self.assertIn("total RAM         : 1024 KB", out)
+        self.assertIn("[$432]", out)
+        self.assertIn("[$FF8001 nibble]", out)
+
+    def test_runner_meminfo_unknown_mmu(self) -> None:
+        self._set_response(200, {
+            "ok": True,
+            "membottom": 0, "memtop": 0, "phystop": 0,
+            "screenmem": 0, "basepage": 0,
+            "bank0_kb": 0, "bank1_kb": 0,
+            "decoded": False,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "meminfo"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("unrecognised MMU config", out)
+
+    def test_runner_meminfo_json(self) -> None:
+        self._set_response(200, {
+            "ok": True, "membottom": 0x900, "memtop": 0x100000,
+            "phystop": 0x100000, "screenmem": 0xF8000, "basepage": 0xC00,
+            "bank0_kb": 512, "bank1_kb": 512, "decoded": True,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "--json", "runner", "meminfo"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        parsed = json.loads(out)
+        self.assertEqual(parsed["bank0_kb"], 512)
+
+    def test_runner_meminfo_504_timeout(self) -> None:
+        self._set_response(504, {"ok": False, "code": "gateway_timeout",
+                                 "message": "Runner did not respond"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "meminfo"])
+        self.assertNotEqual(code, sidecart.EXIT_OK)
+        self.assertIn("gateway_timeout", err)
+
+    def test_runner_meminfo_409_runner_inactive(self) -> None:
+        self._set_response(409, {"ok": False, "code": "runner_inactive",
+                                 "message": "Runner not active"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "meminfo"])
+        self.assertIn("runner_inactive", err)
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:

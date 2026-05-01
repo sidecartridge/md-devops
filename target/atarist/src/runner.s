@@ -66,11 +66,13 @@ RUNNER_CMD_RESET		equ ($01 + APP_RUNNER)	; cold reset
 RUNNER_CMD_EXECUTE		equ ($02 + APP_RUNNER)	; Pexec mode 0
 RUNNER_CMD_CD			equ ($03 + APP_RUNNER)	; Dsetpath
 RUNNER_CMD_RES			equ ($04 + APP_RUNNER)	; XBIOS Setscreen — rez at RUNNER_REZ
+RUNNER_CMD_MEMINFO		equ ($05 + APP_RUNNER)	; system memory snapshot (synchronous)
 ; m68k -> RP report commands (sent via send_sync from the Runner).
 RUNNER_CMD_DONE_EXECUTE		equ ($82 + APP_RUNNER)	; payload: i32 exit code
 RUNNER_CMD_DONE_CD		equ ($83 + APP_RUNNER)	; payload: i32 GEMDOS errno
 RUNNER_CMD_DONE_HELLO		equ ($84 + APP_RUNNER)	; no payload — runner entered loop
 RUNNER_CMD_DONE_RES		equ ($85 + APP_RUNNER)	; payload: i32 errno (0 = OK, -1 = mono, -2 = bad rez)
+RUNNER_CMD_DONE_MEMINFO		equ ($86 + APP_RUNNER)	; payload: 24-byte meminfo struct
 
 ; Wait between the RUNNER_RESET sentinel sighting and the actual
 ; reset trampoline — gives any in-flight cartridge bus traffic time
@@ -96,6 +98,7 @@ _dskbufp			equ $4C6
 GEMDOS_Cconws			equ 9
 GEMDOS_Cconout			equ 2
 GEMDOS_Dsetdrv			equ $E
+GEMDOS_Super			equ $20
 GEMDOS_Dsetpath			equ $3B
 GEMDOS_Pexec			equ $4B
 XBIOS_Getrez			equ 4
@@ -194,6 +197,8 @@ runner_poll_loop:
 	beq	runner_cd
 	cmp.l	#RUNNER_CMD_RES, d6
 	beq	runner_res
+	cmp.l	#RUNNER_CMD_MEMINFO, d6
+	beq	runner_meminfo
 	bra.s	runner_poll_loop
 
 ; RUNNER_CMD_EXECUTE handler. Reads RUNNER_PATH (NUL-terminated) and
@@ -395,6 +400,115 @@ runner_res:
 	send_sync RUNNER_CMD_DONE_RES, 4
 	bra	runner_poll_loop
 
+; RUNNER_CMD_MEMINFO handler. Reads system memory cookies and the
+; MMU bank-config register, packs a 24-byte struct on the stack and
+; ships it back to the RP via send_write_sync. Struct layout (the
+; m68k writes the values big-endian as the CPU sees them; the RP-side
+; chandler iterates 16-bit words and unswaps as needed):
+;
+;   offset  size  field
+;     0     u32   _membot   ($432)
+;     4     u32   _memtop   ($436)
+;     8     u32   _phystop  ($42E)
+;    12     u32   screenmem ($44E)
+;    16     u32   basepage  ($4F2 — TOS >= 1.04; 0 on older TOS)
+;    20     u16   bank0_kb  (decoded from $FFFF8001 lower nibble)
+;    22     u16   bank1_kb
+;
+; $FFFF8001 lives in supervisor address space, so the handler enters
+; supervisor via GEMDOS Super(NULL), reads the byte, then restores
+; user mode via Super(<old_ssp>). All other addresses are in the
+; system-variable RAM area — readable from user mode.
+;
+; Bank decoding (bits 3..0 of $FFFF8001):
+;   0000 -> 128  / 128
+;   0100 -> 512  / 128
+;   0101 -> 512  / 512
+;   1000 -> 2048 / 128
+;   1010 -> 2048 / 2048
+;   any other -> bank0_kb = bank1_kb = 0  (caller flags as unknown)
+runner_meminfo:
+	; Trace.
+	pea	text_mem(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+
+	; Allocate 24-byte struct on the stack and zero it. We're already
+	; in supervisor mode (the runner's whole call chain inherits the
+	; supervisor state from CA_INIT bit 27 / pre_auto), so no Super
+	; toggle is needed for $0..$7FF or $FFFF8001 reads.
+	;
+	; STAGED IMPLEMENTATION: only _membot ($432) is read for now to
+	; validate the wire/buffer path end-to-end. All other fields
+	; ship as zero. Once meminfo returns the correct $432 value,
+	; subsequent fields will be filled in one at a time.
+	lea	-24(sp), sp
+	move.l	sp, a4
+	; Zero the struct.
+	clr.l	0(a4)
+	clr.l	4(a4)
+	clr.l	8(a4)
+	clr.l	12(a4)
+	clr.l	16(a4)
+	clr.l	20(a4)
+
+	; Stage 4: full struct. _membot ($432), _memtop ($436),
+	; _phystop ($42E), screenmem ($44E), basepage ($4F2), and the
+	; MMU bank-config byte at $FFFF8001.
+	move.l	$432.w, 0(a4)			; _membot
+	move.l	$436.w, 4(a4)			; _memtop
+	move.l	$42E.w, 8(a4)			; _phystop
+	move.l	$44E.w, 12(a4)			; screenmem (logical screen base)
+	move.l	$4F2.w, 16(a4)			; _run (basepage; 0 on TOS < 1.04)
+
+	; Read the MMU configuration register at $FFFF8001. The byte's
+	; lower nibble encodes the (bank0, bank1) sizes. We're already
+	; in supervisor mode (inherited from CA_INIT bit 27), so the
+	; absolute address read is allowed. The buffer's bank fields at
+	; offsets 20 and 22 were pre-zeroed, so any unrecognised nibble
+	; falls through with bank0_kb = bank1_kb = 0 — the RP-side
+	; reports that as "unrecognised MMU config".
+	moveq.l	#0, d3
+	move.b	$FFFF8001, d3
+	and.w	#$0F, d3
+
+	cmp.b	#%0000, d3
+	bne.s	.mi_n0100
+	move.w	#128, 20(a4)
+	move.w	#128, 22(a4)
+	bra.s	.mi_decoded
+.mi_n0100:
+	cmp.b	#%0100, d3
+	bne.s	.mi_n0101
+	move.w	#512, 20(a4)
+	move.w	#128, 22(a4)
+	bra.s	.mi_decoded
+.mi_n0101:
+	cmp.b	#%0101, d3
+	bne.s	.mi_n1000
+	move.w	#512, 20(a4)
+	move.w	#512, 22(a4)
+	bra.s	.mi_decoded
+.mi_n1000:
+	cmp.b	#%1000, d3
+	bne.s	.mi_n1010
+	move.w	#2048, 20(a4)
+	move.w	#128, 22(a4)
+	bra.s	.mi_decoded
+.mi_n1010:
+	cmp.b	#%1010, d3
+	bne.s	.mi_decoded
+	move.w	#2048, 20(a4)
+	move.w	#2048, 22(a4)
+.mi_decoded:
+
+	; Ship the struct to the RP. send_write_sync expects a4 = buffer.
+	send_write_sync RUNNER_CMD_DONE_MEMINFO, 24
+
+	lea	24(sp), sp			; pop struct
+	bra	runner_poll_loop
+
 ; Cold reset — same sequence as main.s' .reset. Waits briefly,
 ; invalidates TOS' memory-system "valid" cookies (so the next boot
 ; rebuilds RAM tables instead of trusting stale ones), then jumps
@@ -566,6 +680,9 @@ text_cd:
 	even
 text_res:
 	dc.b	13, 10, "[RES  ]", 13, 10, 0
+	even
+text_mem:
+	dc.b	13, 10, "[MEMIN] - Reading memory information", 13, 10, 0
 	even
 text_terminated:
 	dc.b	" terminated", 13, 10, 0

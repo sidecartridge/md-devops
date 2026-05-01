@@ -52,6 +52,7 @@
 #define RUNNER_CMD_EXECUTE (APP_RUNNER + 0x02)  // Pexec mode 0
 #define RUNNER_CMD_CD (APP_RUNNER + 0x03)       // Dsetpath
 #define RUNNER_CMD_RES (APP_RUNNER + 0x04)      // XBIOS Setscreen
+#define RUNNER_CMD_MEMINFO (APP_RUNNER + 0x05)  // system memory snapshot
 
 // m68k -> RP report commands (sent via send_sync from the Runner).
 // High bit set so they don't collide with the RP -> m68k sentinel
@@ -64,6 +65,7 @@
 // mirror) so a status query right after a reset reflects "idle".
 #define RUNNER_CMD_DONE_HELLO (APP_RUNNER + 0x84)    // no payload
 #define RUNNER_CMD_DONE_RES (APP_RUNNER + 0x85)      // payload: i32 errno
+#define RUNNER_CMD_DONE_MEMINFO (APP_RUNNER + 0x86)  // payload: 24-byte struct
 
 // RP-side state machine mirror. cmdRunner sets ACTIVE; per-command
 // handlers update last_command. Used by GET /api/v1/runner.
@@ -73,7 +75,20 @@ typedef enum {
   RUNNER_LAST_EXECUTE = 2,
   RUNNER_LAST_CD = 3,
   RUNNER_LAST_RES = 4,
+  RUNNER_LAST_MEMINFO = 5,
 } runner_last_command_t;
+
+// Snapshot returned by RUNNER_CMD_MEMINFO. Mirrors the 24-byte
+// struct the m68k builds in runner.s' runner_meminfo handler.
+typedef struct {
+  uint32_t membot;     // _membot   ($432)
+  uint32_t memtop;     // _memtop   ($436)
+  uint32_t phystop;    // _phystop  ($42E)
+  uint32_t screenmem;  // _v_bas_ad ($44E) logical screen base
+  uint32_t basepage;   // _run      ($4F2) — 0 on TOS < 1.04
+  uint16_t bank0_kb;   // 0 = unknown / unrecognised MMU config
+  uint16_t bank1_kb;
+} runner_meminfo_t;
 
 /**
  * @brief Register the Runner's chandler callback for m68k → RP

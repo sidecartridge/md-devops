@@ -125,6 +125,9 @@ static bool runnerLastHasCdErrno = false;
 static int32_t runnerLastCdErrno = 0;
 static bool runnerLastHasResErrno = false;
 static int32_t runnerLastResErrno = 0;
+static runner_meminfo_t runnerMeminfo = {0};
+static bool runnerMeminfoHasSnapshot = false;
+static bool runnerMeminfoPending = false;
 
 bool emul_isRunnerActive(void) { return runnerActive; }
 bool emul_isRunnerBusy(void) { return runnerBusy; }
@@ -263,6 +266,35 @@ bool emul_getRunnerLastResErrno(int32_t *out) {
   return runnerLastHasResErrno;
 }
 
+void emul_recordRunnerMeminfoSubmit(uint32_t now_ms) {
+  runnerLastCommand = RUNNER_LAST_MEMINFO;
+  runnerLastStartedMs = now_ms;
+  runnerLastFinishedMs = 0;
+  runnerLastPath[0] = '\0';
+  runnerMeminfoPending = true;
+  runnerBusy = true;
+}
+
+void emul_recordRunnerMeminfoDone(const runner_meminfo_t *snap,
+                                  uint32_t now_ms) {
+  if (snap != NULL) {
+    runnerMeminfo = *snap;
+    runnerMeminfoHasSnapshot = true;
+  }
+  runnerMeminfoPending = false;
+  runnerLastFinishedMs = now_ms;
+  runnerBusy = false;
+}
+
+bool emul_isRunnerMeminfoReady(void) { return !runnerMeminfoPending; }
+
+bool emul_getRunnerMeminfo(runner_meminfo_t *out) {
+  if (runnerMeminfoHasSnapshot && out != NULL) {
+    *out = runnerMeminfo;
+  }
+  return runnerMeminfoHasSnapshot;
+}
+
 void emul_resetRunnerSession(void) {
   runnerBusy = false;
   runnerCwd[0] = '\0';
@@ -271,6 +303,8 @@ void emul_resetRunnerSession(void) {
   runnerLastCdErrno = 0;
   runnerLastHasResErrno = false;
   runnerLastResErrno = 0;
+  runnerMeminfoPending = false;
+  runnerMeminfoHasSnapshot = false;
 }
 
 void emul_onGemdriveHello(void) {

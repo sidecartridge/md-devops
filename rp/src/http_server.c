@@ -1118,6 +1118,7 @@ static const char *runner_last_command_str(runner_last_command_t cmd) {
     case RUNNER_LAST_EXECUTE: return "EXECUTE";
     case RUNNER_LAST_CD: return "CD";
     case RUNNER_LAST_RES: return "RES";
+    case RUNNER_LAST_MEMINFO: return "MEMINFO";
     default: return NULL;  // RUNNER_LAST_NONE → JSON null
   }
 }
@@ -1643,6 +1644,76 @@ static void __not_in_flash_func(handle_runner_res)(http_conn_t *c) {
                    "{\"ok\":true,\"accepted\":true}\n");
   if (n < 0) n = 0;
   write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
+}
+
+// GET /api/v1/runner/meminfo — Epic 03 / S6.
+//
+// Synchronous: writes RUNNER_CMD_MEMINFO to the cartridge sentinel,
+// then spins on chandler_loop until the m68k Runner replies with
+// RUNNER_CMD_DONE_MEMINFO (handled by runner.c, which stashes the
+// 24-byte snapshot via emul_recordRunnerMeminfoDone). Times out
+// after ~1 s so a wedged m68k doesn't lock the HTTP server forever.
+// Inactive runner / busy lock return early without firing the
+// sentinel. The handler emits a JSON envelope with the 5 u32 system
+// addresses, the two decoded bank sizes (0/0 = unrecognised MMU
+// config), and a simple "decoded" boolean derived from the banks.
+#define RUNNER_MEMINFO_TIMEOUT_US 1000000
+static void __not_in_flash_func(handle_runner_meminfo)(http_conn_t *c) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return;
+  }
+  if (emul_isRunnerBusy()) {
+    write_response_ex(c, 503, "Service Unavailable", "application/json",
+                      "Retry-After: 1\r\n",
+                      "{\"ok\":false,\"code\":\"busy\","
+                      "\"message\":\"Runner is busy with another command\"}\n",
+                      0);
+    return;
+  }
+
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  emul_recordRunnerMeminfoSubmit(now_ms);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_CMD_MEMINFO);
+
+  absolute_time_t deadline =
+      delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
+  while (!emul_isRunnerMeminfoReady()) {
+    chandler_loop();
+    if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+      // Timeout — clear busy and report.
+      uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+      runner_meminfo_t empty = {0};
+      emul_recordRunnerMeminfoDone(&empty, fail_ms);  // unblocks busy
+      write_error(c, 504, "Gateway Timeout", "gateway_timeout",
+                  "Runner did not respond within 1 s");
+      return;
+    }
+  }
+
+  runner_meminfo_t snap;
+  if (!emul_getRunnerMeminfo(&snap)) {
+    write_error(c, 500, "Internal Server Error", "no_snapshot",
+                "Runner returned but no snapshot recorded");
+    return;
+  }
+
+  bool decoded = (snap.bank0_kb != 0) || (snap.bank1_kb != 0);
+  char body[400];
+  int n = snprintf(
+      body, sizeof(body),
+      "{\"ok\":true,"
+      "\"membottom\":%lu,\"memtop\":%lu,\"phystop\":%lu,"
+      "\"screenmem\":%lu,\"basepage\":%lu,"
+      "\"bank0_kb\":%u,\"bank1_kb\":%u,\"decoded\":%s}\n",
+      (unsigned long)snap.membot, (unsigned long)snap.memtop,
+      (unsigned long)snap.phystop, (unsigned long)snap.screenmem,
+      (unsigned long)snap.basepage,
+      (unsigned)snap.bank0_kb, (unsigned)snap.bank1_kb,
+      decoded ? "true" : "false");
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
 // POST /api/v1/runner/reset — Epic 03 / S2.
@@ -3118,6 +3189,14 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
         return;
       }
       write_405(c, "POST");
+      return;
+    }
+    if (strcmp(action, "meminfo") == 0) {
+      if (c->method == HM_GET || c->method == HM_HEAD) {
+        handle_runner_meminfo(c);
+        return;
+      }
+      write_405(c, "GET");
       return;
     }
     write_error(c, 404, "Not Found", "not_found", "Route not found");

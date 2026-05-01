@@ -49,6 +49,34 @@ static void __not_in_flash_func(runner_command_cb)(
       SEND_COMMAND_TO_DISPLAY(0);
       return;
     }
+    case RUNNER_CMD_DONE_MEMINFO: {
+      // send_write_sync packs the payload as: d3.l, d4.l, d5.l (three
+      // 32-bit scratch slots) followed by the buffer body, transmitted
+      // word-by-word via `tst.b (a0, d.w)`. The PIO captures each word
+      // as the m68k saw it (uint16_t native), so payload[j] is already
+      // in the right byte order — NO byte-swap needed. Just skip the
+      // three scratch slots and read the words directly. m68k stored
+      // each u32 as `move.l value, offs(a4)` (high half first), so u32
+      // = (word[0] << 16) | word[1].
+      TPROTO_NEXT32_PAYLOAD_PTR(payload);
+      TPROTO_NEXT32_PAYLOAD_PTR(payload);
+      TPROTO_NEXT32_PAYLOAD_PTR(payload);
+      runner_meminfo_t snap;
+      snap.membot    = ((uint32_t)payload[0] << 16) | payload[1];
+      snap.memtop    = ((uint32_t)payload[2] << 16) | payload[3];
+      snap.phystop   = ((uint32_t)payload[4] << 16) | payload[5];
+      snap.screenmem = ((uint32_t)payload[6] << 16) | payload[7];
+      snap.basepage  = ((uint32_t)payload[8] << 16) | payload[9];
+      snap.bank0_kb  = payload[10];
+      snap.bank1_kb  = payload[11];
+      uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+      DPRINTF("Runner: MEMINFO done, phystop=0x%08lX, banks=%u/%u kB\n",
+              (unsigned long)snap.phystop, (unsigned)snap.bank0_kb,
+              (unsigned)snap.bank1_kb);
+      emul_recordRunnerMeminfoDone(&snap, now_ms);
+      SEND_COMMAND_TO_DISPLAY(0);
+      return;
+    }
     case RUNNER_CMD_DONE_HELLO: {
       DPRINTF("Runner: HELLO — clearing session state\n");
       emul_resetRunnerSession();

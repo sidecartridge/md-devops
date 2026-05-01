@@ -138,6 +138,36 @@ void emul_recordRunnerResDone(int32_t errnum, uint32_t now_ms);
 bool emul_getRunnerLastResErrno(int32_t *out);
 
 /**
+ * @brief Record a MEMINFO submission (HTTP handler is about to fire
+ *        RUNNER_CMD_MEMINFO and spin waiting for the m68k to reply).
+ *        Sets last_command=MEMINFO, started_at_ms, busy=true, marks
+ *        the snapshot stale.
+ */
+void emul_recordRunnerMeminfoSubmit(uint32_t now_ms);
+
+/**
+ * @brief Record a MEMINFO completion (RUNNER_CMD_DONE_MEMINFO).
+ *        Stashes the snapshot, marks it fresh, clears busy,
+ *        timestamps finished_at_ms.
+ */
+void emul_recordRunnerMeminfoDone(const runner_meminfo_t *snap,
+                                  uint32_t now_ms);
+
+/**
+ * @brief Whether the last RUNNER_CMD_DONE_MEMINFO has arrived since
+ *        the most-recent submit. Used by the synchronous HTTP
+ *        handler to spin until the m68k replies.
+ */
+bool emul_isRunnerMeminfoReady(void);
+
+/**
+ * @brief Read out the last MEMINFO snapshot. Returns true and copies
+ *        the struct into *out if a snapshot is available; false
+ *        otherwise (no snapshot recorded yet, or session was reset).
+ */
+bool emul_getRunnerMeminfo(runner_meminfo_t *out);
+
+/**
  * @brief Wipe session-transient Runner state (busy lock, cwd mirror,
  *        last cd-errno). Called when the m68k Runner reports it has
  *        (re)entered its poll loop via RUNNER_CMD_DONE_HELLO — covers
