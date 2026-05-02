@@ -77,6 +77,15 @@ static void __not_in_flash_func(runner_command_cb)(
       SEND_COMMAND_TO_DISPLAY(0);
       return;
     }
+    case RUNNER_ADV_CMD_DONE_JUMP: {
+      // m68k VBL handler is about to rte to a user-supplied address.
+      // Clear the sentinel so subsequent VBLs see NOP and just chain
+      // — without this, every next ISR would re-read RUNNER_ADV_CMD_JUMP
+      // and re-jump in an infinite loop.
+      DPRINTF("Runner: ADV JUMP done — clearing sentinel\n");
+      SEND_COMMAND_TO_DISPLAY(0);
+      return;
+    }
     case RUNNER_CMD_DONE_HELLO: {
       // d3 payload layout (Epic 04 / S1+S4):
       //   bit 0      : advanced installed

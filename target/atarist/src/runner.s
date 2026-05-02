@@ -119,9 +119,11 @@ SHARED_VARIABLES_ADDR		equ (SHARED_BLOCK_ADDR + $10)	; $FA2810
 SHARED_VAR_GEMDRIVE_RELOC	equ 10
 SHARED_VAR_DRIVE_NUMBER		equ 12
 SHARED_VAR_ADV_HOOK_VECTOR	equ 16
+SHARED_VAR_ADV_JUMP_ADDR	equ 17				; u32 target for RUNNER_ADV_CMD_JUMP
 GEMDRIVE_RELOC_ADDR_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_GEMDRIVE_RELOC*4)
 DRIVE_NUMBER_ADDR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_DRIVE_NUMBER*4)
 ADV_HOOK_VECTOR_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_ADV_HOOK_VECTOR*4)
+ADV_JUMP_ADDR_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_ADV_JUMP_ADDR*4)
 
 ; Epic 04 — Advanced Runner. The runner blob now relocates itself
 ; to RAM at runner_entry so its VBL handler can run from a stable
@@ -140,6 +142,12 @@ _memtop				equ $436
 APP_RUNNER_VBL			equ $0600
 RUNNER_ADV_CMD_RESET		equ ($01 + APP_RUNNER_VBL)	; forced cold reset
 RUNNER_ADV_CMD_MEMINFO		equ ($03 + APP_RUNNER_VBL)	; meminfo from inside the ISR
+RUNNER_ADV_CMD_JUMP		equ ($04 + APP_RUNNER_VBL)	; rte to user-supplied address
+; m68k -> RP report commands for the VBL command range. $0680+ to
+; keep the receiver path unambiguous (RP -> m68k uses $06xx without
+; the $80 bit set).
+APP_RUNNER_VBL_DONE		equ $0680
+RUNNER_ADV_CMD_DONE_JUMP	equ APP_RUNNER_VBL_DONE		; no payload — RP clears sentinel
 RUNNER_VBL_RANGE_MASK		equ $FF00
 
 ; --- Hook-vector selector (Epic 04 / S3) ---
@@ -662,6 +670,8 @@ adv_hook_handler:
 	beq	adv_force_reset
 	cmpi.l	#RUNNER_ADV_CMD_MEMINFO, d0
 	beq	adv_meminfo_isr
+	cmpi.l	#RUNNER_ADV_CMD_JUMP, d0
+	beq	adv_jump_isr
 	; Unknown $06xx command — ignore and chain. (Logging on the
 	; m68k from inside an ISR is a hazard; the RP-side handler
 	; already validated the command code before firing the sentinel.)
@@ -762,6 +772,53 @@ adv_meminfo_isr:
 	lea	24(sp), sp			; pop struct
 	movem.l	(sp)+, d2-d7/a1-a4		; restore extra registers
 	bra	adv_chain_to_old		; chain → previous handler runs + rte
+
+; --- adv_jump_isr (Epic 04 / S7) — patch the ISR's saved PC so the
+; eventual rte resumes at the user-supplied address (read from
+; shared-var slot 17 = ADV_JUMP_ADDR_VAR). Fire-and-forget: no
+; payload back to the RP, just a no-payload RUNNER_ADV_CMD_DONE_JUMP
+; ack so the RP-side chandler can clear the sentinel — without
+; clearing, the next VBL would re-read RUNNER_ADV_CMD_JUMP and
+; re-jump in an infinite loop.
+;
+; Stack layout when this handler runs (autovector $70 entry +
+; ISR prologue at top of adv_hook_handler + our extras-save):
+;   sp +  0..39   extras movem (d2-d7/a1-a4 = 10 regs × 4 = 40 B)
+;   sp + 40..51   ISR prologue (d0-d1/a0 = 3 regs × 4 = 12 B)
+;   sp + 52       hardware-saved SR (word)            (= 40 + 12)
+;   sp + 54..57   hardware-saved PC (long)            ← patch this
+;
+; Hook stays installed (B2 decision); the user's code at the target
+; address may see VBL ticks chaining through us. Since the RP
+; cleared the sentinel before we return, subsequent VBLs see a NOP
+; sentinel and just chain through us to the next handler.
+;
+; Only valid for the VBL ($70) hook — etv_timer's outer rte trap
+; frame sits past TOS' MFP scratch and we'd need a TOS-version-
+; specific walk to reach it. RP-side handle_runner_adv_jump returns
+; 409 wrong_hook in that case; if we somehow get here anyway we
+; chain instead of guessing at the frame layout.
+adv_jump_isr:
+	move.l	adv_active_vec(pc), d1
+	cmpi.l	#$70, d1
+	bne	adv_chain_to_old
+
+	movem.l	d2-d7/a1-a4, -(sp)		; save extras for send_sync (40 B)
+
+	; Patch the trap-frame PC at sp+54. d0 currently holds the
+	; sentinel value (RUNNER_ADV_CMD_JUMP) — overwrite with the
+	; target address read from shared-var slot 17.
+	move.l	ADV_JUMP_ADDR_VAR, d0
+	move.l	d0, 54(sp)
+
+	; Notify RP. Chandler clears the sentinel, then bumps the random
+	; token so this send_sync round-trip returns. After the rte
+	; below, the next VBL will see a NOP sentinel and just chain.
+	send_sync RUNNER_ADV_CMD_DONE_JUMP, 0
+
+	movem.l	(sp)+, d2-d7/a1-a4		; restore extras
+	movem.l	(sp)+, d0-d1/a0			; restore ISR prologue
+	rte					; jump to patched PC
 
 ; old_adv_hook: 4-byte cell holding the address of the prior
 ; vector (saved at install time by runner_post_reloc — could be a

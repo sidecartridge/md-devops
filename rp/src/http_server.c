@@ -14,6 +14,7 @@
 #include "emul.h"
 #include "ff.h"
 #include "gconfig.h"
+#include "memfunc.h"
 #include "lwip/err.h"
 #include "lwip/pbuf.h"
 #include "lwip/tcp.h"
@@ -1119,6 +1120,7 @@ static const char *runner_last_command_str(runner_last_command_t cmd) {
     case RUNNER_LAST_CD: return "CD";
     case RUNNER_LAST_RES: return "RES";
     case RUNNER_LAST_MEMINFO: return "MEMINFO";
+    case RUNNER_LAST_JUMP: return "JUMP";
     default: return NULL;  // RUNNER_LAST_NONE → JSON null
   }
 }
@@ -1653,6 +1655,100 @@ static void __not_in_flash_func(handle_runner_res)(http_conn_t *c) {
 #ifndef RUNNER_MEMINFO_TIMEOUT_US
 #define RUNNER_MEMINFO_TIMEOUT_US 1000000
 #endif
+
+// POST /api/v1/runner/adv/jump — Epic 04 / S7.
+//
+// Body: {"address": "<int>"} where the value is a JSON string in
+// either decimal or 0x-hex form. The CLI normalises any user input
+// (decimal / "$..." / "0x...") into 0x-hex before sending, so the
+// RP only sees `strtoul`-parseable forms.
+//
+// Hard constraints:
+//  - VBL hook only — etv_timer rte trap frame sits past TOS' MFP
+//    scratch and we'd need a TOS-version-fragile walk. 409 wrong_hook.
+//  - Address must be even (m68k 68000 instruction alignment) and
+//    fit in the 24-bit address bus ($0..$FFFFFF).
+//
+// Mechanism: stash the address in shared-var slot 17 (m68k reads
+// it indirectly), fire the sentinel, return 202. The m68k VBL ISR
+// patches its own trap frame's saved PC, sends a no-payload
+// RUNNER_ADV_CMD_DONE_JUMP via send_sync (the chandler clears the
+// sentinel so subsequent VBLs don't re-jump in a loop), then rte's
+// to the patched PC.
+//
+// No busy-lock gate — escaping wedged state is the whole point.
+static void __not_in_flash_func(handle_runner_adv_jump)(http_conn_t *c) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return;
+  }
+  if (emul_getRunnerAdvHookVector() != RUNNER_HOOK_VECTOR_VBL) {
+    write_error(c, 409, "Conflict", "wrong_hook",
+                "adv jump requires the VBL hook ($70). Switch "
+                "ADV_HOOK_VECTOR to \"vbl\" in the setup menu, or "
+                "fall back to a different recovery path.");
+    return;
+  }
+  if (c->content_length == 0) {
+    write_error(c, 411, "Length Required", "length_required",
+                "JSON body required");
+    return;
+  }
+  if (!c->content_type_json) {
+    write_error(c, 415, "Unsupported Media Type", "unsupported_media",
+                "Content-Type must be application/json");
+    return;
+  }
+
+  char addr_str[24] = {0};
+  json_status_t js = json_extract_string(c->body, c->body_received,
+                                         "address", addr_str,
+                                         sizeof(addr_str));
+  if (js == JSON_BAD) {
+    write_error(c, 422, "Unprocessable Entity", "bad_json",
+                "Malformed JSON body");
+    return;
+  }
+  if (js != JSON_OK) {
+    write_error(c, 422, "Unprocessable Entity", "unprocessable",
+                "Missing or non-string `address` field");
+    return;
+  }
+  char *endp = NULL;
+  unsigned long addr = strtoul(addr_str, &endp, 0);
+  if (endp == addr_str || (endp != NULL && *endp != '\0')) {
+    write_error(c, 400, "Bad Request", "bad_request",
+                "Could not parse `address` as integer");
+    return;
+  }
+  if (addr > 0xFFFFFFul) {
+    write_error(c, 400, "Bad Request", "bad_request",
+                "address out of 24-bit range ($0..$FFFFFF)");
+    return;
+  }
+  if ((addr & 1u) != 0) {
+    write_error(c, 400, "Bad Request", "bad_request",
+                "address must be even (68000 instruction alignment)");
+    return;
+  }
+
+  // Stash the address in shared-var slot 17 so the m68k VBL ISR can
+  // read it indirectly when RUNNER_ADV_CMD_JUMP arrives.
+  uint32_t base = (uint32_t)&__rom_in_ram_start__;
+  SET_SHARED_VAR(17 /* RUNNER_SVAR_ADV_JUMP_ADDR */, (uint32_t)addr,
+                 base, CHANDLER_SHARED_VARIABLES_OFFSET);
+
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  emul_recordRunnerCommand(RUNNER_LAST_JUMP, now_ms);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_ADV_CMD_JUMP);
+
+  char body[80];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"accepted\":true}\n");
+  if (n < 0) n = 0;
+  write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
+}
 
 // POST /api/v1/runner/adv/meminfo — Epic 04 / S6.
 //
@@ -3314,6 +3410,14 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
     if (strcmp(action, "adv/meminfo") == 0) {
       if (c->method == HM_POST) {
         handle_runner_adv_meminfo(c);
+        return;
+      }
+      write_405(c, "POST");
+      return;
+    }
+    if (strcmp(action, "adv/jump") == 0) {
+      if (c->method == HM_POST) {
+        handle_runner_adv_jump(c);
         return;
       }
       write_405(c, "POST");

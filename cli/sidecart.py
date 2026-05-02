@@ -449,6 +449,64 @@ def cmd_runner_run(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _parse_adv_jump_address(raw: str) -> int:
+    """Parse a jump-target address from CLI input.
+
+    Accepts: decimal (e.g. "65536"), legacy hex with `$` prefix
+    (e.g. "$FA1C00"), modern hex with `0x` prefix (e.g. "0xFA1C00").
+    Raises ValueError on parse failure or out-of-range / odd values.
+    """
+    s = raw.strip()
+    if not s:
+        raise ValueError("address is empty")
+    if s.startswith("$"):
+        value = int(s[1:], 16)
+    elif s.startswith(("0x", "0X")):
+        value = int(s, 16)
+    else:
+        value = int(s, 10)
+    if value < 0 or value > 0xFFFFFF:
+        raise ValueError(
+            f"address 0x{value:X} out of 24-bit range ($0..$FFFFFF)")
+    if value & 1:
+        raise ValueError(
+            f"address 0x{value:X} is odd; m68k 68000 instructions "
+            f"must be even-aligned")
+    return value
+
+
+def cmd_runner_adv_jump(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/adv/jump — VBL ISR rte to user address."""
+    try:
+        addr = _parse_adv_jump_address(args.address)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_BAD_REQUEST
+
+    body_json = {"address": f"0x{addr:X}"}
+    body = json.dumps(body_json, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    url = base_url(args.host) + "/api/v1/runner/adv/jump"
+    try:
+        status, parsed, raw = request_json(
+            "POST", url, body=body, headers=headers)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 202:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        print(f"ok  ADV JUMP 0x{addr:06X} sent (VBL ISR rte)")
+    return EXIT_OK
+
+
 def cmd_runner_adv_meminfo(args: argparse.Namespace) -> int:
     """POST /api/v1/runner/adv/meminfo — meminfo from inside the VBL ISR."""
     url = base_url(args.host) + "/api/v1/runner/adv/meminfo"
@@ -901,6 +959,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="System memory snapshot — same fields as `runner meminfo` "
              "but read from inside the VBL ISR, so it works against "
              "wedged programs the foreground meminfo can't reach.")
+    jump_p = adv_sub.add_parser(
+        "jump",
+        help="Patch the VBL ISR's saved PC so the rte resumes at the "
+             "given address. Fire-and-forget. Requires the VBL hook "
+             "($70). Address: decimal, $hex, or 0xhex; 24-bit; even.")
+    jump_p.add_argument(
+        "address",
+        help="Target address: decimal, $hex (legacy), or 0xhex.")
     run_p = runner_sub.add_parser(
         "run", help="Run a .TOS / .PRG on the Atari ST.")
     run_p.add_argument("remote", help="Path to the program (relative to GEMDRIVE_FOLDER).")
@@ -941,6 +1007,7 @@ def main(argv: list[str] | None = None) -> int:
             adv_handlers = {
                 "status": cmd_runner_adv_status,
                 "meminfo": cmd_runner_adv_meminfo,
+                "jump": cmd_runner_adv_jump,
             }
             handler = adv_handlers.get(args.adv_cmd)
             if handler is None:

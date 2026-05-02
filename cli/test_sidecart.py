@@ -1078,6 +1078,86 @@ class RunnerAdvMeminfoTests(unittest.TestCase):
         self.assertIn("runner_inactive", err)
 
 
+class RunnerAdvJumpTests(unittest.TestCase):
+    """Epic 04 / S7 — `sidecart runner adv jump`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_adv_jump_decimal(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "jump",
+             "16384"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path,
+                         "/api/v1/runner/adv/jump")
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        # CLI normalises to 0x-hex regardless of input form.
+        self.assertEqual(body["address"], "0x4000")
+        self.assertIn("ADV JUMP 0x004000", out)
+
+    def test_runner_adv_jump_legacy_hex(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "jump",
+             "$FA1C00"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body["address"], "0xFA1C00")
+
+    def test_runner_adv_jump_modern_hex(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "jump",
+             "0xfa1c00"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body["address"], "0xFA1C00")
+
+    def test_runner_adv_jump_rejects_odd(self) -> None:
+        # Should not even reach the server — CLI validates first.
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "jump",
+             "0x12345"])
+        self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
+        self.assertIn("odd", err)
+        self.assertIsNone(self.server.state.last_method)
+
+    def test_runner_adv_jump_rejects_out_of_range(self) -> None:
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "jump",
+             "0x10000000"])
+        self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
+        self.assertIn("24-bit", err)
+        self.assertIsNone(self.server.state.last_method)
+
+    def test_runner_adv_jump_409_wrong_hook(self) -> None:
+        self._set_response(409, {"ok": False, "code": "wrong_hook",
+                                 "message": "VBL hook required"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "jump",
+             "0xFA1C00"])
+        self.assertIn("wrong_hook", err)
+
+    def test_runner_adv_jump_409_runner_inactive(self) -> None:
+        self._set_response(409, {"ok": False, "code": "runner_inactive",
+                                 "message": "Runner not active"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "jump",
+             "0xFA1C00"])
+        self.assertIn("runner_inactive", err)
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:
