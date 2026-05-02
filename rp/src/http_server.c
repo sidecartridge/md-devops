@@ -1646,6 +1646,75 @@ static void __not_in_flash_func(handle_runner_res)(http_conn_t *c) {
   write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
 }
 
+// 1 s deadline for any meminfo round-trip — used by both the
+// foreground and the VBL paths. The m68k typically responds in
+// well under one frame; the timeout is just a safety net for a
+// genuinely-wedged ST.
+#ifndef RUNNER_MEMINFO_TIMEOUT_US
+#define RUNNER_MEMINFO_TIMEOUT_US 1000000
+#endif
+
+// POST /api/v1/runner/adv/meminfo — Epic 04 / S6.
+//
+// Same wire-format / chandler path as the foreground meminfo (the
+// m68k ships RUNNER_CMD_DONE_MEMINFO with the 24-byte struct, the
+// existing runner_command_cb records it via emul_recordRunnerMeminfoDone),
+// but the read happens inside the m68k VBL ISR rather than the
+// foreground poll loop — so it works against wedged programs the
+// foreground meminfo can't reach. Synchronous: spin on chandler_loop
+// until the snapshot lands, with a 1 s timeout.
+//
+// Intentionally skips the busy-lock gate — the busy state is what
+// we want to escape (a wedged Pexec'd program holds it set forever).
+static void __not_in_flash_func(handle_runner_adv_meminfo)(http_conn_t *c) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return;
+  }
+
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  emul_recordRunnerMeminfoSubmit(now_ms);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_ADV_CMD_MEMINFO);
+
+  absolute_time_t deadline =
+      delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
+  while (!emul_isRunnerMeminfoReady()) {
+    chandler_loop();
+    if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+      uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+      runner_meminfo_t empty = {0};
+      emul_recordRunnerMeminfoDone(&empty, fail_ms);
+      write_error(c, 504, "Gateway Timeout", "gateway_timeout",
+                  "Runner did not respond within 1 s");
+      return;
+    }
+  }
+
+  runner_meminfo_t snap;
+  if (!emul_getRunnerMeminfo(&snap)) {
+    write_error(c, 500, "Internal Server Error", "no_snapshot",
+                "Runner returned but no snapshot recorded");
+    return;
+  }
+
+  bool decoded = (snap.bank0_kb != 0) || (snap.bank1_kb != 0);
+  char body[400];
+  int n = snprintf(
+      body, sizeof(body),
+      "{\"ok\":true,"
+      "\"membottom\":%lu,\"memtop\":%lu,\"phystop\":%lu,"
+      "\"screenmem\":%lu,\"basepage\":%lu,"
+      "\"bank0_kb\":%u,\"bank1_kb\":%u,\"decoded\":%s}\n",
+      (unsigned long)snap.membot, (unsigned long)snap.memtop,
+      (unsigned long)snap.phystop, (unsigned long)snap.screenmem,
+      (unsigned long)snap.basepage,
+      (unsigned)snap.bank0_kb, (unsigned)snap.bank1_kb,
+      decoded ? "true" : "false");
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
 // GET /api/v1/runner/adv — Epic 04 / S1+S4.
 //
 // Reports whether the m68k Runner has installed its Advanced Runner
@@ -3240,6 +3309,14 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
         return;
       }
       write_405(c, "GET");
+      return;
+    }
+    if (strcmp(action, "adv/meminfo") == 0) {
+      if (c->method == HM_POST) {
+        handle_runner_adv_meminfo(c);
+        return;
+      }
+      write_405(c, "POST");
       return;
     }
     write_error(c, 404, "Not Found", "not_found", "Route not found");

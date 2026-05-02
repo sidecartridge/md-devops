@@ -63,7 +63,9 @@
 // cmp.l cascade only matches $05xx codes, so $06xx values fall
 // through to the VBL handler.
 #define APP_RUNNER_VBL 0x0600
-#define RUNNER_ADV_CMD_RESET (APP_RUNNER_VBL + 0x01)  // forced cold reset
+#define RUNNER_ADV_CMD_RESET (APP_RUNNER_VBL + 0x01)    // forced cold reset
+// 0x02 reserved.
+#define RUNNER_ADV_CMD_MEMINFO (APP_RUNNER_VBL + 0x03)  // meminfo from inside the ISR
 
 // Shared-variable slot 16 — Advanced Runner hook vector address.
 // RP publishes the resolved address ($70 for VBL, $400 for

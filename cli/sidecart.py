@@ -449,6 +449,46 @@ def cmd_runner_run(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_runner_adv_meminfo(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/adv/meminfo — meminfo from inside the VBL ISR."""
+    url = base_url(args.host) + "/api/v1/runner/adv/meminfo"
+    try:
+        status, parsed, raw = request_json("POST", url, body=b"")
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200 or parsed is None or parsed.get("ok") is not True:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        json.dump(parsed, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return EXIT_OK
+    if args.quiet:
+        return EXIT_OK
+
+    print(f"membottom [$432]  : 0x{parsed.get('membottom', 0):08X}")
+    print(f"memtop    [$436]  : 0x{parsed.get('memtop', 0):08X}")
+    print(f"phystop   [$42E]  : 0x{parsed.get('phystop', 0):08X}")
+    print(f"screenmem [$44E]  : 0x{parsed.get('screenmem', 0):08X}")
+    bp = parsed.get('basepage', 0)
+    if bp:
+        print(f"basepage  [$4F2]  : 0x{bp:08X}")
+    else:
+        print(f"basepage  [$4F2]  : 0 (TOS < 1.04 or unset)")
+    b0 = parsed.get('bank0_kb', 0)
+    b1 = parsed.get('bank1_kb', 0)
+    if parsed.get('decoded'):
+        print(f"bank 0    [$FF8001 nibble] : {b0} KB")
+        print(f"bank 1    [$FF8001 nibble] : {b1} KB")
+        print(f"total RAM         : {b0 + b1} KB")
+    else:
+        print(f"banks     [$FF8001 nibble] : (unrecognised MMU config)")
+    return EXIT_OK
+
+
 def cmd_runner_adv_status(args: argparse.Namespace) -> int:
     """GET /api/v1/runner/adv — Advanced Runner VBL hook state."""
     url = base_url(args.host) + "/api/v1/runner/adv"
@@ -856,6 +896,11 @@ def build_parser() -> argparse.ArgumentParser:
         "status",
         help="Show whether the Advanced Runner VBL hook is installed "
              "and which vector ($70 or $400) it landed on.")
+    adv_sub.add_parser(
+        "meminfo",
+        help="System memory snapshot — same fields as `runner meminfo` "
+             "but read from inside the VBL ISR, so it works against "
+             "wedged programs the foreground meminfo can't reach.")
     run_p = runner_sub.add_parser(
         "run", help="Run a .TOS / .PRG on the Atari ST.")
     run_p.add_argument("remote", help="Path to the program (relative to GEMDRIVE_FOLDER).")
@@ -895,6 +940,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.runner_cmd == "adv":
             adv_handlers = {
                 "status": cmd_runner_adv_status,
+                "meminfo": cmd_runner_adv_meminfo,
             }
             handler = adv_handlers.get(args.adv_cmd)
             if handler is None:

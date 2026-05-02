@@ -139,6 +139,7 @@ _memtop				equ $436
 ; codes pass through to the Advanced handler.
 APP_RUNNER_VBL			equ $0600
 RUNNER_ADV_CMD_RESET		equ ($01 + APP_RUNNER_VBL)	; forced cold reset
+RUNNER_ADV_CMD_MEMINFO		equ ($03 + APP_RUNNER_VBL)	; meminfo from inside the ISR
 RUNNER_VBL_RANGE_MASK		equ $FF00
 
 ; --- Hook-vector selector (Epic 04 / S3) ---
@@ -655,14 +656,16 @@ adv_hook_handler:
 	move.l	d0, d1
 	andi.l	#$FFFFFF00, d1
 	cmpi.l	#APP_RUNNER_VBL, d1
-	bne	.adv_chain
+	bne	adv_chain_to_old
 	; In our range. Compare against each known command code.
 	cmpi.l	#RUNNER_ADV_CMD_RESET, d0
 	beq	adv_force_reset
+	cmpi.l	#RUNNER_ADV_CMD_MEMINFO, d0
+	beq	adv_meminfo_isr
 	; Unknown $06xx command — ignore and chain. (Logging on the
 	; m68k from inside an ISR is a hazard; the RP-side handler
 	; already validated the command code before firing the sentinel.)
-.adv_chain:
+adv_chain_to_old:
 	movem.l	(sp)+, d0-d1/a0
 	move.l	old_adv_hook(pc), -(sp)
 	rts					; chain → previous handler
@@ -682,6 +685,83 @@ adv_force_reset:
 	move.l	$4.w, a0		; reset vector
 	jmp	(a0)
 	; unreachable
+
+; --- Advanced meminfo (Epic 04 / S6). Same RP-visible payload as
+; the foreground RUNNER_CMD_MEMINFO (24-byte struct shipped via
+; RUNNER_CMD_DONE_MEMINFO), but the read happens from inside the
+; VBL ISR so it works even when the foreground poll loop is wedged.
+;
+; We're already in supervisor mode (autovector $70 entry preserves
+; the SR with S=1) so $432/$436/$42E/$44E/$4F2/$FFFF8001 are all
+; readable directly — no Super() toggle needed. No Cconws trace
+; either: GEMDOS calls from inside an ISR are a hazard.
+;
+; Register discipline: the ISR prologue saved d0/d1/a0. We need
+; more scratch (d2-d7, a1-a4) for the decode + send_write_sync.
+; Save them on top before clobbering, restore before chaining.
+;
+; Bank decoding identical to runner_meminfo's cascade — the buffer
+; is pre-zeroed via the `clr.l 20(a4)` so unrecognised nibbles
+; naturally produce 0/0 on the wire.
+adv_meminfo_isr:
+	movem.l	d2-d7/a1-a4, -(sp)		; save extra registers
+
+	; Allocate 24-byte struct on stack.
+	lea	-24(sp), sp
+	move.l	sp, a4
+
+	; --- Read system-variable cookies (supervisor area). ---
+	move.l	$432.w, 0(a4)			; _membot
+	move.l	$436.w, 4(a4)			; _memtop
+	move.l	$42E.w, 8(a4)			; _phystop
+	move.l	$44E.w, 12(a4)			; _v_bas_ad
+	move.l	$4F2.w, 16(a4)			; _run (basepage; 0 on TOS < 1.04)
+	clr.l	20(a4)				; pre-zero bank0/bank1 slots
+
+	; --- Read MMU config byte at $FFFF8001 and decode bank sizes. ---
+	moveq.l	#0, d3
+	move.b	$FFFF8001, d3
+	and.w	#$0F, d3
+	moveq.l	#0, d4
+	moveq.l	#0, d2
+	cmp.b	#%0000, d3
+	bne.s	.advmi_n0100
+	move.w	#128, d4
+	move.w	#128, d2
+	bra.s	.advmi_decoded
+.advmi_n0100:
+	cmp.b	#%0100, d3
+	bne.s	.advmi_n0101
+	move.w	#512, d4
+	move.w	#128, d2
+	bra.s	.advmi_decoded
+.advmi_n0101:
+	cmp.b	#%0101, d3
+	bne.s	.advmi_n1000
+	move.w	#512, d4
+	move.w	#512, d2
+	bra.s	.advmi_decoded
+.advmi_n1000:
+	cmp.b	#%1000, d3
+	bne.s	.advmi_n1010
+	move.w	#2048, d4
+	move.w	#128, d2
+	bra.s	.advmi_decoded
+.advmi_n1010:
+	cmp.b	#%1010, d3
+	bne.s	.advmi_decoded
+	move.w	#2048, d4
+	move.w	#2048, d2
+.advmi_decoded:
+	move.w	d4, 20(a4)			; bank0_kb
+	move.w	d2, 22(a4)			; bank1_kb
+
+	; Ship the struct to the RP. send_write_sync expects a4 = buffer.
+	send_write_sync RUNNER_CMD_DONE_MEMINFO, 24
+
+	lea	24(sp), sp			; pop struct
+	movem.l	(sp)+, d2-d7/a1-a4		; restore extra registers
+	bra	adv_chain_to_old		; chain → previous handler runs + rte
 
 ; old_adv_hook: 4-byte cell holding the address of the prior
 ; vector (saved at install time by runner_post_reloc — could be a
