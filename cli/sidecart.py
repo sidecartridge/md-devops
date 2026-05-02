@@ -455,6 +455,11 @@ def _parse_adv_jump_address(raw: str) -> int:
     Accepts: decimal (e.g. "65536"), legacy hex with `$` prefix
     (e.g. "$FA1C00"), modern hex with `0x` prefix (e.g. "0xFA1C00").
     Raises ValueError on parse failure or out-of-range / odd values.
+
+    Shell gotcha: bash/zsh expand `$78000` as a variable reference
+    (unset variable → empty string → dropped from argv entirely),
+    so `$hex` arguments MUST be single-quoted on the command line:
+    `'$78000'`. Use the `0x78000` form to avoid quoting altogether.
     """
     s = raw.strip()
     if not s:
@@ -1035,27 +1040,34 @@ def build_parser() -> argparse.ArgumentParser:
         "jump",
         help="Patch the VBL ISR's saved PC so the rte resumes at the "
              "given address. Fire-and-forget. Requires the VBL hook "
-             "($70). Address: decimal, $hex, or 0xhex; 24-bit; even.")
+             "(\\$70). Address: decimal, $hex, or 0xhex; 24-bit; even. "
+             "Shell gotcha: single-quote `$hex` ('$FA1C00') or your "
+             "shell will expand it as a variable; or use 0xhex.")
     jump_p.add_argument(
         "address",
-        help="Target address: decimal, $hex (legacy), or 0xhex.")
+        help="Target address: decimal, $hex (legacy — single-quote "
+             "in the shell: '$FA1C00'), or 0xhex (no quoting needed).")
     load_p = adv_sub.add_parser(
         "load",
         help="Stream a workstation file into m68k RAM through the VBL "
              "ISR. Synchronous — chunked through APP_FREE 8 KB at a "
              "time. Requires the VBL hook ($70). Target must be even, "
-             "fit inside RAM (above 0x800, below phystop).")
+             "fit inside RAM (above 0x800, below phystop). Shell "
+             "gotcha: single-quote `$hex` ('$78000') or your shell "
+             "will expand it as a variable; or use 0xhex.")
     load_p.add_argument(
         "local",
         help="Workstation file to upload (raw bytes, no envelope).")
     load_p.add_argument(
         "address",
-        help="Target start address: decimal, $hex (legacy), or 0xhex. "
-             "Even; 24-bit; >= 0x800.")
+        help="Target start address: decimal, $hex (legacy — single-"
+             "quote in the shell: '$78000'), or 0xhex. Even; 24-bit; "
+             ">= 0x800.")
     load_p.add_argument(
         "size", nargs="?", default=None,
-        help="Optional cap on bytes to upload (decimal, $hex, or 0xhex). "
-             "If smaller than the file, the trailing bytes are dropped "
+        help="Optional cap on bytes to upload (decimal, $hex, or "
+             "0xhex; same shell-quoting rule as `address`). If smaller "
+             "than the file, the trailing bytes are dropped "
              "(cap-and-truncate).")
     run_p = runner_sub.add_parser(
         "run", help="Run a .TOS / .PRG on the Atari ST.")
