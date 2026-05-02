@@ -100,13 +100,22 @@ Clients can switch on `code` reliably. All defined symbols:
 `is_directory`, `is_file`, `conflict`, `length_required`,
 `payload_too_large`, `range_invalid`, `bad_json`, `unprocessable`,
 `unsupported_media`, `method_not_allowed`, `busy`, `disk_error`,
-`internal_error`, `runner_inactive`, `gateway_timeout`, `no_snapshot`.
+`internal_error`, `runner_inactive`, `gateway_timeout`, `no_snapshot`,
+`wrong_hook`, `ram_overflow`.
 
-The last three are Runner-specific (see *Runner mode* below):
-`runner_inactive` means the user didn't pick `[U]` at boot,
-`gateway_timeout` means the Atari ST didn't reply within 1 s, and
-`no_snapshot` means the m68k handshake completed but no snapshot
-was recorded (should not happen in practice).
+Runner-specific codes (see *Runner mode* below):
+- `runner_inactive` — the user didn't pick `[U]` at boot.
+- `busy` — another foreground Runner command is in flight (only
+  `run`/`cd`/`res`/`meminfo` gate on this; `reset` and the Advanced
+  surface intentionally don't, because escaping wedged state is the
+  whole point).
+- `gateway_timeout` — the Atari ST didn't reply within 1 s.
+- `no_snapshot` — the m68k handshake completed but no snapshot was
+  recorded (should not happen in practice).
+- `wrong_hook` — Advanced Runner command requires the VBL hook (`$70`)
+  but `ADV_HOOK_VECTOR` is set to `etv_timer` (`$400`).
+- `ram_overflow` — `runner adv load`: the requested target range
+  `[address, address+size)` doesn't fit inside `[membottom, phystop)`.
 
 ---
 
@@ -405,13 +414,31 @@ loop reading commands from the cartridge sentinel, while GEMDRIVE
 keeps servicing TOS file I/O so programs you launch can use the
 emulated drive normally.
 
-All Runner endpoints live under `/api/v1/runner/`. Most are fire-
-and-forget (`202 Accepted` — the m68k reports completion later via
-the cartridge protocol, surfaced via `runner status`). `meminfo` is
-synchronous and returns the live snapshot. Every Runner endpoint
-also returns `409 runner_inactive` when the user did not pick `[U]`
-at boot, and `409 busy` (with `Retry-After: 1`) when another Runner
-command is already in flight.
+All Runner endpoints live under `/api/v1/runner/`. The foreground
+mutators (`run`, `cd`, `res`) are fire-and-forget (`202 Accepted`)
+and the m68k reports completion later via the cartridge protocol,
+surfaced via `runner status`. `meminfo` is synchronous. Every
+Runner endpoint returns `409 runner_inactive` when the user did
+not pick `[U]` at boot. The four foreground gating endpoints
+(`run`, `cd`, `res`, `meminfo`) also return `503 busy` (with
+`Retry-After: 1`) when another Runner command is already in flight;
+`reset` and the entire Advanced surface (see below) intentionally
+skip the busy gate because escaping wedged state is their job.
+
+In addition to the foreground surface, Epic 04 adds an **Advanced
+Runner** layer at `/api/v1/runner/adv/...` whose handlers run from
+inside the m68k's VBL ISR (or `etv_timer`, depending on the setup
+menu's `ADV_HOOK_VECTOR` choice). VBL-driven commands keep working
+when the foreground poll loop is blocked — wedged programs, bombs
+already painted, traps disabled. See the *Advanced Runner* section
+below the foreground endpoints.
+
+> **Shell-quoting note** — several Advanced commands accept a
+> `$hex` legacy form (e.g. `$78000`, equivalent to `0x78000`). Bash
+> and zsh expand `$78000` as a variable reference (unset → empty →
+> silently dropped from argv); always single-quote the `$hex` form
+> on the command line (`'$78000'`) or use `0xhex`, which needs no
+> quoting.
 
 ---
 
@@ -444,8 +471,10 @@ curl http://sidecart.local/api/v1/runner
 ```
 
 `last_command` is one of `null`, `RESET`, `EXECUTE`, `CD`, `RES`,
-or `MEMINFO`. The `last_cd_errno` / `last_res_errno` fields are
-`null` unless the most-recent command was a CD or RES respectively.
+`MEMINFO`, `JUMP`, or `LOAD`. The `last_cd_errno` / `last_res_errno`
+fields are `null` unless the most-recent command was a CD or RES
+respectively. `JUMP` / `LOAD` reflect the Advanced commands of the
+same name (see *Advanced Runner* below).
 
 **`sidecart`**:
 ```sh
@@ -507,7 +536,7 @@ python3 cli/sidecart.py runner run PROG.TOS -- -v --file foo    # cmdline = "-v 
 
 Common error codes: `404 not_found` (program file doesn't exist),
 `400 bad_path` (rejected name), `400 bad_request` (cmdline too
-long), `409 runner_inactive`, `409 busy`.
+long), `409 runner_inactive`, `503 busy`.
 
 ---
 
@@ -534,7 +563,7 @@ python3 cli/sidecart.py runner cd ARKANOID         # relative to current cwd
 ```
 
 Common error codes: `404 not_found`, `400 bad_path` (rejected name
-or "not a directory"), `409 runner_inactive`, `409 busy`.
+or "not a directory"), `409 runner_inactive`, `503 busy`.
 
 ---
 
@@ -562,7 +591,7 @@ python3 cli/sidecart.py runner res med
 ```
 
 Common error codes: `400 bad_request` (unknown rez), `409
-runner_inactive`, `409 busy`.
+runner_inactive`, `503 busy`.
 
 ---
 
@@ -620,8 +649,168 @@ curl http://sidecart.local/api/v1/runner/meminfo
 python3 cli/sidecart.py runner meminfo
 ```
 
-Common error codes: `409 runner_inactive`, `409 busy`,
+Common error codes: `409 runner_inactive`, `503 busy`,
 `504 gateway_timeout`.
+
+---
+
+## Advanced Runner
+
+VBL-ISR-driven command surface (Epic 04). Handlers run from inside
+the m68k's level-4 autovector at `$70` (or `$400` if you flipped
+`ADV_HOOK_VECTOR` to `etv_timer` in the setup menu), so they keep
+firing even when the foreground poll loop is wedged. Two of the
+three POSTs (`adv jump`, `adv load`) require the VBL hook
+specifically — they patch the trap frame's saved PC to `rte` to a
+new address, and the trap-frame layout for `etv_timer` is past
+TOS' MFP scratch and TOS-version-fragile to walk. They return
+`409 wrong_hook` when the hook is wrong; `adv meminfo` works on
+either vector.
+
+None of the Advanced endpoints gate on the busy lock — the whole
+point is to escape state the foreground can't reach.
+
+Status query:
+
+### `GET /api/v1/runner/adv` — Advanced Runner state
+
+Reports whether the m68k Runner has installed its VBL hook and
+which vector it landed on.
+
+**`curl`**:
+```sh
+curl http://sidecart.local/api/v1/runner/adv
+```
+
+**Response (200 OK)**:
+```json
+{ "ok": true, "active": true, "installed": true, "hook_vector": "vbl" }
+```
+
+`hook_vector` is one of `"vbl"`, `"etv_timer"`, or `"unknown"`
+(the m68k didn't report — old firmware or no HELLO yet).
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py runner adv status
+```
+
+---
+
+### `POST /api/v1/runner/adv/meminfo` — meminfo from inside the VBL ISR
+
+Same wire format as `GET /api/v1/runner/meminfo` — the m68k ships
+the 24-byte snapshot back, the RP records it, the response is the
+identical JSON shape. The difference is *where* on the m68k the
+snapshot is read: this endpoint dispatches the read from inside
+the VBL ISR (or `etv_timer`), so it works against wedged programs
+the foreground meminfo can't reach. Synchronous, 1 s timeout.
+
+**`curl`**:
+```sh
+curl -X POST http://sidecart.local/api/v1/runner/adv/meminfo
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py runner adv meminfo
+```
+
+Common error codes: `409 runner_inactive`, `504 gateway_timeout`,
+`500 no_snapshot`.
+
+---
+
+### `POST /api/v1/runner/adv/jump` — `rte` to a user address
+
+Body: `{"address":"<int>"}`. Address is a JSON string in decimal
+or `0x`-hex form (the CLI normalises any input — decimal, `$hex`,
+`0xhex` — to `0x`-hex before posting). Validation: 24-bit
+(`$0..$FFFFFF`) and even (m68k 68000 instruction alignment).
+
+The handler stashes the address in shared-var slot 17 and fires
+`RUNNER_ADV_CMD_JUMP`. The next VBL the m68k's adv handler reads
+the slot, patches its own trap-frame's saved PC, and `rte`s. The
+hook stays installed; the sentinel is cleared by the chunk-done
+chandler so subsequent VBLs just chain.
+
+Fire-and-forget (`202 Accepted`) — there is no completion event
+the m68k sends back beyond the no-payload `RUNNER_ADV_CMD_DONE_JUMP`
+that triggers the sentinel clear.
+
+**VBL hook only.** Returns `409 wrong_hook` when
+`ADV_HOOK_VECTOR = etv_timer`.
+
+**`curl`**:
+```sh
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"address":"0xFA1C00"}' \
+     http://sidecart.local/api/v1/runner/adv/jump
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py runner adv jump 0xFA1C00
+python3 cli/sidecart.py runner adv jump '$FA1C00'   # legacy hex — must single-quote
+python3 cli/sidecart.py runner adv jump 16384       # decimal
+```
+
+Common error codes: `400 bad_request` (odd, out-of-24-bit, or
+unparseable address), `409 runner_inactive`, `409 wrong_hook`.
+
+---
+
+### `POST /api/v1/runner/adv/load` — stream a workstation file into m68k RAM
+
+Query: `?address=<int>[&size=<int>]`. Body: raw bytes
+(`Content-Type` ignored). The handler drains the body into APP_FREE
+in 8 KB chunks (byte-pair-swapped so the m68k's word reads land
+native), and after each fill it dispatches a chunk via
+`RUNNER_ADV_CMD_LOAD_CHUNK`; the m68k VBL handler copies the chunk
+to its target and acks. The HTTP request returns `200 OK`
+synchronously when the last chunk lands.
+
+Validation:
+- Address must be even and ≤ 24 bits.
+- The full range `[address, address+size)` must fit in
+  `[membottom, phystop)` per the most recent meminfo snapshot.
+  The handler triggers `RUNNER_ADV_CMD_MEMINFO` itself if no
+  snapshot is cached. → `400 ram_overflow` if it doesn't fit.
+- Body Content-Length ≤ 4 MB. → `413 payload_too_large`.
+- `size`, when present, caps the upload (`min(file_size, size)`).
+  Trailing bytes past the cap are silently dropped (cap-and-truncate).
+
+**VBL hook only.** Returns `409 wrong_hook` when
+`ADV_HOOK_VECTOR = etv_timer`.
+
+**Mid-transfer failure leaves partial bytes in m68k RAM.** A
+`504 gateway_timeout` mid-stream means some chunks already landed;
+caller's responsibility to retry or repair.
+
+**`curl`**:
+```sh
+curl -X POST --data-binary @./game.prg \
+     'http://sidecart.local/api/v1/runner/adv/load?address=0x40000'
+# With a size cap:
+curl -X POST --data-binary @./game.prg \
+     'http://sidecart.local/api/v1/runner/adv/load?address=0x40000&size=4096'
+```
+
+**Response (200 OK)**:
+```json
+{ "ok": true, "loaded": true, "address": 262144, "bytes": 12345 }
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py runner adv load ./game.prg 0x40000
+python3 cli/sidecart.py runner adv load ./game.prg 0x40000 4096   # cap to 4 KB
+python3 cli/sidecart.py runner adv load ./game.prg '$40000'        # legacy hex — must single-quote
+```
+
+Common error codes: `400 bad_request` (odd / out-of-range address,
+bad size), `400 ram_overflow`, `409 runner_inactive`,
+`409 wrong_hook`, `413 payload_too_large`, `504 gateway_timeout`.
 
 ---
 

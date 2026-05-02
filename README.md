@@ -46,6 +46,19 @@ python3 cli/sidecart.py runner res low
 python3 cli/sidecart.py runner meminfo
 ```
 
+### Advanced Runner
+
+A second command surface (Epic 04) runs from inside the m68k's VBL ISR (`$70`, or `$400` if you switched `ADV_HOOK_VECTOR` to `etv_timer`), so it keeps working when a launched program has wedged the foreground poll loop — infinite loops, bombs already painted, traps disabled. Two of the three POSTs (`adv jump`, `adv load`) require the VBL hook specifically; `adv meminfo` works on either vector. None gate on the busy lock.
+
+```sh
+python3 cli/sidecart.py runner adv status                              # is the hook installed? which vector?
+python3 cli/sidecart.py runner adv meminfo                             # snapshot from inside the ISR
+python3 cli/sidecart.py runner adv jump 0xFA1C00                       # rte to a user address
+python3 cli/sidecart.py runner adv load ./kernel.bin 0x40000           # stream a file into RAM
+```
+
+`runner adv jump` and `runner adv load` accept addresses in decimal, `0xhex`, or `$hex` — quote `$hex` in your shell (`'$FA1C00'`) or the shell will eat it as a variable reference. Prefer `0xhex` in scripts.
+
 ## Remote HTTP Management API
 
 Once the device joins Wi-Fi it advertises an HTTP/1.1 REST API on
