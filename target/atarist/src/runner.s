@@ -120,10 +120,22 @@ SHARED_VAR_GEMDRIVE_RELOC	equ 10
 SHARED_VAR_DRIVE_NUMBER		equ 12
 SHARED_VAR_ADV_HOOK_VECTOR	equ 16
 SHARED_VAR_ADV_JUMP_ADDR	equ 17				; u32 target for RUNNER_ADV_CMD_JUMP
+SHARED_VAR_ADV_LOAD_TARGET	equ 18				; u32 chunk target for RUNNER_ADV_CMD_LOAD_CHUNK
+SHARED_VAR_ADV_LOAD_LEN		equ 19				; u32 byte count for the current chunk
 GEMDRIVE_RELOC_ADDR_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_GEMDRIVE_RELOC*4)
 DRIVE_NUMBER_ADDR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_DRIVE_NUMBER*4)
 ADV_HOOK_VECTOR_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_ADV_HOOK_VECTOR*4)
 ADV_JUMP_ADDR_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_ADV_JUMP_ADDR*4)
+ADV_LOAD_TARGET_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_ADV_LOAD_TARGET*4)
+ADV_LOAD_LEN_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_ADV_LOAD_LEN*4)
+
+; Epic 04 / S8 — Advanced load chunk staging buffer inside APP_FREE.
+; Carved out at offset $4000 (8 KB), well past the GEMDRIVE / runner
+; sub-regions and well below the framebuffer ceiling. RP writes each
+; chunk byte-pair-swapped here so the m68k's word/long reads return
+; the file's bytes in their natural order.
+RUNNER_ADV_LOAD_BUF_OFFSET	equ $4000
+RUNNER_ADV_LOAD_BUF		equ (APP_FREE_ADDR + RUNNER_ADV_LOAD_BUF_OFFSET)
 
 ; Epic 04 — Advanced Runner. The runner blob now relocates itself
 ; to RAM at runner_entry so its VBL handler can run from a stable
@@ -143,11 +155,13 @@ APP_RUNNER_VBL			equ $0600
 RUNNER_ADV_CMD_RESET		equ ($01 + APP_RUNNER_VBL)	; forced cold reset
 RUNNER_ADV_CMD_MEMINFO		equ ($03 + APP_RUNNER_VBL)	; meminfo from inside the ISR
 RUNNER_ADV_CMD_JUMP		equ ($04 + APP_RUNNER_VBL)	; rte to user-supplied address
+RUNNER_ADV_CMD_LOAD_CHUNK	equ ($05 + APP_RUNNER_VBL)	; copy 8 KB chunk from APP_FREE -> RAM
 ; m68k -> RP report commands for the VBL command range. $0680+ to
 ; keep the receiver path unambiguous (RP -> m68k uses $06xx without
 ; the $80 bit set).
 APP_RUNNER_VBL_DONE		equ $0680
-RUNNER_ADV_CMD_DONE_JUMP	equ APP_RUNNER_VBL_DONE		; no payload — RP clears sentinel
+RUNNER_ADV_CMD_DONE_JUMP	equ ($00 + APP_RUNNER_VBL_DONE)	; no payload — RP clears sentinel
+RUNNER_ADV_CMD_DONE_LOAD_CHUNK	equ ($01 + APP_RUNNER_VBL_DONE)	; no payload — RP clears + advances
 RUNNER_VBL_RANGE_MASK		equ $FF00
 
 ; --- Hook-vector selector (Epic 04 / S3) ---
@@ -672,6 +686,8 @@ adv_hook_handler:
 	beq	adv_meminfo_isr
 	cmpi.l	#RUNNER_ADV_CMD_JUMP, d0
 	beq	adv_jump_isr
+	cmpi.l	#RUNNER_ADV_CMD_LOAD_CHUNK, d0
+	beq	adv_load_chunk_isr
 	; Unknown $06xx command — ignore and chain. (Logging on the
 	; m68k from inside an ISR is a hazard; the RP-side handler
 	; already validated the command code before firing the sentinel.)
@@ -819,6 +835,51 @@ adv_jump_isr:
 	movem.l	(sp)+, d2-d7/a1-a4		; restore extras
 	movem.l	(sp)+, d0-d1/a0			; restore ISR prologue
 	rte					; jump to patched PC
+
+; --- adv_load_chunk_isr (Epic 04 / S8) — copy a single chunk from
+; the APP_FREE staging buffer (at RUNNER_ADV_LOAD_BUF, byte-pair-
+; swapped by the RP writer) into the m68k RAM target read from
+; shared-var slot 18 (current chunk start). Length in slot 19.
+;
+; The pre-swap on the RP side means a m68k word/long read from
+; APP_FREE returns the file's natural-endian word/long, so the
+; bulk copy uses move.w (and a single move.b for any odd tail).
+;
+; Fire-and-forget per chunk: send_sync DONE_LOAD_CHUNK acks the RP
+; (which advances the per-chunk target and prepares the next
+; chunk). Sentinel cleared by the chandler.
+;
+; Trusts the RP-side validation (target even, length even except
+; possibly the tail byte, range fits in [membottom,phystop)). No
+; bounds checks here.
+adv_load_chunk_isr:
+	movem.l	d2-d7/a1-a4, -(sp)		; save extras
+
+	; Pull target + length out of the shared variables.
+	move.l	ADV_LOAD_TARGET_VAR, a1		; destination
+	move.l	ADV_LOAD_LEN_VAR, d2		; bytes in this chunk
+	lea	RUNNER_ADV_LOAD_BUF.l, a0	; source
+
+	; Word-loop: num_words = len / 2.
+	move.l	d2, d3
+	lsr.l	#1, d3
+	beq.s	.lc_word_done			; len < 2 — only a tail byte at most
+	subq.l	#1, d3				; dbf wants count - 1
+.lc_word_loop:
+	move.w	(a0)+, (a1)+
+	dbf	d3, .lc_word_loop
+.lc_word_done:
+
+	; Tail byte if len is odd.
+	btst	#0, d2
+	beq.s	.lc_done
+	move.b	(a0)+, (a1)+
+.lc_done:
+
+	send_sync RUNNER_ADV_CMD_DONE_LOAD_CHUNK, 0
+
+	movem.l	(sp)+, d2-d7/a1-a4		; restore extras
+	bra	adv_chain_to_old		; chain — VBL keeps firing
 
 ; old_adv_hook: 4-byte cell holding the address of the prior
 ; vector (saved at install time by runner_post_reloc — could be a

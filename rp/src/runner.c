@@ -86,6 +86,15 @@ static void __not_in_flash_func(runner_command_cb)(
       SEND_COMMAND_TO_DISPLAY(0);
       return;
     }
+    case RUNNER_ADV_CMD_DONE_LOAD_CHUNK: {
+      // The m68k VBL handler finished copying the current chunk
+      // out of APP_FREE into RAM. Clear the sentinel and flip the
+      // chunk-ack flag the streaming HTTP handler is spinning on.
+      DPRINTF("Runner: ADV LOAD CHUNK done\n");
+      SEND_COMMAND_TO_DISPLAY(0);
+      emul_recordRunnerAdvLoadAck();
+      return;
+    }
     case RUNNER_CMD_DONE_HELLO: {
       // d3 payload layout (Epic 04 / S1+S4):
       //   bit 0      : advanced installed

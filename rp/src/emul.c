@@ -136,6 +136,10 @@ static bool runnerAdvancedInstalled = false;
 // S4 — active hook vector ID reported by the m68k in the HELLO
 // payload. Default UNKNOWN until HELLO arrives.
 static uint8_t runnerAdvHookVector = RUNNER_HOOK_VECTOR_UNKNOWN;
+// S8 — Advanced load chunk-ack flag. Set by the chandler when a
+// RUNNER_ADV_CMD_DONE_LOAD_CHUNK arrives, cleared by the streamer
+// before firing each chunk.
+static bool runnerAdvLoadAcked = false;
 
 bool emul_isRunnerActive(void) { return runnerActive; }
 bool emul_isRunnerBusy(void) { return runnerBusy; }
@@ -330,6 +334,10 @@ uint8_t emul_getRunnerAdvHookVector(void) { return runnerAdvHookVector; }
 void emul_recordRunnerAdvHookVector(uint8_t vector_id) {
   runnerAdvHookVector = vector_id;
 }
+
+bool emul_isRunnerAdvLoadAcked(void) { return runnerAdvLoadAcked; }
+void emul_recordRunnerAdvLoadAck(void) { runnerAdvLoadAcked = true; }
+void emul_clearRunnerAdvLoadAck(void) { runnerAdvLoadAcked = false; }
 
 void emul_onGemdriveHello(void) {
   if (!runnerActive) return;

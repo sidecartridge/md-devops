@@ -208,6 +208,17 @@ uint8_t emul_getRunnerAdvHookVector(void);
 void emul_recordRunnerAdvHookVector(uint8_t vector_id);
 
 /**
+ * @brief Per-chunk ack flag for the Advanced load streamer (S8). The
+ *        chunk-done chandler sets it via emul_recordRunnerAdvLoadAck;
+ *        the HTTP streamer spins on emul_isRunnerAdvLoadAcked +
+ *        chandler_loop until the flag flips, then clears it via
+ *        emul_clearRunnerAdvLoadAck before firing the next chunk.
+ */
+bool emul_isRunnerAdvLoadAcked(void);
+void emul_recordRunnerAdvLoadAck(void);
+void emul_clearRunnerAdvLoadAck(void);
+
+/**
  * @brief The m68k just ran gemdrive_init (CMD_GEMDRIVE_HELLO arrived).
  *        That is the unambiguous "ST cold-booted" signal — true for
  *        first power-on, `runner reset`, the ST's physical reset

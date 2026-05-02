@@ -67,6 +67,8 @@
 // 0x02 reserved.
 #define RUNNER_ADV_CMD_MEMINFO (APP_RUNNER_VBL + 0x03)  // meminfo from inside the ISR
 #define RUNNER_ADV_CMD_JUMP (APP_RUNNER_VBL + 0x04)     // rte to user-supplied address
+#define RUNNER_ADV_CMD_LOAD_CHUNK \
+  (APP_RUNNER_VBL + 0x05)  // copy 8 KB chunk from APP_FREE → m68k RAM
 
 // m68k -> RP report commands for the VBL command range. $0680+ to
 // keep the receiver path unambiguous (RP -> m68k uses $06xx without
@@ -74,6 +76,8 @@
 #define APP_RUNNER_VBL_DONE 0x0680
 #define RUNNER_ADV_CMD_DONE_JUMP \
   (APP_RUNNER_VBL_DONE + 0x00)  // no payload — RP clears sentinel
+#define RUNNER_ADV_CMD_DONE_LOAD_CHUNK \
+  (APP_RUNNER_VBL_DONE + 0x01)  // no payload — RP clears + advances
 
 // Shared-variable slot 16 — Advanced Runner hook vector address.
 // RP publishes the resolved address ($70 for VBL, $400 for
@@ -113,6 +117,7 @@ typedef enum {
   RUNNER_LAST_RES = 4,
   RUNNER_LAST_MEMINFO = 5,
   RUNNER_LAST_JUMP = 6,
+  RUNNER_LAST_LOAD = 7,
 } runner_last_command_t;
 
 // Snapshot returned by RUNNER_CMD_MEMINFO. Mirrors the 24-byte

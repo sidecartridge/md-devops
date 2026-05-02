@@ -17,6 +17,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1156,6 +1157,88 @@ class RunnerAdvJumpTests(unittest.TestCase):
             ["--host", self.server.host, "runner", "adv", "jump",
              "0xFA1C00"])
         self.assertIn("runner_inactive", err)
+
+
+class RunnerAdvLoadTests(unittest.TestCase):
+    """Epic 04 / S8 — `sidecart runner adv load`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+        # Workstation-side blob the CLI streams into the fake server.
+        self.tmp = tempfile.NamedTemporaryFile(delete=False)
+        self.tmp.write(b"\xDE\xAD\xBE\xEF" * 64)  # 256 B
+        self.tmp.flush()
+        self.tmp.close()
+        self.addCleanup(lambda: os.unlink(self.tmp.name))
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_adv_load_decimal_address(self) -> None:
+        self._set_response(200, {"ok": True, "loaded": True,
+                                 "address": 491520, "bytes": 256})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "load",
+             self.tmp.name, "491520"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertTrue(self.server.state.last_path.startswith(
+            "/api/v1/runner/adv/load"))
+        self.assertIn("address=0x78000", self.server.state.last_path)
+        self.assertEqual(self.server.state.last_body,
+                         b"\xDE\xAD\xBE\xEF" * 64)
+        self.assertIn("ADV LOAD", out)
+
+    def test_runner_adv_load_legacy_hex(self) -> None:
+        self._set_response(200, {"ok": True, "loaded": True,
+                                 "address": 0x78000, "bytes": 256})
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "load",
+             self.tmp.name, "$78000"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("address=0x78000", self.server.state.last_path)
+
+    def test_runner_adv_load_with_size_truncates(self) -> None:
+        self._set_response(200, {"ok": True, "loaded": True,
+                                 "address": 0x78000, "bytes": 64})
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "load",
+             self.tmp.name, "0x78000", "64"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        # CLI cap-and-truncates client-side too — the body sent over
+        # the wire is exactly the 64 B prefix, regardless of the
+        # workstation file's full size.
+        self.assertEqual(len(self.server.state.last_body), 64)
+        self.assertIn("size=64", self.server.state.last_path)
+
+    def test_runner_adv_load_rejects_odd_address(self) -> None:
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "load",
+             self.tmp.name, "0x78001"])
+        self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
+        self.assertIn("odd", err)
+        self.assertIsNone(self.server.state.last_method)
+
+    def test_runner_adv_load_rejects_missing_file(self) -> None:
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "load",
+             "/nonexistent/path/here.bin", "0x78000"])
+        self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
+        self.assertIn("cannot read", err)
+        self.assertIsNone(self.server.state.last_method)
+
+    def test_runner_adv_load_409_wrong_hook(self) -> None:
+        self._set_response(409, {"ok": False, "code": "wrong_hook",
+                                 "message": "VBL hook required"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "load",
+             self.tmp.name, "0x78000"])
+        self.assertIn("wrong_hook", err)
 
 
 class HostResolutionTests(unittest.TestCase):

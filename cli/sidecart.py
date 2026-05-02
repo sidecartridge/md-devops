@@ -507,6 +507,78 @@ def cmd_runner_adv_jump(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_runner_adv_load(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/adv/load — stream a workstation file into m68k RAM."""
+    try:
+        addr = _parse_adv_jump_address(args.address)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_BAD_REQUEST
+
+    cap: int | None = None
+    if args.size is not None:
+        try:
+            cap = _parse_adv_jump_address(args.size)
+        except ValueError:
+            # _parse_adv_jump_address enforces even+24bit which doesn't
+            # apply to a byte count. Fall back to a plain int parse.
+            s = args.size.strip()
+            try:
+                if s.startswith("$"):
+                    cap = int(s[1:], 16)
+                elif s.startswith(("0x", "0X")):
+                    cap = int(s, 16)
+                else:
+                    cap = int(s, 10)
+            except ValueError:
+                print(f"error: cannot parse size: {args.size!r}",
+                      file=sys.stderr)
+                return EXIT_BAD_REQUEST
+        if cap <= 0:
+            print(f"error: size must be > 0", file=sys.stderr)
+            return EXIT_BAD_REQUEST
+
+    try:
+        with open(args.local, "rb") as f:
+            blob = f.read()
+    except OSError as exc:
+        print(f"error: cannot read {args.local}: {exc}", file=sys.stderr)
+        return EXIT_BAD_REQUEST
+
+    if cap is not None and cap < len(blob):
+        blob = blob[:cap]
+
+    if not blob:
+        print(f"error: nothing to upload (empty file or size=0)",
+              file=sys.stderr)
+        return EXIT_BAD_REQUEST
+
+    query = f"address=0x{addr:X}"
+    if cap is not None:
+        query += f"&size={cap}"
+    url = base_url(args.host) + "/api/v1/runner/adv/load?" + query
+    headers = {"Content-Type": "application/octet-stream"}
+    try:
+        status, parsed, raw = request_json(
+            "POST", url, body=blob, headers=headers)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200 or parsed is None or parsed.get("ok") is not True:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        json.dump(parsed, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+    elif not args.quiet:
+        bytes_sent = parsed.get("bytes", len(blob))
+        print(f"ok  ADV LOAD {args.local} → 0x{addr:06X} "
+              f"({bytes_sent} bytes)")
+    return EXIT_OK
+
+
 def cmd_runner_adv_meminfo(args: argparse.Namespace) -> int:
     """POST /api/v1/runner/adv/meminfo — meminfo from inside the VBL ISR."""
     url = base_url(args.host) + "/api/v1/runner/adv/meminfo"
@@ -967,6 +1039,24 @@ def build_parser() -> argparse.ArgumentParser:
     jump_p.add_argument(
         "address",
         help="Target address: decimal, $hex (legacy), or 0xhex.")
+    load_p = adv_sub.add_parser(
+        "load",
+        help="Stream a workstation file into m68k RAM through the VBL "
+             "ISR. Synchronous — chunked through APP_FREE 8 KB at a "
+             "time. Requires the VBL hook ($70). Target must be even, "
+             "fit inside RAM (above 0x800, below phystop).")
+    load_p.add_argument(
+        "local",
+        help="Workstation file to upload (raw bytes, no envelope).")
+    load_p.add_argument(
+        "address",
+        help="Target start address: decimal, $hex (legacy), or 0xhex. "
+             "Even; 24-bit; >= 0x800.")
+    load_p.add_argument(
+        "size", nargs="?", default=None,
+        help="Optional cap on bytes to upload (decimal, $hex, or 0xhex). "
+             "If smaller than the file, the trailing bytes are dropped "
+             "(cap-and-truncate).")
     run_p = runner_sub.add_parser(
         "run", help="Run a .TOS / .PRG on the Atari ST.")
     run_p.add_argument("remote", help="Path to the program (relative to GEMDRIVE_FOLDER).")
@@ -1008,6 +1098,7 @@ def main(argv: list[str] | None = None) -> int:
                 "status": cmd_runner_adv_status,
                 "meminfo": cmd_runner_adv_meminfo,
                 "jump": cmd_runner_adv_jump,
+                "load": cmd_runner_adv_load,
             }
             handler = adv_handlers.get(args.adv_cmd)
             if handler is None:
