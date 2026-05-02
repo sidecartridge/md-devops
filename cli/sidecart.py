@@ -449,6 +449,217 @@ def cmd_runner_run(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _parse_adv_jump_address(raw: str) -> int:
+    """Parse a jump-target address from CLI input.
+
+    Accepts: decimal (e.g. "65536"), legacy hex with `$` prefix
+    (e.g. "$FA1C00"), modern hex with `0x` prefix (e.g. "0xFA1C00").
+    Raises ValueError on parse failure or out-of-range / odd values.
+
+    Shell gotcha: bash/zsh expand `$78000` as a variable reference
+    (unset variable → empty string → dropped from argv entirely),
+    so `$hex` arguments MUST be single-quoted on the command line:
+    `'$78000'`. Use the `0x78000` form to avoid quoting altogether.
+    """
+    s = raw.strip()
+    if not s:
+        raise ValueError("address is empty")
+    if s.startswith("$"):
+        value = int(s[1:], 16)
+    elif s.startswith(("0x", "0X")):
+        value = int(s, 16)
+    else:
+        value = int(s, 10)
+    if value < 0 or value > 0xFFFFFF:
+        raise ValueError(
+            f"address 0x{value:X} out of 24-bit range ($0..$FFFFFF)")
+    if value & 1:
+        raise ValueError(
+            f"address 0x{value:X} is odd; m68k 68000 instructions "
+            f"must be even-aligned")
+    return value
+
+
+def cmd_runner_adv_jump(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/adv/jump — VBL ISR rte to user address."""
+    try:
+        addr = _parse_adv_jump_address(args.address)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_BAD_REQUEST
+
+    body_json = {"address": f"0x{addr:X}"}
+    body = json.dumps(body_json, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    url = base_url(args.host) + "/api/v1/runner/adv/jump"
+    try:
+        status, parsed, raw = request_json(
+            "POST", url, body=body, headers=headers)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 202:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        print(f"ok  ADV JUMP 0x{addr:06X} sent (VBL ISR rte)")
+    return EXIT_OK
+
+
+def cmd_runner_adv_load(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/adv/load — stream a workstation file into m68k RAM."""
+    try:
+        addr = _parse_adv_jump_address(args.address)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_BAD_REQUEST
+
+    cap: int | None = None
+    if args.size is not None:
+        try:
+            cap = _parse_adv_jump_address(args.size)
+        except ValueError:
+            # _parse_adv_jump_address enforces even+24bit which doesn't
+            # apply to a byte count. Fall back to a plain int parse.
+            s = args.size.strip()
+            try:
+                if s.startswith("$"):
+                    cap = int(s[1:], 16)
+                elif s.startswith(("0x", "0X")):
+                    cap = int(s, 16)
+                else:
+                    cap = int(s, 10)
+            except ValueError:
+                print(f"error: cannot parse size: {args.size!r}",
+                      file=sys.stderr)
+                return EXIT_BAD_REQUEST
+        if cap <= 0:
+            print(f"error: size must be > 0", file=sys.stderr)
+            return EXIT_BAD_REQUEST
+
+    try:
+        with open(args.local, "rb") as f:
+            blob = f.read()
+    except OSError as exc:
+        print(f"error: cannot read {args.local}: {exc}", file=sys.stderr)
+        return EXIT_BAD_REQUEST
+
+    if cap is not None and cap < len(blob):
+        blob = blob[:cap]
+
+    if not blob:
+        print(f"error: nothing to upload (empty file or size=0)",
+              file=sys.stderr)
+        return EXIT_BAD_REQUEST
+
+    query = f"address=0x{addr:X}"
+    if cap is not None:
+        query += f"&size={cap}"
+    url = base_url(args.host) + "/api/v1/runner/adv/load?" + query
+    headers = {"Content-Type": "application/octet-stream"}
+    try:
+        status, parsed, raw = request_json(
+            "POST", url, body=blob, headers=headers)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200 or parsed is None or parsed.get("ok") is not True:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        json.dump(parsed, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+    elif not args.quiet:
+        bytes_sent = parsed.get("bytes", len(blob))
+        print(f"ok  ADV LOAD {args.local} → 0x{addr:06X} "
+              f"({bytes_sent} bytes)")
+    return EXIT_OK
+
+
+def cmd_runner_adv_meminfo(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/adv/meminfo — meminfo from inside the VBL ISR."""
+    url = base_url(args.host) + "/api/v1/runner/adv/meminfo"
+    try:
+        status, parsed, raw = request_json("POST", url, body=b"")
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200 or parsed is None or parsed.get("ok") is not True:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        json.dump(parsed, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return EXIT_OK
+    if args.quiet:
+        return EXIT_OK
+
+    print(f"membottom [$432]  : 0x{parsed.get('membottom', 0):08X}")
+    print(f"memtop    [$436]  : 0x{parsed.get('memtop', 0):08X}")
+    print(f"phystop   [$42E]  : 0x{parsed.get('phystop', 0):08X}")
+    print(f"screenmem [$44E]  : 0x{parsed.get('screenmem', 0):08X}")
+    bp = parsed.get('basepage', 0)
+    if bp:
+        print(f"basepage  [$4F2]  : 0x{bp:08X}")
+    else:
+        print(f"basepage  [$4F2]  : 0 (TOS < 1.04 or unset)")
+    b0 = parsed.get('bank0_kb', 0)
+    b1 = parsed.get('bank1_kb', 0)
+    if parsed.get('decoded'):
+        print(f"bank 0    [$FF8001 nibble] : {b0} KB")
+        print(f"bank 1    [$FF8001 nibble] : {b1} KB")
+        print(f"total RAM         : {b0 + b1} KB")
+    else:
+        print(f"banks     [$FF8001 nibble] : (unrecognised MMU config)")
+    return EXIT_OK
+
+
+def cmd_runner_adv_status(args: argparse.Namespace) -> int:
+    """GET /api/v1/runner/adv — Advanced Runner VBL hook state."""
+    url = base_url(args.host) + "/api/v1/runner/adv"
+    try:
+        status, parsed, raw = request_json("GET", url)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200 or parsed is None or parsed.get("ok") is not True:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        json.dump(parsed, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return EXIT_OK
+    if args.quiet:
+        return EXIT_OK
+
+    active = parsed.get("active", False)
+    installed = parsed.get("installed", False)
+    hook_vec = parsed.get("hook_vector", "unknown")
+    print(f"runner active : {'yes' if active else 'no'}")
+    if installed:
+        if hook_vec == "vbl":
+            print(f"hook vector   : installed (vbl @ $70)")
+        elif hook_vec == "etv_timer":
+            print(f"hook vector   : installed (etv_timer @ $400)")
+        else:
+            print(f"hook vector   : installed ({hook_vec})")
+    else:
+        print(f"hook vector   : not installed")
+    return EXIT_OK
+
+
 def cmd_runner_meminfo(args: argparse.Namespace) -> int:
     """GET /api/v1/runner/meminfo — synchronous system memory snapshot."""
     url = base_url(args.host) + "/api/v1/runner/meminfo"
@@ -813,6 +1024,51 @@ def build_parser() -> argparse.ArgumentParser:
     runner_sub.add_parser(
         "meminfo",
         help="System memory snapshot from the live ST (synchronous).")
+    adv_p = runner_sub.add_parser(
+        "adv", help="Advanced Runner (Epic 04) — VBL hook diagnostics.")
+    adv_sub = adv_p.add_subparsers(dest="adv_cmd", required=True)
+    adv_sub.add_parser(
+        "status",
+        help="Show whether the Advanced Runner VBL hook is installed "
+             "and which vector ($70 or $400) it landed on.")
+    adv_sub.add_parser(
+        "meminfo",
+        help="System memory snapshot — same fields as `runner meminfo` "
+             "but read from inside the VBL ISR, so it works against "
+             "wedged programs the foreground meminfo can't reach.")
+    jump_p = adv_sub.add_parser(
+        "jump",
+        help="Patch the VBL ISR's saved PC so the rte resumes at the "
+             "given address. Fire-and-forget. Requires the VBL hook "
+             "(\\$70). Address: decimal, $hex, or 0xhex; 24-bit; even. "
+             "Shell gotcha: single-quote `$hex` ('$FA1C00') or your "
+             "shell will expand it as a variable; or use 0xhex.")
+    jump_p.add_argument(
+        "address",
+        help="Target address: decimal, $hex (legacy — single-quote "
+             "in the shell: '$FA1C00'), or 0xhex (no quoting needed).")
+    load_p = adv_sub.add_parser(
+        "load",
+        help="Stream a workstation file into m68k RAM through the VBL "
+             "ISR. Synchronous — chunked through APP_FREE 8 KB at a "
+             "time. Requires the VBL hook ($70). Target must be even, "
+             "fit inside RAM (above 0x800, below phystop). Shell "
+             "gotcha: single-quote `$hex` ('$78000') or your shell "
+             "will expand it as a variable; or use 0xhex.")
+    load_p.add_argument(
+        "local",
+        help="Workstation file to upload (raw bytes, no envelope).")
+    load_p.add_argument(
+        "address",
+        help="Target start address: decimal, $hex (legacy — single-"
+             "quote in the shell: '$78000'), or 0xhex. Even; 24-bit; "
+             ">= 0x800.")
+    load_p.add_argument(
+        "size", nargs="?", default=None,
+        help="Optional cap on bytes to upload (decimal, $hex, or "
+             "0xhex; same shell-quoting rule as `address`). If smaller "
+             "than the file, the trailing bytes are dropped "
+             "(cap-and-truncate).")
     run_p = runner_sub.add_parser(
         "run", help="Run a .TOS / .PRG on the Atari ST.")
     run_p.add_argument("remote", help="Path to the program (relative to GEMDRIVE_FOLDER).")
@@ -849,6 +1105,18 @@ def main(argv: list[str] | None = None) -> int:
             "res": cmd_runner_res,
             "meminfo": cmd_runner_meminfo,
         }
+        if args.runner_cmd == "adv":
+            adv_handlers = {
+                "status": cmd_runner_adv_status,
+                "meminfo": cmd_runner_adv_meminfo,
+                "jump": cmd_runner_adv_jump,
+                "load": cmd_runner_adv_load,
+            }
+            handler = adv_handlers.get(args.adv_cmd)
+            if handler is None:
+                parser.error(f"unknown runner adv subcommand: {args.adv_cmd}")
+                return EXIT_USAGE
+            return handler(args)
         handler = runner_handlers.get(args.runner_cmd)
         if handler is None:
             parser.error(f"unknown runner subcommand: {args.runner_cmd}")

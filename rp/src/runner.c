@@ -77,9 +77,43 @@ static void __not_in_flash_func(runner_command_cb)(
       SEND_COMMAND_TO_DISPLAY(0);
       return;
     }
+    case RUNNER_ADV_CMD_DONE_JUMP: {
+      // m68k VBL handler is about to rte to a user-supplied address.
+      // Clear the sentinel so subsequent VBLs see NOP and just chain
+      // — without this, every next ISR would re-read RUNNER_ADV_CMD_JUMP
+      // and re-jump in an infinite loop.
+      DPRINTF("Runner: ADV JUMP done — clearing sentinel\n");
+      SEND_COMMAND_TO_DISPLAY(0);
+      return;
+    }
+    case RUNNER_ADV_CMD_DONE_LOAD_CHUNK: {
+      // The m68k VBL handler finished copying the current chunk
+      // out of APP_FREE into RAM. Clear the sentinel and flip the
+      // chunk-ack flag the streaming HTTP handler is spinning on.
+      DPRINTF("Runner: ADV LOAD CHUNK done\n");
+      SEND_COMMAND_TO_DISPLAY(0);
+      emul_recordRunnerAdvLoadAck();
+      return;
+    }
     case RUNNER_CMD_DONE_HELLO: {
-      DPRINTF("Runner: HELLO — clearing session state\n");
+      // d3 payload layout (Epic 04 / S1+S4):
+      //   bit 0      : advanced installed
+      //   bits 8..15 : hook_vector_id (0=vbl, 1=etv_timer, 0xFF=unknown)
+      // Older firmwares without S1 send HELLO with size 0; d3 reads
+      // as 0 → installed=false, hook_vector_id=0 (the default we
+      // overwrite to UNKNOWN below if installed is false).
+      // emul_resetRunnerSession() clears both fields, so the order
+      // matters: reset first, then record.
+      uint32_t flags = TPROTO_GET_PAYLOAD_PARAM32(payload);
+      bool adv = (flags & 1u) != 0;
+      uint8_t vec_id = adv
+                           ? (uint8_t)((flags >> 8) & 0xFFu)
+                           : (uint8_t)RUNNER_HOOK_VECTOR_UNKNOWN;
+      DPRINTF("Runner: HELLO — clearing session state, advanced=%d, hook_vec=%u\n",
+              adv ? 1 : 0, (unsigned)vec_id);
       emul_resetRunnerSession();
+      emul_recordRunnerAdvancedInstalled(adv);
+      emul_recordRunnerAdvHookVector(vec_id);
       // The runner is confirmed back on the air. Cancel any pending
       // relaunch retry storm and clear the sentinel back to NOP so a
       // late-firing CMD_START_RUNNER write doesn't get re-read by the

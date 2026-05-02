@@ -62,7 +62,6 @@ RUNNER_PROTO_VERSION		equ $00010001	; min=1, max=1
 ; commands live at $0500 + N to avoid collisions.
 CMD_NOP				equ 0
 APP_RUNNER			equ $0500
-RUNNER_CMD_RESET		equ ($01 + APP_RUNNER)	; cold reset
 RUNNER_CMD_EXECUTE		equ ($02 + APP_RUNNER)	; Pexec mode 0
 RUNNER_CMD_CD			equ ($03 + APP_RUNNER)	; Dsetpath
 RUNNER_CMD_RES			equ ($04 + APP_RUNNER)	; XBIOS Setscreen — rez at RUNNER_REZ
@@ -73,11 +72,6 @@ RUNNER_CMD_DONE_CD		equ ($83 + APP_RUNNER)	; payload: i32 GEMDOS errno
 RUNNER_CMD_DONE_HELLO		equ ($84 + APP_RUNNER)	; no payload — runner entered loop
 RUNNER_CMD_DONE_RES		equ ($85 + APP_RUNNER)	; payload: i32 errno (0 = OK, -1 = mono, -2 = bad rez)
 RUNNER_CMD_DONE_MEMINFO		equ ($86 + APP_RUNNER)	; payload: 24-byte meminfo struct
-
-; Wait between the RUNNER_RESET sentinel sighting and the actual
-; reset trampoline — gives any in-flight cartridge bus traffic time
-; to drain. Mirrors main.s' PRE_RESET_WAIT.
-PRE_RESET_WAIT			equ $FFFFF
 
 ; Constants required by inc/sidecart_macros.s when send_sync expands.
 ; main.s defines these too; we need our own local copies because
@@ -122,8 +116,78 @@ RUNNER_RES_ERR_BAD		equ -2	; requested rez out of range
 ; SHARED_VAR_DRIVE_NUMBER and stays on the GEMDRIVE-handled path
 ; instead of chaining to TOS native (which would EFILNF on C:\).
 SHARED_VARIABLES_ADDR		equ (SHARED_BLOCK_ADDR + $10)	; $FA2810
+SHARED_VAR_GEMDRIVE_RELOC	equ 10
 SHARED_VAR_DRIVE_NUMBER		equ 12
+SHARED_VAR_ADV_HOOK_VECTOR	equ 16
+SHARED_VAR_ADV_JUMP_ADDR	equ 17				; u32 target for RUNNER_ADV_CMD_JUMP
+SHARED_VAR_ADV_LOAD_TARGET	equ 18				; u32 chunk target for RUNNER_ADV_CMD_LOAD_CHUNK
+SHARED_VAR_ADV_LOAD_LEN		equ 19				; u32 byte count for the current chunk
+GEMDRIVE_RELOC_ADDR_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_GEMDRIVE_RELOC*4)
 DRIVE_NUMBER_ADDR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_DRIVE_NUMBER*4)
+ADV_HOOK_VECTOR_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_ADV_HOOK_VECTOR*4)
+ADV_JUMP_ADDR_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_ADV_JUMP_ADDR*4)
+ADV_LOAD_TARGET_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_ADV_LOAD_TARGET*4)
+ADV_LOAD_LEN_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_ADV_LOAD_LEN*4)
+
+; Epic 04 / S8 — Advanced load chunk staging buffer inside APP_FREE.
+; Carved out at offset $4000 (8 KB), well past the GEMDRIVE / runner
+; sub-regions and well below the framebuffer ceiling. RP writes each
+; chunk byte-pair-swapped here so the m68k's word/long reads return
+; the file's bytes in their natural order.
+RUNNER_ADV_LOAD_BUF_OFFSET	equ $4000
+RUNNER_ADV_LOAD_BUF		equ (APP_FREE_ADDR + RUNNER_ADV_LOAD_BUF_OFFSET)
+
+; Epic 04 — Advanced Runner. The runner blob now relocates itself
+; to RAM at runner_entry so its VBL handler can run from a stable
+; RAM address (cartridge ROM is fine for instructions but the VBL
+; ISR fires every frame — RAM is safer). Target address is
+; gemdrive_reloc - RUNNER_RELOC_OFFSET, leaving $400 of slack
+; between the two relocated blobs.
+RUNNER_BLOB_CART_ADDR		equ (ROM4_ADDR + $1C00)		; cartridge source
+RUNNER_BLOB_SIZE_BYTES		equ $C00			; matches devops.ld slot
+RUNNER_RELOC_OFFSET		equ $1000			; runner sits 4 KB below gemdrive
+_memtop				equ $436
+
+; Advanced Runner command range. Reuses the existing sentinel; the
+; foreground poll loop's cmp.l cascade only matches $05xx, so $06xx
+; codes pass through to the Advanced handler.
+APP_RUNNER_VBL			equ $0600
+RUNNER_ADV_CMD_RESET		equ ($01 + APP_RUNNER_VBL)	; forced cold reset
+RUNNER_ADV_CMD_MEMINFO		equ ($03 + APP_RUNNER_VBL)	; meminfo from inside the ISR
+RUNNER_ADV_CMD_JUMP		equ ($04 + APP_RUNNER_VBL)	; rte to user-supplied address
+RUNNER_ADV_CMD_LOAD_CHUNK	equ ($05 + APP_RUNNER_VBL)	; copy 8 KB chunk from APP_FREE -> RAM
+; m68k -> RP report commands for the VBL command range. $0680+ to
+; keep the receiver path unambiguous (RP -> m68k uses $06xx without
+; the $80 bit set).
+APP_RUNNER_VBL_DONE		equ $0680
+RUNNER_ADV_CMD_DONE_JUMP	equ ($00 + APP_RUNNER_VBL_DONE)	; no payload — RP clears sentinel
+RUNNER_ADV_CMD_DONE_LOAD_CHUNK	equ ($01 + APP_RUNNER_VBL_DONE)	; no payload — RP clears + advances
+RUNNER_VBL_RANGE_MASK		equ $FF00
+
+; --- Hook-vector selector (Epic 04 / S3) ---
+; The Advanced handler can be installed at one of two vectors.
+; Both are simple long pointers and accept the same chain pattern
+; (`move.l old(pc), -(sp); rts`), so the handler body is identical;
+; only the install address differs.
+;
+;   $70  — VBL autovector. Fires every vsync (50/60 Hz). Default.
+;          Polite to chain, but a program that does
+;          `move.l #my_handler, $70.w` without saving the previous
+;          value DESTROYS our hook completely — the VBL-driven
+;          `adv reset` cannot recover such a program.
+;   $400 — etv_timer ETV vector. Fires every 200 Hz from TOS' MFP
+;          timer-C handler. Higher rate (5 ms) but our handler is
+;          minimal so the overhead is negligible. Much harder for
+;          a wedged program to break — TOS' keyboard, mouse and
+;          sound subsystems all chain through this vector, so a
+;          wholesale replacement breaks the program itself before
+;          it can wedge anything else.
+;
+; Toggle by changing ADV_HOOK_VECTOR below. No other code change
+; needed — install / chain / uninstall all use this constant.
+ADV_HOOK_VECTOR_VBL		equ $70
+ADV_HOOK_VECTOR_ETV_TIMER	equ $400
+ADV_HOOK_VECTOR			equ ADV_HOOK_VECTOR_ETV_TIMER
 
 ; runner.s must be 100% relocatable and self-contained — no xref /
 ; xdef cross-module references, no jsr / jmp to symbols outside
@@ -143,17 +207,42 @@ DRIVE_NUMBER_ADDR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_DRIVE_NUMBER*4)
 ; ---------------------------------------------------------------
 
 runner_entry:
+	; --- Stage 0: relocation harness — runs ONCE from cartridge
+	; ROM at $FA1C00. Copies the entire runner blob to RAM
+	; (gemdrive_reloc - RUNNER_RELOC_OFFSET), lowers _memtop to
+	; protect both blobs, then jmps into the relocated copy at
+	; runner_post_reloc. The cartridge-ROM source is unused after
+	; the copy; the RAM copy is what actually executes for the
+	; lifetime of this Runner session. The whole module is
+	; PC-relative so labels resolve correctly post-relocation. ---
+	move.l	GEMDRIVE_RELOC_ADDR_VAR, d0
+	sub.l	#RUNNER_RELOC_OFFSET, d0	; d0 = runner_reloc
+	move.l	d0, _memtop.w			; lower _memtop to protect us
+
+	move.l	d0, a1				; dest
+	move.l	#RUNNER_BLOB_CART_ADDR, a0	; source
+	move.l	#RUNNER_BLOB_SIZE_BYTES, d1
+	lsr.l	#2, d1
+	subq.l	#1, d1
+.runner_copy:
+	move.l	(a0)+, (a1)+
+	dbf	d1, .runner_copy
+
+	; Compute relocated runner_post_reloc and jump.
+	move.l	d0, a0
+	add.l	#(runner_post_reloc - runner_entry), a0
+	jmp	(a0)
+
+; --- Stage 1+: post-relocation. Everything below runs from the
+; relocated RAM copy. ---
+runner_post_reloc:
 	; The cartridge address space ($FA0000-$FAFFFF) is read-only
 	; from the m68k — the cartridge port has no write strobe and
-	; any store there bus-errors (two bombs). The Runner therefore
-	; never writes to the shared region directly. The RP-side
-	; cmdRunner handler flips an in-memory `runner_active` flag the
-	; moment it sends DISPLAY_COMMAND_START_RUNNER, so
-	; `GET /api/v1/runner` knows the user chose Runner mode without
-	; a handshake from the m68k. Future stories will push richer
-	; state (exit codes, cwd) up to the RP via the cartridge
-	; protocol (send_sync with APP_RUNNER command IDs), where the
-	; RP-side runner_command_cb stashes it in RP RAM.
+	; any store there bus-errors. The Runner therefore never writes
+	; to the shared region directly; cross-target state lives in
+	; APP_FREE (RP writes), shared variables (RP writes via
+	; chandler), or the RP's in-memory mirror (set by cmdRunner /
+	; the chandler callbacks).
 
 	; --- Step 0: known cwd baseline. Whether we landed here from a
 	; cold boot, a runner reset, or the [U] menu pick, force the
@@ -172,10 +261,60 @@ runner_entry:
 	trap	#1
 	addq.l	#6, sp
 
+	; --- Step 0.5 (Epic 04 / S1+S3+S4): install the Advanced Runner
+	; hook at the vector chosen by the RP-side aconfig setting. The
+	; resolved vector address ($70 for VBL or $400 for etv_timer) is
+	; published to shared-var slot 16 by gemdrive_command_cb's HELLO
+	; handler before the runner is launched. We read it indirectly
+	; into a2; if the slot is zero (older RP firmware that doesn't
+	; publish it) we fall back to the build-time ADV_HOOK_VECTOR
+	; macro. We're already in supervisor mode (inherited from
+	; CA_INIT bit 27), so direct vector write is fine. Mask
+	; interrupts during the swap so we never run a partially-updated
+	; vector. ---
+	move.l	ADV_HOOK_VECTOR_VAR, d2
+	tst.l	d2
+	bne.s	.adv_have_addr
+	move.l	#ADV_HOOK_VECTOR, d2		; fallback to build-time choice
+.adv_have_addr:
+	move.l	d2, a2				; a2 = vector address (1024 max → indirect ok)
+	; Stash the resolved hook-vector address inside the relocated
+	; blob so the HELLO payload below can echo a vector ID back to
+	; the RP without re-reading the shared var.
+	lea	adv_active_vec(pc), a1
+	move.l	d2, (a1)
+
+	move.w	sr, -(sp)
+	or.w	#$0700, sr
+	lea	old_adv_hook(pc), a1		; PC-rel into the relocated blob
+	move.l	(a2), (a1)			; (a1) = old handler address
+	lea	adv_hook_handler(pc), a0	; relocated handler address
+	move.l	a0, (a2)			; install at the chosen vector
+	move.w	(sp)+, sr
+
 	; Tell the RP a fresh Runner session just started so it clears
 	; any stale busy lock / cwd mirror that survived a physical or
-	; cold reset (where the RP itself didn't see the reset event).
-	send_sync RUNNER_CMD_DONE_HELLO, 0
+	; cold reset. d3 layout:
+	;   bit 0      : advanced_installed (always 1 here)
+	;   bits 8..15 : hook_vector_id (0 = vbl @ $70,
+	;                                 1 = etv_timer @ $400,
+	;                                 0xFF = unknown — shouldn't happen)
+	moveq.l	#0, d3
+	move.b	#1, d3				; bit 0 = advanced installed
+	move.l	adv_active_vec(pc), d4
+	cmpi.l	#$70, d4
+	bne.s	.adv_hello_etv
+	; vector ID 0 — already in the high byte of d3 (still 0).
+	bra.s	.adv_hello_send
+.adv_hello_etv:
+	cmpi.l	#$400, d4
+	bne.s	.adv_hello_unknown
+	ori.l	#$0100, d3			; bits 8..15 = 1 (etv_timer)
+	bra.s	.adv_hello_send
+.adv_hello_unknown:
+	ori.l	#$FF00, d3			; bits 8..15 = 0xFF (unknown)
+.adv_hello_send:
+	send_sync RUNNER_CMD_DONE_HELLO, 4
 
 	; --- Step 1: clear screen + paint banner (single Cconws — the
 	; banner_text string leads with VT52 ESC E). ---
@@ -188,9 +327,12 @@ runner_entry:
 	; the RP writes to dispatch Runner commands. RUNNER_CMD_EXECUTE
 	; / RUNNER_CMD_CD land in S3/S4. ---
 runner_poll_loop:
+	; Cold reset is handled by the Advanced Runner VBL hook
+	; (RUNNER_ADV_CMD_RESET in the $06xx range — see adv_hook_handler
+	; below). The foreground RUNNER_CMD_RESET dispatch was retired
+	; in Epic 04 / S5 because the VBL path also escapes wedged
+	; programs that the foreground poll can't reach.
 	move.l	CMD_MAGIC_SENTINEL_ADDR, d6
-	cmp.l	#RUNNER_CMD_RESET, d6
-	beq	runner_reset
 	cmp.l	#RUNNER_CMD_EXECUTE, d6
 	beq	runner_execute
 	cmp.l	#RUNNER_CMD_CD, d6
@@ -509,29 +651,253 @@ runner_meminfo:
 	lea	24(sp), sp			; pop struct
 	bra	runner_poll_loop
 
-; Cold reset — same sequence as main.s' .reset. Waits briefly,
-; invalidates TOS' memory-system "valid" cookies (so the next boot
-; rebuilds RAM tables instead of trusting stale ones), then jumps
-; through the reset vector at $00000004.
-runner_reset:
-	; Trace before the wait so the user sees something even if the
-	; reset itself takes a moment.
-	pea	text_reset(pc)
-	move.w	#GEMDOS_Cconws, -(sp)
-	trap	#1
-	addq.l	#6, sp
+; ---------------------------------------------------------------
+; Advanced Runner hook (Epic 04 / S1+S2+S3).
+;
+; Installed at ADV_HOOK_VECTOR ($70 VBL or $400 etv_timer) by
+; runner_post_reloc. Same handler body services both — the chain
+; pattern (`move.l old(pc), -(sp); rts`) works for an autovectored
+; interrupt (rts → chained handler → rte) and for an ETV-style
+; subroutine (rts → chained handler → rts back to TOS' MFP ISR
+; which then rte's). ETV convention says d0/d1/a0/a1 are scratch,
+; which our save list (d0/d1/a0) is a strict subset of.
+;
+; Read the cartridge sentinel and check whether the upper byte of
+; the command code matches APP_RUNNER_VBL ($0600). If so, dispatch.
+; Then fall through to the saved handler regardless.
+;
+; The sentinel is written by the RP via SEND_COMMAND_TO_DISPLAY;
+; values in the $05xx range belong to the foreground poll loop,
+; values in the $06xx range belong to us. The two ranges never
+; collide so the poll loop's existing cmp.l cascade ignores us
+; and we ignore everything outside $06xx.
+; ---------------------------------------------------------------
+adv_hook_handler:
+	movem.l	d0-d1/a0, -(sp)			; ISR prologue — minimal save
+	move.l	CMD_MAGIC_SENTINEL_ADDR, d0
+	move.l	d0, d1
+	andi.l	#$FFFFFF00, d1
+	cmpi.l	#APP_RUNNER_VBL, d1
+	bne	adv_chain_to_old
+	; In our range. Compare against each known command code.
+	cmpi.l	#RUNNER_ADV_CMD_RESET, d0
+	beq	adv_force_reset
+	cmpi.l	#RUNNER_ADV_CMD_MEMINFO, d0
+	beq	adv_meminfo_isr
+	cmpi.l	#RUNNER_ADV_CMD_JUMP, d0
+	beq	adv_jump_isr
+	cmpi.l	#RUNNER_ADV_CMD_LOAD_CHUNK, d0
+	beq	adv_load_chunk_isr
+	; Unknown $06xx command — ignore and chain. (Logging on the
+	; m68k from inside an ISR is a hazard; the RP-side handler
+	; already validated the command code before firing the sentinel.)
+adv_chain_to_old:
+	movem.l	(sp)+, d0-d1/a0
+	move.l	old_adv_hook(pc), -(sp)
+	rts					; chain → previous handler
 
-	move.l	#PRE_RESET_WAIT, d6
-.runner_reset_wait:
-	subq.l	#1, d6
-	bne.s	.runner_reset_wait
-
+; --- Forced cold reset (Epic 04 / S2). Mirrors the foreground
+; runner_reset's memvalid clear + jmp through the reset vector at
+; $4.w, but driven from inside the VBL ISR so it works even when
+; the foreground poll loop is wedged (program in an infinite loop,
+; bombs already painted, etc.). No register restore — the cold
+; reset wipes everything. No rte — control transfers to TOS' init
+; permanently. SR's IPL is reset by TOS' init early in its
+; sequence so the in-interrupt entry doesn't matter. ---
+adv_force_reset:
 	clr.l	$420.w			; memvalid
 	clr.l	$43A.w			; memval2
 	clr.l	$51A.w			; memval3
 	move.l	$4.w, a0		; reset vector
 	jmp	(a0)
-	nop
+	; unreachable
+
+; --- Advanced meminfo (Epic 04 / S6). Same RP-visible payload as
+; the foreground RUNNER_CMD_MEMINFO (24-byte struct shipped via
+; RUNNER_CMD_DONE_MEMINFO), but the read happens from inside the
+; VBL ISR so it works even when the foreground poll loop is wedged.
+;
+; We're already in supervisor mode (autovector $70 entry preserves
+; the SR with S=1) so $432/$436/$42E/$44E/$4F2/$FFFF8001 are all
+; readable directly — no Super() toggle needed. No Cconws trace
+; either: GEMDOS calls from inside an ISR are a hazard.
+;
+; Register discipline: the ISR prologue saved d0/d1/a0. We need
+; more scratch (d2-d7, a1-a4) for the decode + send_write_sync.
+; Save them on top before clobbering, restore before chaining.
+;
+; Bank decoding identical to runner_meminfo's cascade — the buffer
+; is pre-zeroed via the `clr.l 20(a4)` so unrecognised nibbles
+; naturally produce 0/0 on the wire.
+adv_meminfo_isr:
+	movem.l	d2-d7/a1-a4, -(sp)		; save extra registers
+
+	; Allocate 24-byte struct on stack.
+	lea	-24(sp), sp
+	move.l	sp, a4
+
+	; --- Read system-variable cookies (supervisor area). ---
+	move.l	$432.w, 0(a4)			; _membot
+	move.l	$436.w, 4(a4)			; _memtop
+	move.l	$42E.w, 8(a4)			; _phystop
+	move.l	$44E.w, 12(a4)			; _v_bas_ad
+	move.l	$4F2.w, 16(a4)			; _run (basepage; 0 on TOS < 1.04)
+	clr.l	20(a4)				; pre-zero bank0/bank1 slots
+
+	; --- Read MMU config byte at $FFFF8001 and decode bank sizes. ---
+	moveq.l	#0, d3
+	move.b	$FFFF8001, d3
+	and.w	#$0F, d3
+	moveq.l	#0, d4
+	moveq.l	#0, d2
+	cmp.b	#%0000, d3
+	bne.s	.advmi_n0100
+	move.w	#128, d4
+	move.w	#128, d2
+	bra.s	.advmi_decoded
+.advmi_n0100:
+	cmp.b	#%0100, d3
+	bne.s	.advmi_n0101
+	move.w	#512, d4
+	move.w	#128, d2
+	bra.s	.advmi_decoded
+.advmi_n0101:
+	cmp.b	#%0101, d3
+	bne.s	.advmi_n1000
+	move.w	#512, d4
+	move.w	#512, d2
+	bra.s	.advmi_decoded
+.advmi_n1000:
+	cmp.b	#%1000, d3
+	bne.s	.advmi_n1010
+	move.w	#2048, d4
+	move.w	#128, d2
+	bra.s	.advmi_decoded
+.advmi_n1010:
+	cmp.b	#%1010, d3
+	bne.s	.advmi_decoded
+	move.w	#2048, d4
+	move.w	#2048, d2
+.advmi_decoded:
+	move.w	d4, 20(a4)			; bank0_kb
+	move.w	d2, 22(a4)			; bank1_kb
+
+	; Ship the struct to the RP. send_write_sync expects a4 = buffer.
+	send_write_sync RUNNER_CMD_DONE_MEMINFO, 24
+
+	lea	24(sp), sp			; pop struct
+	movem.l	(sp)+, d2-d7/a1-a4		; restore extra registers
+	bra	adv_chain_to_old		; chain → previous handler runs + rte
+
+; --- adv_jump_isr (Epic 04 / S7) — patch the ISR's saved PC so the
+; eventual rte resumes at the user-supplied address (read from
+; shared-var slot 17 = ADV_JUMP_ADDR_VAR). Fire-and-forget: no
+; payload back to the RP, just a no-payload RUNNER_ADV_CMD_DONE_JUMP
+; ack so the RP-side chandler can clear the sentinel — without
+; clearing, the next VBL would re-read RUNNER_ADV_CMD_JUMP and
+; re-jump in an infinite loop.
+;
+; Stack layout when this handler runs (autovector $70 entry +
+; ISR prologue at top of adv_hook_handler + our extras-save):
+;   sp +  0..39   extras movem (d2-d7/a1-a4 = 10 regs × 4 = 40 B)
+;   sp + 40..51   ISR prologue (d0-d1/a0 = 3 regs × 4 = 12 B)
+;   sp + 52       hardware-saved SR (word)            (= 40 + 12)
+;   sp + 54..57   hardware-saved PC (long)            ← patch this
+;
+; Hook stays installed (B2 decision); the user's code at the target
+; address may see VBL ticks chaining through us. Since the RP
+; cleared the sentinel before we return, subsequent VBLs see a NOP
+; sentinel and just chain through us to the next handler.
+;
+; Only valid for the VBL ($70) hook — etv_timer's outer rte trap
+; frame sits past TOS' MFP scratch and we'd need a TOS-version-
+; specific walk to reach it. RP-side handle_runner_adv_jump returns
+; 409 wrong_hook in that case; if we somehow get here anyway we
+; chain instead of guessing at the frame layout.
+adv_jump_isr:
+	move.l	adv_active_vec(pc), d1
+	cmpi.l	#$70, d1
+	bne	adv_chain_to_old
+
+	movem.l	d2-d7/a1-a4, -(sp)		; save extras for send_sync (40 B)
+
+	; Patch the trap-frame PC at sp+54. d0 currently holds the
+	; sentinel value (RUNNER_ADV_CMD_JUMP) — overwrite with the
+	; target address read from shared-var slot 17.
+	move.l	ADV_JUMP_ADDR_VAR, d0
+	move.l	d0, 54(sp)
+
+	; Notify RP. Chandler clears the sentinel, then bumps the random
+	; token so this send_sync round-trip returns. After the rte
+	; below, the next VBL will see a NOP sentinel and just chain.
+	send_sync RUNNER_ADV_CMD_DONE_JUMP, 0
+
+	movem.l	(sp)+, d2-d7/a1-a4		; restore extras
+	movem.l	(sp)+, d0-d1/a0			; restore ISR prologue
+	rte					; jump to patched PC
+
+; --- adv_load_chunk_isr (Epic 04 / S8) — copy a single chunk from
+; the APP_FREE staging buffer (at RUNNER_ADV_LOAD_BUF, byte-pair-
+; swapped by the RP writer) into the m68k RAM target read from
+; shared-var slot 18 (current chunk start). Length in slot 19.
+;
+; The pre-swap on the RP side means a m68k word/long read from
+; APP_FREE returns the file's natural-endian word/long, so the
+; bulk copy uses move.w (and a single move.b for any odd tail).
+;
+; Fire-and-forget per chunk: send_sync DONE_LOAD_CHUNK acks the RP
+; (which advances the per-chunk target and prepares the next
+; chunk). Sentinel cleared by the chandler.
+;
+; Trusts the RP-side validation (target even, length even except
+; possibly the tail byte, range fits in [membottom,phystop)). No
+; bounds checks here.
+adv_load_chunk_isr:
+	movem.l	d2-d7/a1-a4, -(sp)		; save extras
+
+	; Pull target + length out of the shared variables.
+	move.l	ADV_LOAD_TARGET_VAR, a1		; destination
+	move.l	ADV_LOAD_LEN_VAR, d2		; bytes in this chunk
+	lea	RUNNER_ADV_LOAD_BUF.l, a0	; source
+
+	; Word-loop: num_words = len / 2.
+	move.l	d2, d3
+	lsr.l	#1, d3
+	beq.s	.lc_word_done			; len < 2 — only a tail byte at most
+	subq.l	#1, d3				; dbf wants count - 1
+.lc_word_loop:
+	move.w	(a0)+, (a1)+
+	dbf	d3, .lc_word_loop
+.lc_word_done:
+
+	; Tail byte if len is odd.
+	btst	#0, d2
+	beq.s	.lc_done
+	move.b	(a0)+, (a1)+
+.lc_done:
+
+	send_sync RUNNER_ADV_CMD_DONE_LOAD_CHUNK, 0
+
+	movem.l	(sp)+, d2-d7/a1-a4		; restore extras
+	bra	adv_chain_to_old		; chain — VBL keeps firing
+
+; old_adv_hook: 4-byte cell holding the address of the prior
+; vector (saved at install time by runner_post_reloc — could be a
+; previous VBL handler or a previous etv_timer ETV depending on
+; ADV_HOOK_VECTOR). adv_active_vec mirrors the vector address that
+; was actually installed (from shared-var slot 16, or the build-time
+; fallback) so the HELLO payload can echo a vector ID back to the
+; RP without re-reading the shared var. PC-relative reads work at
+; runtime once the blob is relocated; both cells live in the
+; relocated copy, NOT the cartridge ROM original.
+	cnop	0,4
+	dc.l	'XBRA'				; XBRA debug marker so chain
+	dc.l	'SDRA'				; walkers can identify our hook
+old_adv_hook:
+	dc.l	0
+adv_active_vec:
+	dc.l	0
+	even
 
 ; ---------------------------------------------------------------
 ; runner_print_dec_d3 — print signed 32-bit value in d3 as ASCII
@@ -663,9 +1029,6 @@ banner_text:
 ; Per-command trace strings. Cconws prints these alongside the path
 ; (read straight from RUNNER_PATH in APP_FREE) so the operator can see
 ; on the ST screen exactly which command landed and which program ran.
-text_reset:
-	dc.b	13, 10, "[RESET] - Received Cold Reset command", 13, 10, 0
-	even
 text_run:
 	dc.b	13, 10, "[RUN  ] - Launching ", 0
 	even

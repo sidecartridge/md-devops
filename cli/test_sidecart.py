@@ -17,6 +17,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -962,6 +963,282 @@ class RunnerMeminfoTests(unittest.TestCase):
         code, _out, err = _run_cli(
             ["--host", self.server.host, "runner", "meminfo"])
         self.assertIn("runner_inactive", err)
+
+
+class RunnerAdvStatusTests(unittest.TestCase):
+    """Epic 04 / S1 — `sidecart runner adv status`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_adv_status_installed_etv(self) -> None:
+        self._set_response(200, {
+            "ok": True, "active": True, "installed": True,
+            "hook_vector": "etv_timer",
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "GET")
+        self.assertEqual(self.server.state.last_path, "/api/v1/runner/adv")
+        self.assertIn("hook vector   : installed (etv_timer @ $400)", out)
+        self.assertIn("runner active : yes", out)
+
+    def test_runner_adv_status_installed_vbl(self) -> None:
+        self._set_response(200, {
+            "ok": True, "active": True, "installed": True,
+            "hook_vector": "vbl",
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("hook vector   : installed (vbl @ $70)", out)
+
+    def test_runner_adv_status_inactive(self) -> None:
+        self._set_response(200, {
+            "ok": True, "active": False, "installed": False,
+            "hook_vector": "unknown",
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("hook vector   : not installed", out)
+        self.assertIn("runner active : no", out)
+
+    def test_runner_adv_status_json(self) -> None:
+        self._set_response(200, {
+            "ok": True, "active": True, "installed": True,
+            "hook_vector": "etv_timer",
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "--json",
+             "runner", "adv", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        parsed = json.loads(out)
+        self.assertTrue(parsed["installed"])
+        self.assertEqual(parsed["hook_vector"], "etv_timer")
+
+
+class RunnerAdvMeminfoTests(unittest.TestCase):
+    """Epic 04 / S6 — `sidecart runner adv meminfo`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_adv_meminfo_human(self) -> None:
+        self._set_response(200, {
+            "ok": True,
+            "membottom": 0x000900,
+            "memtop": 0x100000,
+            "phystop": 0x100000,
+            "screenmem": 0x0F8000,
+            "basepage": 0x000C00,
+            "bank0_kb": 512,
+            "bank1_kb": 512,
+            "decoded": True,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "meminfo"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path,
+                         "/api/v1/runner/adv/meminfo")
+        self.assertIn("0x00100000", out)
+        self.assertIn("total RAM         : 1024 KB", out)
+        self.assertIn("[$432]", out)
+
+    def test_runner_adv_meminfo_504_timeout(self) -> None:
+        self._set_response(504, {"ok": False, "code": "gateway_timeout",
+                                 "message": "Runner did not respond"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "meminfo"])
+        self.assertNotEqual(code, sidecart.EXIT_OK)
+        self.assertIn("gateway_timeout", err)
+
+    def test_runner_adv_meminfo_409_runner_inactive(self) -> None:
+        self._set_response(409, {"ok": False, "code": "runner_inactive",
+                                 "message": "Runner not active"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "meminfo"])
+        self.assertIn("runner_inactive", err)
+
+
+class RunnerAdvJumpTests(unittest.TestCase):
+    """Epic 04 / S7 — `sidecart runner adv jump`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_adv_jump_decimal(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "jump",
+             "16384"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path,
+                         "/api/v1/runner/adv/jump")
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        # CLI normalises to 0x-hex regardless of input form.
+        self.assertEqual(body["address"], "0x4000")
+        self.assertIn("ADV JUMP 0x004000", out)
+
+    def test_runner_adv_jump_legacy_hex(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "jump",
+             "$FA1C00"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body["address"], "0xFA1C00")
+
+    def test_runner_adv_jump_modern_hex(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "jump",
+             "0xfa1c00"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body["address"], "0xFA1C00")
+
+    def test_runner_adv_jump_rejects_odd(self) -> None:
+        # Should not even reach the server — CLI validates first.
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "jump",
+             "0x12345"])
+        self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
+        self.assertIn("odd", err)
+        self.assertIsNone(self.server.state.last_method)
+
+    def test_runner_adv_jump_rejects_out_of_range(self) -> None:
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "jump",
+             "0x10000000"])
+        self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
+        self.assertIn("24-bit", err)
+        self.assertIsNone(self.server.state.last_method)
+
+    def test_runner_adv_jump_409_wrong_hook(self) -> None:
+        self._set_response(409, {"ok": False, "code": "wrong_hook",
+                                 "message": "VBL hook required"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "jump",
+             "0xFA1C00"])
+        self.assertIn("wrong_hook", err)
+
+    def test_runner_adv_jump_409_runner_inactive(self) -> None:
+        self._set_response(409, {"ok": False, "code": "runner_inactive",
+                                 "message": "Runner not active"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "jump",
+             "0xFA1C00"])
+        self.assertIn("runner_inactive", err)
+
+
+class RunnerAdvLoadTests(unittest.TestCase):
+    """Epic 04 / S8 — `sidecart runner adv load`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+        # Workstation-side blob the CLI streams into the fake server.
+        self.tmp = tempfile.NamedTemporaryFile(delete=False)
+        self.tmp.write(b"\xDE\xAD\xBE\xEF" * 64)  # 256 B
+        self.tmp.flush()
+        self.tmp.close()
+        self.addCleanup(lambda: os.unlink(self.tmp.name))
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_adv_load_decimal_address(self) -> None:
+        self._set_response(200, {"ok": True, "loaded": True,
+                                 "address": 491520, "bytes": 256})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "load",
+             self.tmp.name, "491520"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertTrue(self.server.state.last_path.startswith(
+            "/api/v1/runner/adv/load"))
+        self.assertIn("address=0x78000", self.server.state.last_path)
+        self.assertEqual(self.server.state.last_body,
+                         b"\xDE\xAD\xBE\xEF" * 64)
+        self.assertIn("ADV LOAD", out)
+
+    def test_runner_adv_load_legacy_hex(self) -> None:
+        self._set_response(200, {"ok": True, "loaded": True,
+                                 "address": 0x78000, "bytes": 256})
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "load",
+             self.tmp.name, "$78000"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("address=0x78000", self.server.state.last_path)
+
+    def test_runner_adv_load_with_size_truncates(self) -> None:
+        self._set_response(200, {"ok": True, "loaded": True,
+                                 "address": 0x78000, "bytes": 64})
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "load",
+             self.tmp.name, "0x78000", "64"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        # CLI cap-and-truncates client-side too — the body sent over
+        # the wire is exactly the 64 B prefix, regardless of the
+        # workstation file's full size.
+        self.assertEqual(len(self.server.state.last_body), 64)
+        self.assertIn("size=64", self.server.state.last_path)
+
+    def test_runner_adv_load_rejects_odd_address(self) -> None:
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "load",
+             self.tmp.name, "0x78001"])
+        self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
+        self.assertIn("odd", err)
+        self.assertIsNone(self.server.state.last_method)
+
+    def test_runner_adv_load_rejects_missing_file(self) -> None:
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "load",
+             "/nonexistent/path/here.bin", "0x78000"])
+        self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
+        self.assertIn("cannot read", err)
+        self.assertIsNone(self.server.state.last_method)
+
+    def test_runner_adv_load_409_wrong_hook(self) -> None:
+        self._set_response(409, {"ok": False, "code": "wrong_hook",
+                                 "message": "VBL hook required"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "adv", "load",
+             self.tmp.name, "0x78000"])
+        self.assertIn("wrong_hook", err)
 
 
 class HostResolutionTests(unittest.TestCase):

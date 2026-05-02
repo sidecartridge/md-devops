@@ -14,6 +14,7 @@
 #include "emul.h"
 #include "ff.h"
 #include "gconfig.h"
+#include "memfunc.h"
 #include "lwip/err.h"
 #include "lwip/pbuf.h"
 #include "lwip/tcp.h"
@@ -70,6 +71,7 @@ typedef enum {
   HC_STREAM_LISTING,
   HC_STREAM_DOWNLOAD,
   HC_STREAM_UPLOAD,
+  HC_STREAM_LOAD,
   HC_DRAINING,
 } hc_state_t;
 
@@ -139,6 +141,18 @@ typedef struct http_conn {
   char upload_norm[HTTP_PATH_BUF_BYTES];      // for response Location: /api/v1/files<rel>
   char upload_abs[HTTP_FAT_PATH_BUF_BYTES];   // for cleanup f_unlink
 
+  // Streaming Advanced-Runner load state (Epic 04 / S8). Active while
+  // state == HC_STREAM_LOAD. Bytes arrive from the HTTP body in pbuf
+  // segments; we copy them byte-pair-swapped into APP_FREE at the
+  // RUNNER_ADV_LOAD_BUF offset; once a chunk is full (or the body
+  // ends) we fire RUNNER_ADV_CMD_LOAD_CHUNK and spin chandler_loop
+  // until the m68k's VBL handler reports back via the chunk-ack flag.
+  uint32_t adv_load_target;        // current m68k destination address
+  uint32_t adv_load_received;      // total body bytes pumped through chunk buffer
+  uint32_t adv_load_total;         // bytes we will actually load (post cap-and-truncate)
+  uint32_t adv_load_start;         // original target — kept for the response envelope
+  uint32_t adv_load_chunk_pos;     // bytes accumulated in the current chunk buffer
+
   // Range request state, populated during header parsing.
   bool has_range;
   bool range_invalid;        // syntactically present but unparseable
@@ -189,6 +203,12 @@ static void stream_download_drive(http_conn_t *c);
 static bool handle_file_upload_init(http_conn_t *c, const char *body_start,
                                     size_t leftover);
 static void upload_finish_ok(http_conn_t *c);
+static bool handle_runner_adv_load_init(http_conn_t *c, const char *body_start,
+                                        size_t leftover);
+static void adv_load_drain_pbuf(http_conn_t *c, struct pbuf *p, size_t off,
+                                size_t n);
+static bool adv_load_dispatch_chunk(http_conn_t *c);
+static void adv_load_finish_ok(http_conn_t *c);
 
 // --- Public API ---
 
@@ -402,6 +422,21 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
     pbuf_free(p);
     if (c->upload_received >= c->content_length) {
       upload_finish_ok(c);
+    }
+  } else if (c->state == HC_STREAM_LOAD) {
+    // Drain the HTTP body straight into the APP_FREE chunk staging
+    // buffer (byte-pair-swapped). Bytes past adv_load_total are
+    // silently dropped — the cap-and-truncate decision means the
+    // client may have sent more than we'll honour.
+    size_t want = (size_t)(c->adv_load_total - c->adv_load_received);
+    size_t take = (p->tot_len < want) ? p->tot_len : want;
+    if (take > 0) {
+      adv_load_drain_pbuf(c, p, 0, take);
+    }
+    tcp_recved(pcb, p->tot_len);
+    pbuf_free(p);
+    if (c->adv_load_received >= c->adv_load_total) {
+      adv_load_finish_ok(c);
     }
   } else {
     // Already writing the response (or draining); discard any extra
@@ -647,6 +682,25 @@ static void __not_in_flash_func(parse_and_dispatch)(http_conn_t *c) {
       return;
     }
     c->state = HC_STREAM_UPLOAD;
+    return;
+  }
+
+  // Special-case POST /api/v1/runner/adv/load — same reason: bodies
+  // can be megabytes, much bigger than HTTP_REQUEST_BODY_BUF_BYTES.
+  // We drain straight into APP_FREE in 8 KB chunks and dispatch each
+  // chunk to the m68k VBL ISR via RUNNER_ADV_CMD_LOAD_CHUNK.
+  if (c->method == HM_POST &&
+      strcmp(c->path, "/api/v1/runner/adv/load") == 0) {
+    size_t leftover = body_leftover;
+    if (leftover > c->content_length) leftover = c->content_length;
+    if (!handle_runner_adv_load_init(c, body_start, leftover)) {
+      return;  // init wrote the error response
+    }
+    if (c->adv_load_received >= c->adv_load_total) {
+      adv_load_finish_ok(c);
+      return;
+    }
+    c->state = HC_STREAM_LOAD;
     return;
   }
 
@@ -1119,6 +1173,8 @@ static const char *runner_last_command_str(runner_last_command_t cmd) {
     case RUNNER_LAST_CD: return "CD";
     case RUNNER_LAST_RES: return "RES";
     case RUNNER_LAST_MEMINFO: return "MEMINFO";
+    case RUNNER_LAST_JUMP: return "JUMP";
+    case RUNNER_LAST_LOAD: return "LOAD";
     default: return NULL;  // RUNNER_LAST_NONE → JSON null
   }
 }
@@ -1646,6 +1702,465 @@ static void __not_in_flash_func(handle_runner_res)(http_conn_t *c) {
   write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
 }
 
+// 1 s deadline for any meminfo round-trip — used by both the
+// foreground and the VBL paths. The m68k typically responds in
+// well under one frame; the timeout is just a safety net for a
+// genuinely-wedged ST.
+#ifndef RUNNER_MEMINFO_TIMEOUT_US
+#define RUNNER_MEMINFO_TIMEOUT_US 1000000
+#endif
+
+// POST /api/v1/runner/adv/jump — Epic 04 / S7.
+//
+// Body: {"address": "<int>"} where the value is a JSON string in
+// either decimal or 0x-hex form. The CLI normalises any user input
+// (decimal / "$..." / "0x...") into 0x-hex before sending, so the
+// RP only sees `strtoul`-parseable forms.
+//
+// Hard constraints:
+//  - VBL hook only — etv_timer rte trap frame sits past TOS' MFP
+//    scratch and we'd need a TOS-version-fragile walk. 409 wrong_hook.
+//  - Address must be even (m68k 68000 instruction alignment) and
+//    fit in the 24-bit address bus ($0..$FFFFFF).
+//
+// Mechanism: stash the address in shared-var slot 17 (m68k reads
+// it indirectly), fire the sentinel, return 202. The m68k VBL ISR
+// patches its own trap frame's saved PC, sends a no-payload
+// RUNNER_ADV_CMD_DONE_JUMP via send_sync (the chandler clears the
+// sentinel so subsequent VBLs don't re-jump in a loop), then rte's
+// to the patched PC.
+//
+// No busy-lock gate — escaping wedged state is the whole point.
+static void __not_in_flash_func(handle_runner_adv_jump)(http_conn_t *c) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return;
+  }
+  if (emul_getRunnerAdvHookVector() != RUNNER_HOOK_VECTOR_VBL) {
+    write_error(c, 409, "Conflict", "wrong_hook",
+                "adv jump requires the VBL hook ($70). Switch "
+                "ADV_HOOK_VECTOR to \"vbl\" in the setup menu, or "
+                "fall back to a different recovery path.");
+    return;
+  }
+  if (c->content_length == 0) {
+    write_error(c, 411, "Length Required", "length_required",
+                "JSON body required");
+    return;
+  }
+  if (!c->content_type_json) {
+    write_error(c, 415, "Unsupported Media Type", "unsupported_media",
+                "Content-Type must be application/json");
+    return;
+  }
+
+  char addr_str[24] = {0};
+  json_status_t js = json_extract_string(c->body, c->body_received,
+                                         "address", addr_str,
+                                         sizeof(addr_str));
+  if (js == JSON_BAD) {
+    write_error(c, 422, "Unprocessable Entity", "bad_json",
+                "Malformed JSON body");
+    return;
+  }
+  if (js != JSON_OK) {
+    write_error(c, 422, "Unprocessable Entity", "unprocessable",
+                "Missing or non-string `address` field");
+    return;
+  }
+  char *endp = NULL;
+  unsigned long addr = strtoul(addr_str, &endp, 0);
+  if (endp == addr_str || (endp != NULL && *endp != '\0')) {
+    write_error(c, 400, "Bad Request", "bad_request",
+                "Could not parse `address` as integer");
+    return;
+  }
+  if (addr > 0xFFFFFFul) {
+    write_error(c, 400, "Bad Request", "bad_request",
+                "address out of 24-bit range ($0..$FFFFFF)");
+    return;
+  }
+  if ((addr & 1u) != 0) {
+    write_error(c, 400, "Bad Request", "bad_request",
+                "address must be even (68000 instruction alignment)");
+    return;
+  }
+
+  // Stash the address in shared-var slot 17 so the m68k VBL ISR can
+  // read it indirectly when RUNNER_ADV_CMD_JUMP arrives.
+  uint32_t base = (uint32_t)&__rom_in_ram_start__;
+  SET_SHARED_VAR(17 /* RUNNER_SVAR_ADV_JUMP_ADDR */, (uint32_t)addr,
+                 base, CHANDLER_SHARED_VARIABLES_OFFSET);
+
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  emul_recordRunnerCommand(RUNNER_LAST_JUMP, now_ms);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_ADV_CMD_JUMP);
+
+  char body[80];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"accepted\":true}\n");
+  if (n < 0) n = 0;
+  write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
+}
+
+// POST /api/v1/runner/adv/load — Epic 04 / S8.
+//
+// Streams an arbitrary blob from the workstation into m68k RAM
+// through the VBL ISR. Query params:
+//   address=<int>   target start address (decimal, 0xHEX or $HEX)
+//   size=<int>      optional cap; if absent or larger than the body,
+//                   the body's Content-Length wins. If smaller, we
+//                   take the first <size> body bytes and silently
+//                   drop the rest (cap-and-truncate).
+// Body: raw bytes (Content-Type ignored).
+//
+// Mechanism: drain the HTTP body into the APP_FREE chunk buffer
+// (RUNNER_ADV_LOAD_BUF, byte-pair-swapped so the m68k word reads
+// land native), 8 KB at a time. After each fill, publish chunk
+// target + length in shared-var slots 18/19, fire
+// RUNNER_ADV_CMD_LOAD_CHUNK, and spin chandler_loop until the m68k
+// VBL handler reports back via the chunk-ack flag. Per-chunk
+// timeout is 1 s — at 60 Hz the m68k typically responds in < 1
+// frame, but a wedged ST may need to be escaped with adv reset.
+//
+// Hard constraints:
+//   - VBL hook only (etv_timer's outer-rte trap layout differs;
+//     same restriction as adv jump).
+//   - Target must be even (m68k word-aligned writes).
+//   - Target range must lie above 0x800 (system area) and below
+//     the snapshot's phystop (writable RAM only).
+#define ADV_LOAD_CHUNK_SIZE   8192u
+#define ADV_LOAD_TIMEOUT_US   1000000
+
+static uint8_t *__not_in_flash_func(adv_load_buf_base)(void) {
+  // RUNNER_ADV_LOAD_BUF_OFFSET in runner.s. Mirrors at APP_FREE +
+  // 0x4000; APP_FREE is 46 KB so 0x4000..0x6000 (8 KB) is comfortably
+  // inside the arena and clear of the GEMDRIVE / Runner-meta block
+  // (which ends below 0x1A00).
+  return (uint8_t *)(runner_app_free_address() + 0x4000u);
+}
+
+// Byte-pair-swapped append: drop `n` bytes from `p` (starting at
+// pbuf offset `off`) into the chunk staging buffer, advancing the
+// per-chunk write cursor. When the cursor hits ADV_LOAD_CHUNK_SIZE,
+// dispatch the chunk and reset the cursor for the next one. The
+// final partial chunk (chunk_pos > 0 at end-of-content) is flushed
+// by adv_load_finish_ok().
+static void __not_in_flash_func(adv_load_drain_pbuf)(http_conn_t *c,
+                                                     struct pbuf *p,
+                                                     size_t off, size_t n) {
+  uint8_t *base = adv_load_buf_base();
+  // Walk pbuf segments to avoid an O(n) intermediate copy through
+  // pbuf_copy_partial. Same shape as pbuf_get_at, but we can't use
+  // that for spans — fall back to a tiny scratch loop.
+  size_t remaining = n;
+  size_t cursor = off;
+  while (remaining > 0) {
+    // Pull this segment's bytes one at a time. pbuf segments are
+    // typically MSS-sized (~1.4 KB) so this is at most a few
+    // thousand iterations per pbuf — well within VBL frame budget.
+    uint8_t b = pbuf_get_at(p, (u16_t)cursor);
+    base[(c->adv_load_chunk_pos) ^ 1u] = b;
+    c->adv_load_chunk_pos++;
+    c->adv_load_received++;
+    cursor++;
+    remaining--;
+    if (c->adv_load_chunk_pos >= ADV_LOAD_CHUNK_SIZE) {
+      // Buffer is full — dispatch and reset. If the dispatch fails
+      // (timeout) we leave the conn in a state where the recv path
+      // will keep draining bytes into nowhere; the response is
+      // already a 504 so the client sees the failure.
+      if (!adv_load_dispatch_chunk(c)) {
+        return;
+      }
+    }
+  }
+}
+
+// Publish (target, len) in shared-var slots 18/19, fire
+// RUNNER_ADV_CMD_LOAD_CHUNK, spin chandler_loop until the m68k's
+// VBL handler reports RUNNER_ADV_CMD_DONE_LOAD_CHUNK (via
+// runner_command_cb -> emul_recordRunnerAdvLoadAck), then advance
+// the destination cursor and reset the chunk cursor. Returns false
+// on per-chunk timeout (1 s).
+static bool __not_in_flash_func(adv_load_dispatch_chunk)(http_conn_t *c) {
+  uint32_t base = (uint32_t)&__rom_in_ram_start__;
+  uint32_t len = c->adv_load_chunk_pos;
+  if (len == 0) return true;
+  emul_clearRunnerAdvLoadAck();
+  SET_SHARED_VAR(18 /* SHARED_VAR_ADV_LOAD_TARGET */, c->adv_load_target,
+                 base, CHANDLER_SHARED_VARIABLES_OFFSET);
+  SET_SHARED_VAR(19 /* SHARED_VAR_ADV_LOAD_LEN */, len, base,
+                 CHANDLER_SHARED_VARIABLES_OFFSET);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_ADV_CMD_LOAD_CHUNK);
+  absolute_time_t deadline =
+      delayed_by_us(get_absolute_time(), ADV_LOAD_TIMEOUT_US);
+  while (!emul_isRunnerAdvLoadAcked()) {
+    chandler_loop();
+    if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+      DPRINTF("adv_load: chunk dispatch timed out at target=0x%lX len=%lu\n",
+              (unsigned long)c->adv_load_target, (unsigned long)len);
+      write_error(c, 504, "Gateway Timeout", "gateway_timeout",
+                  "Runner did not ack chunk within 1 s");
+      return false;
+    }
+  }
+  c->adv_load_target += len;
+  c->adv_load_chunk_pos = 0;
+  return true;
+}
+
+// End of body — flush the final partial chunk (if any) and send
+// the success envelope.
+static void __not_in_flash_func(adv_load_finish_ok)(http_conn_t *c) {
+  if (c->adv_load_chunk_pos > 0) {
+    if (!adv_load_dispatch_chunk(c)) {
+      return;
+    }
+  }
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  emul_recordRunnerCommand(RUNNER_LAST_LOAD, now_ms);
+  char body[160];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"loaded\":true,"
+                   "\"address\":%lu,\"bytes\":%lu}\n",
+                   (unsigned long)c->adv_load_start,
+                   (unsigned long)c->adv_load_total);
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
+// Validate everything, fire one synchronous meminfo to lock down the
+// RAM whitelist, set up streaming state, and consume the leftover
+// body bytes that arrived in the same TCP segment as the headers.
+// Returns false if any validation failed (an error response was
+// already written).
+static bool __not_in_flash_func(handle_runner_adv_load_init)(
+    http_conn_t *c, const char *body_start, size_t leftover) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return false;
+  }
+  if (emul_getRunnerAdvHookVector() != RUNNER_HOOK_VECTOR_VBL) {
+    write_error(c, 409, "Conflict", "wrong_hook",
+                "adv load requires the VBL hook ($70). Switch "
+                "ADV_HOOK_VECTOR to \"vbl\" in the setup menu.");
+    return false;
+  }
+  if (!c->has_content_length || c->content_length == 0) {
+    write_error(c, 411, "Length Required", "length_required",
+                "Content-Length required for streaming load");
+    return false;
+  }
+  if (c->content_length > HTTP_MAX_UPLOAD_BYTES) {
+    write_error(c, 413, "Payload Too Large", "payload_too_large",
+                "Body exceeds 4 MB upload cap");
+    return false;
+  }
+
+  // Parse query params. address required; size optional.
+  char addr_str[24] = {0};
+  if (!query_get(c->query, "address", addr_str, sizeof(addr_str)) ||
+      addr_str[0] == '\0') {
+    write_error(c, 400, "Bad Request", "bad_request",
+                "Missing required query param `address`");
+    return false;
+  }
+  char *endp = NULL;
+  unsigned long addr = strtoul(addr_str, &endp, 0);
+  if (endp == addr_str || (endp != NULL && *endp != '\0')) {
+    write_error(c, 400, "Bad Request", "bad_request",
+                "Could not parse `address` as integer");
+    return false;
+  }
+  if (addr > 0xFFFFFFul) {
+    write_error(c, 400, "Bad Request", "bad_request",
+                "address out of 24-bit range ($0..$FFFFFF)");
+    return false;
+  }
+  if ((addr & 1u) != 0) {
+    write_error(c, 400, "Bad Request", "bad_request",
+                "address must be even (m68k word alignment)");
+    return false;
+  }
+  // Final RAM whitelist check (snap.membot lower bound) lands after
+  // we've fetched a meminfo snapshot — see below.
+
+  uint32_t total = (uint32_t)c->content_length;
+  char size_str[24] = {0};
+  if (query_get(c->query, "size", size_str, sizeof(size_str)) &&
+      size_str[0] != '\0') {
+    char *send = NULL;
+    unsigned long sz = strtoul(size_str, &send, 0);
+    if (send == size_str || (send != NULL && *send != '\0')) {
+      write_error(c, 400, "Bad Request", "bad_request",
+                  "Could not parse `size` as integer");
+      return false;
+    }
+    if (sz == 0) {
+      write_error(c, 400, "Bad Request", "bad_request",
+                  "`size` must be > 0");
+      return false;
+    }
+    if ((uint32_t)sz < total) total = (uint32_t)sz;
+  }
+
+  // Lazy meminfo fetch — we need phystop to range-check the target.
+  // Skip the round-trip if a fresh-enough snapshot is already cached.
+  runner_meminfo_t snap;
+  if (!emul_isRunnerMeminfoReady() || !emul_getRunnerMeminfo(&snap)) {
+    uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+    emul_recordRunnerMeminfoSubmit(now_ms);
+    SEND_COMMAND_TO_DISPLAY(RUNNER_ADV_CMD_MEMINFO);
+    absolute_time_t deadline =
+        delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
+    while (!emul_isRunnerMeminfoReady()) {
+      chandler_loop();
+      if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+        runner_meminfo_t empty = {0};
+        uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+        emul_recordRunnerMeminfoDone(&empty, fail_ms);
+        write_error(c, 504, "Gateway Timeout", "gateway_timeout",
+                    "Runner did not respond to meminfo within 1 s");
+        return false;
+      }
+    }
+    if (!emul_getRunnerMeminfo(&snap)) {
+      write_error(c, 500, "Internal Server Error", "no_snapshot",
+                  "Runner meminfo round-trip returned no snapshot");
+      return false;
+    }
+  }
+
+  uint32_t end = (uint32_t)addr + total;
+  if (end < (uint32_t)addr || (uint32_t)addr < snap.membot ||
+      end > snap.phystop) {
+    char msg[112];
+    snprintf(msg, sizeof(msg),
+             "target range [%lu..%lu) outside RAM [%lu..%lu)",
+             (unsigned long)addr, (unsigned long)end,
+             (unsigned long)snap.membot, (unsigned long)snap.phystop);
+    write_error(c, 400, "Bad Request", "ram_overflow", msg);
+    return false;
+  }
+
+  c->adv_load_start = (uint32_t)addr;
+  c->adv_load_target = (uint32_t)addr;
+  c->adv_load_total = total;
+  c->adv_load_received = 0;
+  c->adv_load_chunk_pos = 0;
+
+  // Pump the leftover bytes that arrived in the same TCP segment as
+  // the headers directly into the chunk buffer. pbuf-free isn't
+  // available here (no pbuf to walk); instead loop byte-by-byte.
+  size_t pump = leftover;
+  if (pump > c->adv_load_total) pump = c->adv_load_total;
+  uint8_t *base = adv_load_buf_base();
+  for (size_t i = 0; i < pump; i++) {
+    base[c->adv_load_chunk_pos ^ 1u] = (uint8_t)body_start[i];
+    c->adv_load_chunk_pos++;
+    c->adv_load_received++;
+    if (c->adv_load_chunk_pos >= ADV_LOAD_CHUNK_SIZE) {
+      if (!adv_load_dispatch_chunk(c)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// POST /api/v1/runner/adv/meminfo — Epic 04 / S6.
+//
+// Same wire-format / chandler path as the foreground meminfo (the
+// m68k ships RUNNER_CMD_DONE_MEMINFO with the 24-byte struct, the
+// existing runner_command_cb records it via emul_recordRunnerMeminfoDone),
+// but the read happens inside the m68k VBL ISR rather than the
+// foreground poll loop — so it works against wedged programs the
+// foreground meminfo can't reach. Synchronous: spin on chandler_loop
+// until the snapshot lands, with a 1 s timeout.
+//
+// Intentionally skips the busy-lock gate — the busy state is what
+// we want to escape (a wedged Pexec'd program holds it set forever).
+static void __not_in_flash_func(handle_runner_adv_meminfo)(http_conn_t *c) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return;
+  }
+
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  emul_recordRunnerMeminfoSubmit(now_ms);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_ADV_CMD_MEMINFO);
+
+  absolute_time_t deadline =
+      delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
+  while (!emul_isRunnerMeminfoReady()) {
+    chandler_loop();
+    if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+      uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+      runner_meminfo_t empty = {0};
+      emul_recordRunnerMeminfoDone(&empty, fail_ms);
+      write_error(c, 504, "Gateway Timeout", "gateway_timeout",
+                  "Runner did not respond within 1 s");
+      return;
+    }
+  }
+
+  runner_meminfo_t snap;
+  if (!emul_getRunnerMeminfo(&snap)) {
+    write_error(c, 500, "Internal Server Error", "no_snapshot",
+                "Runner returned but no snapshot recorded");
+    return;
+  }
+
+  bool decoded = (snap.bank0_kb != 0) || (snap.bank1_kb != 0);
+  char body[400];
+  int n = snprintf(
+      body, sizeof(body),
+      "{\"ok\":true,"
+      "\"membottom\":%lu,\"memtop\":%lu,\"phystop\":%lu,"
+      "\"screenmem\":%lu,\"basepage\":%lu,"
+      "\"bank0_kb\":%u,\"bank1_kb\":%u,\"decoded\":%s}\n",
+      (unsigned long)snap.membot, (unsigned long)snap.memtop,
+      (unsigned long)snap.phystop, (unsigned long)snap.screenmem,
+      (unsigned long)snap.basepage,
+      (unsigned)snap.bank0_kb, (unsigned)snap.bank1_kb,
+      decoded ? "true" : "false");
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
+// GET /api/v1/runner/adv — Epic 04 / S1+S4.
+//
+// Reports whether the m68k Runner has installed its Advanced Runner
+// hook, and which vector it landed on ("vbl" at $70 or "etv_timer"
+// at $400 — chosen via the ACONFIG_PARAM_ADV_HOOK_VECTOR setting in
+// the setup menu). The flag and vector ID arrive together in the
+// HELLO payload; both clear on emul_resetRunnerSession.
+static void __not_in_flash_func(handle_runner_adv_status)(http_conn_t *c) {
+  bool active = emul_isRunnerActive();
+  bool installed = active && emul_isRunnerAdvancedInstalled();
+  uint8_t vec = installed ? emul_getRunnerAdvHookVector()
+                          : RUNNER_HOOK_VECTOR_UNKNOWN;
+  const char *vec_str;
+  switch (vec) {
+    case RUNNER_HOOK_VECTOR_VBL:       vec_str = "vbl"; break;
+    case RUNNER_HOOK_VECTOR_ETV_TIMER: vec_str = "etv_timer"; break;
+    default:                           vec_str = "unknown"; break;
+  }
+  char body[128];
+  int n = snprintf(
+      body, sizeof(body),
+      "{\"ok\":true,\"active\":%s,\"installed\":%s,\"hook_vector\":\"%s\"}\n",
+      active ? "true" : "false",
+      installed ? "true" : "false",
+      vec_str);
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
 // GET /api/v1/runner/meminfo — Epic 03 / S6.
 //
 // Synchronous: writes RUNNER_CMD_MEMINFO to the cartridge sentinel,
@@ -1716,14 +2231,20 @@ static void __not_in_flash_func(handle_runner_meminfo)(http_conn_t *c) {
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
-// POST /api/v1/runner/reset — Epic 03 / S2.
+// POST /api/v1/runner/reset — Epic 03 / S2, rewired in Epic 04 / S5.
 //
-// Fire-and-forget: writes RUNNER_CMD_RESET into the cartridge
-// sentinel; the m68k Runner's poll loop sees it and cold-resets the
-// machine. The Runner can't reply (the machine is rebooting), so the
-// RP records last_command=RESET locally and answers 202 Accepted
-// immediately. If Runner mode wasn't selected at boot, return
-// 409 runner_inactive.
+// Fire-and-forget. Writes RUNNER_ADV_CMD_RESET into the cartridge
+// sentinel; the m68k Runner's VBL hook (installed at $70 or $400
+// per the ACONFIG_PARAM_ADV_HOOK_VECTOR aconfig setting) sees it
+// from inside the ISR and jumps through the reset vector at $4.w.
+// This replaced the previous foreground RUNNER_CMD_RESET dispatch
+// because the VBL path also escapes wedged programs (infinite
+// loops, bombs already painted) that the foreground poll loop
+// can't reach.
+//
+// Intentionally no busy-lock gate — the busy state is exactly what
+// we want to escape. 409 runner_inactive when the user hasn't
+// picked [U] at boot.
 static void __not_in_flash_func(handle_runner_reset)(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
@@ -1732,7 +2253,7 @@ static void __not_in_flash_func(handle_runner_reset)(http_conn_t *c) {
   }
   uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
   emul_recordRunnerCommand(RUNNER_LAST_RESET, now_ms);
-  SEND_COMMAND_TO_DISPLAY(RUNNER_CMD_RESET);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_ADV_CMD_RESET);
   // Schedule the auto-relaunch into Runner mode once the ST has
   // had time to cold-boot back to its CA_INIT polling loop. 3 s is
   // generous; TOS typically reaches CA_INIT well within 1.5 s. This
@@ -3197,6 +3718,38 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
         return;
       }
       write_405(c, "GET");
+      return;
+    }
+    if (strcmp(action, "adv") == 0) {
+      if (c->method == HM_GET || c->method == HM_HEAD) {
+        handle_runner_adv_status(c);
+        return;
+      }
+      write_405(c, "GET");
+      return;
+    }
+    if (strcmp(action, "adv/meminfo") == 0) {
+      if (c->method == HM_POST) {
+        handle_runner_adv_meminfo(c);
+        return;
+      }
+      write_405(c, "POST");
+      return;
+    }
+    if (strcmp(action, "adv/jump") == 0) {
+      if (c->method == HM_POST) {
+        handle_runner_adv_jump(c);
+        return;
+      }
+      write_405(c, "POST");
+      return;
+    }
+    if (strcmp(action, "adv/load") == 0) {
+      // Streaming POST is handled in parse_and_dispatch via the
+      // special-case before HC_READ_BODY; reaching this branch means
+      // the request used the wrong method (the streaming path bypasses
+      // the route table entirely for HM_POST).
+      write_405(c, "POST");
       return;
     }
     write_error(c, 404, "Not Found", "not_found", "Route not found");

@@ -48,11 +48,51 @@
 // (CHANDLER_CMD_SENTINEL_OFFSET) to dispatch a command; the Runner's
 // poll loop reads and acts on it.
 #define APP_RUNNER 0x0500
-#define RUNNER_CMD_RESET (APP_RUNNER + 0x01)    // cold reset
+// Note: APP_RUNNER + 0x01 was the foreground RUNNER_CMD_RESET; retired
+// in Epic 04 / S5 in favour of RUNNER_ADV_CMD_RESET (VBL-driven). Slot
+// kept reserved so future stories don't reuse it accidentally.
 #define RUNNER_CMD_EXECUTE (APP_RUNNER + 0x02)  // Pexec mode 0
 #define RUNNER_CMD_CD (APP_RUNNER + 0x03)       // Dsetpath
 #define RUNNER_CMD_RES (APP_RUNNER + 0x04)      // XBIOS Setscreen
 #define RUNNER_CMD_MEMINFO (APP_RUNNER + 0x05)  // system memory snapshot
+
+// Epic 04 — Advanced Runner. Commands in this range are dispatched
+// by the m68k's VBL ISR (installed at $70 by runner_post_reloc) so
+// they keep working when the foreground poll loop is wedged. The
+// existing $05xx foreground range is unaffected — the poll loop's
+// cmp.l cascade only matches $05xx codes, so $06xx values fall
+// through to the VBL handler.
+#define APP_RUNNER_VBL 0x0600
+#define RUNNER_ADV_CMD_RESET (APP_RUNNER_VBL + 0x01)    // forced cold reset
+// 0x02 reserved.
+#define RUNNER_ADV_CMD_MEMINFO (APP_RUNNER_VBL + 0x03)  // meminfo from inside the ISR
+#define RUNNER_ADV_CMD_JUMP (APP_RUNNER_VBL + 0x04)     // rte to user-supplied address
+#define RUNNER_ADV_CMD_LOAD_CHUNK \
+  (APP_RUNNER_VBL + 0x05)  // copy 8 KB chunk from APP_FREE → m68k RAM
+
+// m68k -> RP report commands for the VBL command range. $0680+ to
+// keep the receiver path unambiguous (RP -> m68k uses $06xx without
+// the $80 bit set).
+#define APP_RUNNER_VBL_DONE 0x0680
+#define RUNNER_ADV_CMD_DONE_JUMP \
+  (APP_RUNNER_VBL_DONE + 0x00)  // no payload — RP clears sentinel
+#define RUNNER_ADV_CMD_DONE_LOAD_CHUNK \
+  (APP_RUNNER_VBL_DONE + 0x01)  // no payload — RP clears + advances
+
+// Shared-variable slot 16 — Advanced Runner hook vector address.
+// RP publishes the resolved address ($70 for VBL, $400 for
+// etv_timer) at HELLO time based on the ACONFIG_PARAM_ADV_HOOK_VECTOR
+// aconfig setting; m68k's runner_post_reloc reads it to know where
+// to install adv_hook_handler. Slots 0..15 are claimed by chandler
+// framework + GEMDRIVE; 16 is the first runner-claimed slot.
+#define RUNNER_SVAR_ADV_HOOK_VECTOR 16
+
+// Hook vector identifiers used in the HELLO payload byte and in the
+// JSON envelope for GET /api/v1/runner/adv. 0xFF reserved for
+// "unknown" (m68k didn't report — older firmware or no HELLO yet).
+#define RUNNER_HOOK_VECTOR_VBL 0
+#define RUNNER_HOOK_VECTOR_ETV_TIMER 1
+#define RUNNER_HOOK_VECTOR_UNKNOWN 0xFF
 
 // m68k -> RP report commands (sent via send_sync from the Runner).
 // High bit set so they don't collide with the RP -> m68k sentinel
@@ -76,6 +116,8 @@ typedef enum {
   RUNNER_LAST_CD = 3,
   RUNNER_LAST_RES = 4,
   RUNNER_LAST_MEMINFO = 5,
+  RUNNER_LAST_JUMP = 6,
+  RUNNER_LAST_LOAD = 7,
 } runner_last_command_t;
 
 // Snapshot returned by RUNNER_CMD_MEMINFO. Mirrors the 24-byte

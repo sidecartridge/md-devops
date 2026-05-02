@@ -24,6 +24,7 @@
 #include "emul.h"
 #include "ff.h"
 #include "memfunc.h"
+#include "runner.h"
 #include "settings.h"
 #include "tprotocol.h"
 
@@ -1379,6 +1380,17 @@ void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
   SET_SHARED_VAR(GEMDRIVE_SVAR_RELOC_ADDR, effectiveReloc, base,
                  CHANDLER_SHARED_VARIABLES_OFFSET);
   SET_SHARED_VAR(GEMDRIVE_SVAR_MEMTOP, effectiveMemtop, base,
+                 CHANDLER_SHARED_VARIABLES_OFFSET);
+
+  // Epic 04 / S4 — publish the Advanced Runner hook vector address
+  // resolved from aconfig. m68k's runner_post_reloc reads this slot
+  // and writes adv_hook_handler into the chosen vector. "etv_timer"
+  // is the default; anything else (or unset) falls back to VBL.
+  const char *advHookCfg =
+      aconfigString(ACONFIG_PARAM_ADV_HOOK_VECTOR, "etv_timer");
+  uint32_t advHookAddr =
+      (strcmp(advHookCfg, "vbl") == 0) ? 0x70u : 0x400u;
+  SET_SHARED_VAR(RUNNER_SVAR_ADV_HOOK_VECTOR, advHookAddr, base,
                  CHANDLER_SHARED_VARIABLES_OFFSET);
 
   char letter = resolveDriveLetter();
