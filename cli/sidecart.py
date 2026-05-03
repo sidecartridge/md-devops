@@ -660,6 +660,36 @@ def cmd_runner_adv_status(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_debug_status(args: argparse.Namespace) -> int:
+    """GET /api/v1/debug — fast-debug-traces diagnostics (Epic 05 v2)."""
+    url = base_url(args.host) + "/api/v1/debug"
+    try:
+        status, parsed, raw = request_json("GET", url)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200 or parsed is None or parsed.get("ok") is not True:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        json.dump(parsed, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return EXIT_OK
+    if args.quiet:
+        return EXIT_OK
+
+    fw = parsed.get("firmware_mode", False)
+    used = parsed.get("ring_used", 0)
+    cap = parsed.get("ring_capacity", 0)
+    dropped = parsed.get("bytes_dropped", 0)
+    print(f"firmware_mode  : {'yes' if fw else 'no'}")
+    print(f"ring           : {used} / {cap} bytes")
+    print(f"bytes_dropped  : {dropped}")
+    return EXIT_OK
+
+
 def cmd_runner_meminfo(args: argparse.Namespace) -> int:
     """GET /api/v1/runner/meminfo — synchronous system memory snapshot."""
     url = base_url(args.host) + "/api/v1/runner/meminfo"
@@ -1076,6 +1106,15 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Command-line arguments (joined with spaces, ≤127 chars). "
                             "Everything after REMOTE is captured verbatim, including "
                             "leading dashes — no need for --.")
+
+    debug = sub.add_parser(
+        "debug",
+        help="Fast-debug-traces (Epic 05) diagnostics + transports.")
+    debug_sub = debug.add_subparsers(dest="debug_cmd", required=True)
+    debug_sub.add_parser(
+        "status",
+        help="Show whether firmware mode has committed and the "
+             "current debug-byte ring occupancy / drop count.")
     return p
 
 
@@ -1120,6 +1159,15 @@ def main(argv: list[str] | None = None) -> int:
         handler = runner_handlers.get(args.runner_cmd)
         if handler is None:
             parser.error(f"unknown runner subcommand: {args.runner_cmd}")
+            return EXIT_USAGE
+        return handler(args)
+    if args.cmd == "debug":
+        debug_handlers = {
+            "status": cmd_debug_status,
+        }
+        handler = debug_handlers.get(args.debug_cmd)
+        if handler is None:
+            parser.error(f"unknown debug subcommand: {args.debug_cmd}")
             return EXIT_USAGE
         return handler(args)
     handler = handlers.get(args.cmd)

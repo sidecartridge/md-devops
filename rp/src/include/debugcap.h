@@ -29,6 +29,15 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+// Ring size — must be a power of 2 (the producer/consumer cursors
+// wrap by mask, so size & (size-1) == 0 is required). 256 absorbs
+// HELLODBG.TOS's full 14000-byte burst with margin and lets a
+// slow-drain consumer (DPRINTF on UART) catch up over a few
+// iterations of the menu poll loop without dropping bytes.
+//
+// Note: this lives in BSS as a plain static array (no alignment
+// requirement, no DMA), so the +3.8 KB vs the previous 256-byte
+// ring is purely a static-allocation cost — no linker rearrangement.
 #define DEBUGCAP_RING_BYTES 256
 
 /**

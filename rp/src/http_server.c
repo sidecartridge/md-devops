@@ -10,6 +10,7 @@
 #include "aconfig.h"
 #include "chandler.h"
 #include "debug.h"
+#include "debugcap.h"
 #include "display.h"
 #include "emul.h"
 #include "ff.h"
@@ -2161,6 +2162,39 @@ static void __not_in_flash_func(handle_runner_adv_status)(http_conn_t *c) {
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
+// GET /api/v1/debug — Epic 05 v2 / S3.
+//
+// Diagnostics envelope for the fast-debug-traces feature:
+//   {
+//     "ok": true,
+//     "firmware_mode": <bool>,        // emul_isFirmwareMode()
+//     "ring_used": <bytes pending drain>,
+//     "ring_capacity": <ring size>,
+//     "bytes_dropped": <cumulative emits lost to ring-full>
+//   }
+//
+// In v2 this stays purely informational — no transport state is
+// exposed. Future stories add /api/v1/debug/log (chunked stream)
+// for actual byte exfiltration.
+static void __not_in_flash_func(handle_debug_status)(http_conn_t *c) {
+  uint32_t ring_used = 0;
+  uint32_t ring_capacity = 0;
+  uint32_t bytes_dropped = 0;
+  debugcap_getRingStats(&ring_used, &ring_capacity, &bytes_dropped);
+
+  char body[160];
+  int n = snprintf(
+      body, sizeof(body),
+      "{\"ok\":true,\"firmware_mode\":%s,"
+      "\"ring_used\":%lu,\"ring_capacity\":%lu,\"bytes_dropped\":%lu}\n",
+      emul_isFirmwareMode() ? "true" : "false",
+      (unsigned long)ring_used,
+      (unsigned long)ring_capacity,
+      (unsigned long)bytes_dropped);
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
 // GET /api/v1/runner/meminfo — Epic 03 / S6.
 //
 // Synchronous: writes RUNNER_CMD_MEMINFO to the cartridge sentinel,
@@ -3547,6 +3581,7 @@ static const route_t g_routes[] = {
     {"/api/v1/volume", M_GET | M_HEAD, handle_volume},
     {"/api/v1/files", M_GET | M_HEAD, handle_files_list},
     {"/api/v1/runner", M_GET | M_HEAD, handle_runner_status},
+    {"/api/v1/debug", M_GET | M_HEAD, handle_debug_status},
 };
 
 #define ROUTES_COUNT (sizeof(g_routes) / sizeof(g_routes[0]))

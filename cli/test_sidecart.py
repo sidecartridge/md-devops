@@ -1241,6 +1241,66 @@ class RunnerAdvLoadTests(unittest.TestCase):
         self.assertIn("wrong_hook", err)
 
 
+class DebugStatusTests(unittest.TestCase):
+    """Epic 05 v2 / S3 — `sidecart debug status`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_debug_status_human(self) -> None:
+        self._set_response(200, {
+            "ok": True,
+            "firmware_mode": False,
+            "ring_used": 0,
+            "ring_capacity": 256,
+            "bytes_dropped": 0,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "debug", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "GET")
+        self.assertEqual(self.server.state.last_path, "/api/v1/debug")
+        self.assertIn("firmware_mode", out)
+        self.assertIn("256", out)
+
+    def test_debug_status_firmware_mode_yes(self) -> None:
+        self._set_response(200, {
+            "ok": True,
+            "firmware_mode": True,
+            "ring_used": 42,
+            "ring_capacity": 256,
+            "bytes_dropped": 7,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "debug", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("yes", out)
+        self.assertIn("42 / 256", out)
+        self.assertIn("7", out)
+
+    def test_debug_status_json(self) -> None:
+        self._set_response(200, {
+            "ok": True,
+            "firmware_mode": False,
+            "ring_used": 0,
+            "ring_capacity": 256,
+            "bytes_dropped": 0,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "--json", "debug", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        parsed = json.loads(out.strip())
+        self.assertEqual(parsed["ring_capacity"], 256)
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:
