@@ -108,6 +108,7 @@ target_sources(${PROJECT_NAME} PRIVATE
         blink.c
         chandler.c
         commemul.c
+        debugcap.c
         display.c
         display_term.c
         download.c

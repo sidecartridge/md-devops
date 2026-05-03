@@ -239,4 +239,23 @@ void emul_onGemdriveHello(void);
  */
 void emul_scheduleRunnerRelaunch(uint32_t at_ms);
 
+/**
+ * @brief Commit the firmware-mode transition (Epic 05 v2). Called
+ *        from the menu code paths right before they hand control
+ *        off — the user picked [U] / [E] / [F]. Idempotent and
+ *        one-way: subsequent calls are no-ops.
+ *
+ *        The chandler ingest filter uses this flag to gate
+ *        debug-byte capture: pre-firmware-mode emits get dropped
+ *        at the handler so menu-mode noise doesn't pollute the
+ *        diagnostic stream.
+ */
+void emul_enterFirmwareMode(void);
+
+/**
+ * @brief Whether emul_enterFirmwareMode() has been called this
+ *        session.
+ */
+bool emul_isFirmwareMode(void);
+
 #endif  // EMUL_H

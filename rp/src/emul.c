@@ -19,6 +19,7 @@
 #include "aconfig.h"
 #include "chandler.h"
 #include "commemul.h"
+#include "debugcap.h"
 #include "constants.h"
 #include "debug.h"
 #include "display.h"
@@ -365,6 +366,28 @@ void emul_onGemdriveHello(void) {
 
 void emul_scheduleRunnerRelaunch(uint32_t at_ms) {
   runnerRelaunchAtMs = at_ms;
+}
+
+// Epic 05 v2 — firmware-mode flag.
+//
+// One-way: only a hardware reset clears it. Used by the chandler
+// ingest filter (chandler.c) to gate debug-byte capture: pre-menu
+// emits get dropped at the handler so menu-mode noise doesn't
+// pollute the diagnostic stream.
+static bool firmwareModeActive = false;
+
+void emul_enterFirmwareMode(void) {
+  if (firmwareModeActive) {
+    return;  // idempotent
+  }
+  firmwareModeActive = true;
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  DPRINTF("emul: firmware mode committed at %lu ms\n",
+          (unsigned long)now_ms);
+}
+
+bool emul_isFirmwareMode(void) {
+  return firmwareModeActive;
 }
 
 // Boot countdown — auto-launches GEMDRIVE on the Atari ST when it hits 0.
@@ -804,6 +827,9 @@ void cmdExit(const char *arg) {
   showTitle();
   term_printString("\n\n");
   term_printString("Launching DevOps on the Atari ST...\n");
+  // Epic 05 v2 — commit firmware mode (debug-byte filter starts
+  // accepting captures from this point on).
+  emul_enterFirmwareMode();
   SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START);
 }
 
@@ -812,6 +838,10 @@ void cmdFirmware(const char *arg) {
   haltCountdown = true;
   menuScreenActive = false;
   term_printString("Launching DevOps on the Atari ST...\n");
+  // Epic 05 v2 — commit firmware mode. This site also covers the
+  // boot-countdown auto-launch path, which calls cmdFirmware when
+  // the timer hits zero.
+  emul_enterFirmwareMode();
   // CMD_START is the cartridge sentinel that GEMDRIVE polls during
   // pre_auto; receiving it makes the m68k jump into the GEMDRIVE blob.
   SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START);
@@ -833,6 +863,9 @@ void cmdRunner(const char *arg) {
   // "active": true even though the m68k Runner can't write a
   // handshake into the read-only cartridge area.
   runnerActive = true;
+  // Epic 05 v2 — commit firmware mode (enables the debug-byte
+  // capture filter for the rest of the session).
+  emul_enterFirmwareMode();
   SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START_RUNNER);
 }
 
@@ -1412,6 +1445,13 @@ void emul_start() {
 #endif
     // Drain the ROM3 command ring → dispatch to registered callbacks.
     chandler_loop();
+
+    // Drain any debug bytes that the chandler ingest filter has
+    // emitted into the debug-byte ring (Epic 05 v2 / S1). DPRINTFs
+    // them to the RP console. No-op when firmware mode hasn't
+    // committed (filter drops emits at the source) or the ring
+    // is empty.
+    debugcap_drainToConsole();
 
     // Run the terminal foreground (consume the published command, render
     // output, etc.).
