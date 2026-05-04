@@ -76,7 +76,11 @@ void __not_in_flash_func(usbcdc_drain)(void) {
   if (avail == 0) {
     return;
   }
-  uint8_t buf[64];
+  // 512 B drain batch (Epic 05 v2 / S8). Sized to absorb a single
+  // HELLODBG-style chunk in one tud_cdc_write call; smaller than
+  // CFG_TUD_CDC_TX_BUFSIZE (1024) so we don't try to push more
+  // than the FIFO can hold and lose the tail.
+  uint8_t buf[512];
   uint32_t want = (avail < sizeof(buf)) ? avail : (uint32_t)sizeof(buf);
   uint32_t take = debugcap_cursor_pull(&g_usbcdcCursor, buf, want);
   if (take == 0) {

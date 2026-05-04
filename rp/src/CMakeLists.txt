@@ -256,6 +256,18 @@ add_definitions(-DDISPLAY_ATARIST)
 # We don't modify the flash in Core 1
 add_definitions(-DPICO_FLASH_ASSUME_CORE0_SAFE=1)
 
+# TinyUSB CDC TX FIFO sizing (Epic 05 v2 / S8). pico-sdk's
+# tusb_config.h leaves the FS default at 64 bytes — far too tight
+# for HELLODBG-style debug bursts, which fill the FIFO faster than
+# tud_task can hand bytes to the USB core, causing the producer
+# ring to wrap and usbcdc_dropped to grow during attached sessions.
+# 1024 B kills the in-session drops at a ~960 B BSS cost.
+# RX is left at the FS default (64) — debugcap is one-way, host →
+# device traffic isn't part of this contract. EP size stays at
+# the FS bulk hard limit (64) — bumping it past 64 on FS is
+# undefined behaviour.
+add_definitions(-DCFG_TUD_CDC_TX_BUFSIZE=1024)
+
 # Select HTTPS or HTTP downloads of the firmware
 add_definitions(-DAPP_DOWNLOAD_HTTPS=0)
 
