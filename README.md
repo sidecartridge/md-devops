@@ -15,7 +15,7 @@ floppies, ACSI), the sister app
 [md-drives-emulator](https://github.com/sidecartridge/md-drives-emulator)
 is what you want. **md-devops** is the developer-focused variant
 of that surface — same drive emulation, plus the runner / debug /
-HTTP-management story stitched on top.
+HTTP-management surface stitched on top.
 
 ## Highlights
 
@@ -480,8 +480,8 @@ The surface splits into three behavioural buckets:
 
 Note that `runner reset` lives at `/api/v1/runner/reset` (no
 `/adv/`) for historical reasons but mechanically belongs in the
-VBL bucket — Epic 04 rewired it from the foreground poll loop
-to the VBL ISR exactly so it could escape wedged programs.
+VBL bucket — it was deliberately wired to the VBL ISR rather
+than the foreground poll loop so it can escape wedged programs.
 
 ### `runner status` — show Runner state
 
