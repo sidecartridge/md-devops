@@ -37,6 +37,7 @@
 #include "select.h"
 #include "target_firmware.h"  // Include the target firmware binary
 #include "term.h"
+#include "usbcdc.h"
 
 #define SLEEP_LOOP_MS 100
 
@@ -400,6 +401,7 @@ static absolute_time_t lastCountdownTick;
 // alive during multi-second WiFi operations.
 static void __not_in_flash_func(emul_pollTick)(void) {
   chandler_loop();
+  usbcdc_drain();
   term_loop();
 }
 
@@ -1198,6 +1200,12 @@ static void init(void) {
 }
 
 void emul_start() {
+  // Bring up the USB CDC sink for the debugcap ring (Epic 05 v2 / S5).
+  // Idempotent stdio_init_all + detaches stdio from CDC so DPRINTF
+  // stays UART-only and the CDC interface is the dedicated raw-byte
+  // channel for captured debug bytes.
+  usbcdc_init();
+
   // The anatomy of an app or microfirmware is as follows:
   // - The driver code running in the remote device (the computer)
   // - the driver code running in the host device (the rp2040/rp2350)
@@ -1444,6 +1452,11 @@ void emul_start() {
 #endif
     // Drain the ROM3 command ring → dispatch to registered callbacks.
     chandler_loop();
+
+    // Pump pending debug bytes out the USB CDC interface
+    // (Epic 05 v2 / S5). Cheap when no host is attached or the
+    // debugcap ring is empty.
+    usbcdc_drain();
 
     // Run the terminal foreground (consume the published command, render
     // output, etc.).
