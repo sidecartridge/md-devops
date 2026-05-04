@@ -1071,10 +1071,10 @@ static void __not_in_flash_func(menu)(void) {
   const char *advHookValue =
       (advHookEntry != NULL && advHookEntry->value[0] != '\0')
           ? advHookEntry->value
-          : "etv_timer";
-  const char *advHookDisplay = (strcmp(advHookValue, "vbl") == 0)
-                                   ? "vbl ($70)"
-                                   : "etv_timer ($400)";
+          : "vbl";
+  const char *advHookDisplay = (strcmp(advHookValue, "etv_timer") == 0)
+                                   ? "etv_timer ($400)"
+                                   : "vbl ($70)";
   term_printString("Adv [V]ector\n");
   term_printString("  Hook        : ");
   term_printString(advHookDisplay);
@@ -1383,9 +1383,9 @@ void cmdAdvHookVector(const char *arg) {
       aconfig_getContext(), ACONFIG_PARAM_ADV_HOOK_VECTOR);
   const char *current = (entry != NULL && entry->value[0] != '\0')
                             ? entry->value
-                            : "etv_timer";
+                            : "vbl";
   const char *next =
-      (strcmp(current, "vbl") == 0) ? "etv_timer" : "vbl";
+      (strcmp(current, "etv_timer") == 0) ? "vbl" : "etv_timer";
   settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ADV_HOOK_VECTOR,
                       next);
   settings_save(aconfig_getContext(), true);

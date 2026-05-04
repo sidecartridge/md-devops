@@ -105,7 +105,7 @@ GEMDRIVE                                   💾
   Mem[t]op    : auto (matches reloc)
 
 Adv [V]ector                               ⚙
-  Hook        : etv_timer ($400)
+  Hook        : vbl ($70)
 
 API Endpoint                               📶
   URL         : http://sidecart.local/
@@ -131,12 +131,15 @@ Select an option: ▌
 ### Picking a hook vector
 
 The `[V]` setting controls where the Advanced Runner installs
-its m68k-side ISR. The two choices have meaningfully different
-behaviour:
+its m68k-side ISR. The default is `vbl ($70)` — the full
+Advanced Runner feature set is only available on this vector.
+`etv_timer ($400)` is an opt-in alternative for callers who
+need to ride downstream of TOS' VBL chain.
 
-**`vbl ($70)`** — the 68000's hardware vertical-blank exception
-vector. Fires every video frame (50 Hz PAL / 60 Hz NTSC) directly
-from the CPU, *before* TOS dispatches its own VBL chain.
+**`vbl ($70)` — the default.** The 68000's hardware
+vertical-blank exception vector. Fires every video frame
+(50 Hz PAL / 60 Hz NTSC) directly from the CPU, *before* TOS
+dispatches its own VBL chain.
 
 - ✅ Standard m68k exception trap frame on the supervisor stack —
   saved PC and SR are at known offsets, so the firmware can
@@ -151,12 +154,11 @@ from the CPU, *before* TOS dispatches its own VBL chain.
   handler will replace ours on the spot. The Advanced Runner
   goes silent until the program restores the vector.
 
-**`etv_timer ($400)`** — TOS' documented "extension hook" that
-gets called from *inside* TOS' VBL handler chain, after TOS has
-finished its own bookkeeping (cursor blink, keyboard sweep,
-mouse, ACIA). Programs that want a periodic background task
-without disrupting TOS install themselves here — it's the
-"polite" place.
+**`etv_timer ($400)` — opt-in alternative.** TOS' documented
+"extension hook" that gets called from *inside* TOS' VBL handler
+chain, after TOS has finished its own bookkeeping (cursor blink,
+keyboard sweep, mouse, ACIA). Programs that want a periodic
+background task without disrupting TOS install themselves here.
 
 - ✅ Cooperates with TOS' own VBL discipline. Less likely to
   interfere with anything TOS-aware running in the background.
@@ -172,14 +174,8 @@ without disrupting TOS install themselves here — it's the
 `runner adv meminfo` and `runner reset` work on **either**
 vector (they don't need to patch a return address — they just
 need the ISR to fire periodically). `runner adv jump` and
-`runner adv load` need `vbl ($70)` specifically.
-
-**Rule of thumb:** keep the default `etv_timer ($400)` for
-running normal TOS programs that respect TOS conventions.
-Switch to `vbl ($70)` when you need `runner adv jump` /
-`runner adv load` (debugger-style code injection), when you're
-debugging programs that bypass TOS' VBL chain entirely, or
-when a program is suspected of hijacking `etv_timer`.
+`runner adv load` need `vbl ($70)` specifically, which is why
+that's the default.
 
 ## 🌐 Remote HTTP Management API + the `sidecart.py` CLI
 
