@@ -21,6 +21,13 @@
  *
  * Pre-firmware-mode emits are dropped at the handler so menu-mode
  * activity doesn't pollute the diagnostic stream.
+ *
+ * Multi-consumer model (Epic 05 v2 / S4): the producer always
+ * writes to the ring; consumers each keep their own
+ * (read_pos, dropped) cursor and drain independently. A consumer
+ * that lags by more than DEBUGCAP_RING_BYTES jumps its read_pos
+ * forward to the oldest still-valid byte and increments its
+ * per-cursor drop count.
  */
 
 #ifndef DEBUGCAP_H
@@ -30,15 +37,52 @@
 #include <stdint.h>
 
 // Ring size — must be a power of 2 (the producer/consumer cursors
-// wrap by mask, so size & (size-1) == 0 is required). 256 absorbs
-// HELLODBG.TOS's full 14000-byte burst with margin and lets a
-// slow-drain consumer (DPRINTF on UART) catch up over a few
-// iterations of the menu poll loop without dropping bytes.
+// wrap by mask, so size & (size-1) == 0 is required). 8 KB lets
+// HELLODBG-style bursts (~14 KB) ride out a slow consumer for
+// most of a burst before per-cursor drops kick in, and matches
+// the commemul ring's order of magnitude so neither stage is the
+// obvious bottleneck.
 //
 // Note: this lives in BSS as a plain static array (no alignment
-// requirement, no DMA), so the +3.8 KB vs the previous 256-byte
-// ring is purely a static-allocation cost — no linker rearrangement.
-#define DEBUGCAP_RING_BYTES 256
+// requirement, no DMA), so the size is purely a static-allocation
+// cost — no linker rearrangement.
+#define DEBUGCAP_RING_BYTES 8192
+
+/**
+ * @brief Per-consumer cursor over the debug ring. Each independent
+ *        consumer (DPRINTF drainer, HTTP /api/v1/debug/log streamer,
+ *        future USB CDC sink) holds one of these. The producer is
+ *        oblivious to consumer count — it just writes.
+ *
+ *        Initialise with debugcap_cursor_initSnapshot to start
+ *        at the "now" position (the consumer sees only bytes
+ *        emitted from this point forward).
+ */
+typedef struct debugcap_cursor {
+  uint32_t read_pos;  // bytes-since-boot; difference vs producer's
+                      // write_pos is the cursor's pending data.
+  uint32_t dropped;   // bytes lost because the producer wrapped
+                      // past this cursor before it could read.
+} debugcap_cursor_t;
+
+/**
+ * @brief Initialise a cursor at the current producer write
+ *        position. The consumer will see only bytes emitted
+ *        AFTER this call returns.
+ */
+void debugcap_cursor_initSnapshot(debugcap_cursor_t *cur);
+
+/**
+ * @brief Pull up to `max_bytes` from the cursor into `out`, in
+ *        emit order. Advances the cursor. Returns the number of
+ *        bytes actually copied (0 if no new data, or if `cur` /
+ *        `out` are NULL). If the producer has wrapped past this
+ *        cursor since the last call, the cursor jumps to the
+ *        oldest still-valid byte and `cur->dropped` is
+ *        incremented by the count of skipped bytes.
+ */
+uint32_t debugcap_cursor_pull(debugcap_cursor_t *cur, uint8_t *out,
+                              uint32_t max_bytes);
 
 /**
  * @brief Append one debug byte to the ring. Called by the
@@ -50,20 +94,19 @@
 void debugcap_emit(uint8_t b);
 
 /**
- * @brief Drain any new bytes from the ring and emit them to the
- *        RP console via DPRINTF, then advance the consumer
- *        cursor. Intended to be called from a polling loop on
- *        Core 0 (the menu/idle loop in emul_start). Cheap when
- *        the ring is empty (just two-word comparison).
- */
-void debugcap_drainToConsole(void);
-
-/**
  * @brief Read out current ring statistics. All three fields may
- *        be NULL (skipped). `used` = bytes captured but not yet
- *        drained; `capacity` = ring size; `dropped` = cumulative
- *        count of bytes lost because the ring was full at the
- *        moment of an emit.
+ *        be NULL (skipped). The producer never drops — it just
+ *        overwrites — so `dropped` here always reads 0 and is
+ *        retained only for envelope-shape compatibility with the
+ *        diagnostics endpoint. Per-cursor drops (the meaningful
+ *        signal for a given consumer) are reported on the
+ *        debugcap_cursor_t.dropped field instead.
+ *
+ *        `used` = min(total bytes emitted since boot, ring size)
+ *        — i.e. how much of the ring currently holds valid data
+ *        from the producer's perspective.
+ *
+ *        `capacity` = ring size.
  */
 void debugcap_getRingStats(uint32_t *used, uint32_t *capacity,
                            uint32_t *dropped);

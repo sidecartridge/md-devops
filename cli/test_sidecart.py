@@ -1301,6 +1301,37 @@ class DebugStatusTests(unittest.TestCase):
         self.assertEqual(parsed["ring_capacity"], 256)
 
 
+class DebugTailTests(unittest.TestCase):
+    """Epic 05 v2 / S4 — `sidecart debug tail`.
+
+    Byte-level streaming of the response body is exercised on
+    hardware (urllib + chunked transfer-encoding is stdlib
+    behaviour); these tests cover URL hit + error-envelope
+    rendering at the CLI layer.
+    """
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def test_debug_tail_404_renders_error(self) -> None:
+        body = json.dumps({
+            "ok": False,
+            "code": "not_found",
+            "message": "Route not found",
+        }).encode("utf-8")
+        self.server.state.next_status = 404
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "debug", "tail"])
+        self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
+        self.assertIn("not_found", err)
+        self.assertEqual(self.server.state.last_method, "GET")
+        self.assertEqual(self.server.state.last_path, "/api/v1/debug/log")
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:

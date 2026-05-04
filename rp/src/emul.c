@@ -19,7 +19,6 @@
 #include "aconfig.h"
 #include "chandler.h"
 #include "commemul.h"
-#include "debugcap.h"
 #include "constants.h"
 #include "debug.h"
 #include "display.h"
@@ -1445,13 +1444,6 @@ void emul_start() {
 #endif
     // Drain the ROM3 command ring → dispatch to registered callbacks.
     chandler_loop();
-
-    // Drain any debug bytes that the chandler ingest filter has
-    // emitted into the debug-byte ring (Epic 05 v2 / S1). DPRINTFs
-    // them to the RP console. No-op when firmware mode hasn't
-    // committed (filter drops emits at the source) or the ring
-    // is empty.
-    debugcap_drainToConsole();
 
     // Run the terminal foreground (consume the published command, render
     // output, etc.).
