@@ -94,6 +94,29 @@ consume over either HTTP or USB. Public m68k ABI: every read in
 the debug ring; the 8-bit data result is undefined and MUST be
 discarded.
 
+> **Power-up ordering when debugging via USB.** If the Pico is
+> powered through its own USB cable (e.g. plugged into your
+> workstation for `sidecart debug tail` over CDC, or for serial
+> DPRINTF), it boots *before* the Atari ST. Two side effects:
+> 1. The setup-menu countdown starts running with no ST attached,
+>    and once it elapses (~20 s by default) the firmware
+>    auto-commits Runner mode (per Epic 06 / S2). When you
+>    subsequently power the ST, it sees the cartridge already
+>    in Runner state and skips the menu — you never get a
+>    chance to press `[U]` / `[E]` / `[F]`.
+> 2. Any Runner state the Pico accumulated before the ST booted
+>    (a previously-loaded program, a stale cwd, etc.) survives
+>    into the new ST session — the Pico has no way to detect
+>    a fresh ST cold reset until GEMDRIVE HELLO arrives.
+>
+> If you want the menu countdown to run while you watch it,
+> press a key on the ST keyboard before the timer expires
+> (any key halts the countdown), or power the cartridge slot
+> first and add the USB cable after the ST is up. Stopping the
+> countdown also lets you observe the menu live-state (USB CDC
+> attached/disconnected line, etc.) before committing to a
+> mode.
+
 **Emit one byte, C**:
 
 ```c

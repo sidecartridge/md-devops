@@ -449,6 +449,104 @@ def cmd_runner_run(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_runner_load(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/load — synchronous Pexec(3) load-only.
+
+    Returns the basepage pointer on success. The program is then in
+    m68k RAM, ready for `runner exec`. Use `runner status` to inspect
+    the loaded state at any time.
+    """
+    cmdline = " ".join(args.cmdline) if args.cmdline else ""
+    body_json = {"path": args.remote, "cmdline": cmdline}
+    body = json.dumps(body_json, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    url = base_url(args.host) + "/api/v1/runner/load"
+    try:
+        # Synchronous on the server side (spin-waits up to 10 s); use
+        # a slightly longer client timeout so we never give up before
+        # the device does.
+        status, parsed, raw = request_json(
+            "POST", url, body=body, headers=headers, timeout=15)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        bp = parsed.get("basepage", 0) if parsed else 0
+        print(f"ok  LOAD {args.remote} → basepage 0x{bp:08X}")
+    return EXIT_OK
+
+
+def cmd_runner_exec(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/exec — fire-and-forget Pexec(4).
+
+    Executes the program previously loaded via `runner load`. No
+    arguments — the basepage pointer is held server-side as state.
+    Re-exec on the same loaded program is supported (Pexec(4) does
+    not free the basepage); use `runner unload` to release the
+    memory when you're done.
+    """
+    headers = {"Content-Type": "application/json"}
+    url = base_url(args.host) + "/api/v1/runner/exec"
+    try:
+        status, parsed, raw = request_json(
+            "POST", url, body=b"", headers=headers)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 202:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        print("ok  EXEC sent")
+    return EXIT_OK
+
+
+def cmd_runner_unload(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/unload — synchronous GEMDOS Mfree.
+
+    Releases the basepage of the program previously loaded via
+    `runner load`. Pairs with the Pexec(4)-based `runner exec`
+    (which deliberately doesn't auto-free, so re-exec works).
+    """
+    headers = {"Content-Type": "application/json"}
+    url = base_url(args.host) + "/api/v1/runner/unload"
+    try:
+        # Server spin-waits up to 5 s; client allows a bit more.
+        status, parsed, raw = request_json(
+            "POST", url, body=b"", headers=headers, timeout=10)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        bp = parsed.get("basepage", 0) if parsed else 0
+        print(f"ok  UNLOAD basepage 0x{int(bp):08X}")
+    return EXIT_OK
+
+
 def _parse_adv_jump_address(raw: str) -> int:
     """Parse a jump-target address from CLI input.
 
@@ -908,6 +1006,16 @@ def cmd_runner_status(args: argparse.Namespace) -> int:
         print(f"last     : {last_cmd} (exit={last_exit})")
     else:
         print(f"last     : {last_cmd} {last_path} (exit={last_exit})")
+
+    # Epic 06 / S5+S6 — Pexec load+exec split state. Print only
+    # when there's a basepage pending or a load error to report,
+    # so a fresh-boot status stays uncluttered.
+    loaded_basepage = parsed.get("loaded_basepage")
+    last_load_errno = parsed.get("last_load_errno")
+    if loaded_basepage is not None:
+        print(f"loaded   : basepage 0x{int(loaded_basepage):08X}")
+    elif last_load_errno is not None:
+        print(f"loaded   : (last load failed, GEMDOS errno {last_load_errno})")
     return EXIT_OK
 
 
@@ -1163,6 +1271,25 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Command-line arguments (joined with spaces, ≤127 chars). "
                             "Everything after REMOTE is captured verbatim, including "
                             "leading dashes — no need for --.")
+    load_p = runner_sub.add_parser(
+        "load",
+        help="Load a .TOS / .PRG into m68k RAM (Pexec mode 3) "
+             "without executing it. Pair with `runner exec`.")
+    load_p.add_argument("remote", help="Path to the program (relative to GEMDRIVE_FOLDER).")
+    load_p.add_argument("cmdline", nargs=argparse.REMAINDER,
+                        help="Command-line arguments stored in the basepage at load "
+                             "time. Same quoting rule as `runner run`.")
+    runner_sub.add_parser(
+        "exec",
+        help="Execute the program previously loaded via `runner load` "
+             "(Pexec mode 4). No arguments — the basepage is held "
+             "server-side as state. Re-exec is supported; use "
+             "`runner unload` to free the memory.")
+    runner_sub.add_parser(
+        "unload",
+        help="Free the basepage previously loaded via `runner load` "
+             "(GEMDOS Mfree). Pairs with `runner exec` to give "
+             "Pexec(0)-equivalent lifecycle without the auto-free.")
 
     debug = sub.add_parser(
         "debug",
@@ -1202,6 +1329,9 @@ def main(argv: list[str] | None = None) -> int:
             "status": cmd_runner_status,
             "reset": cmd_runner_reset,
             "run": cmd_runner_run,
+            "load": cmd_runner_load,
+            "exec": cmd_runner_exec,
+            "unload": cmd_runner_unload,
             "cd": cmd_runner_cd,
             "res": cmd_runner_res,
             "meminfo": cmd_runner_meminfo,

@@ -151,6 +151,19 @@ static int32_t runnerLastResErrno = 0;
 static runner_meminfo_t runnerMeminfo = {0};
 static bool runnerMeminfoHasSnapshot = false;
 static bool runnerMeminfoPending = false;
+// Epic 06 / S5+S6 — Pexec(3)/(4) load+exec split state. The
+// m68k Runner's RUNNER_CMD_LOAD handler (Pexec mode 3) returns a
+// basepage pointer in the DONE_LOAD payload; we cache it here so
+// a subsequent RUNNER_CMD_EXEC fires Pexec(4) on the right
+// program, and so the strict-refuse semantics on a second LOAD
+// stay enforceable from the RP side without any m68k roundtrip.
+// pendingBasepage is signed — the m68k payload format is "i32:
+// >0 basepage ptr, <0 -GEMDOS errno". On error we store 0 so
+// emul_isRunnerLoadPending() reads correctly; the errno survives
+// in runnerLoadErrno for the status endpoint.
+static int32_t runnerPendingBasepage = 0;
+static bool runnerLoadHasErrno = false;
+static int32_t runnerLoadErrno = 0;
 // Epic 04 — Advanced Runner installation flag, set by the m68k's
 // HELLO payload byte after runner_post_reloc installs its VBL hook.
 static bool runnerAdvancedInstalled = false;
@@ -225,6 +238,103 @@ void emul_recordRunnerExecuteDone(int32_t exit_code, uint32_t now_ms) {
   runnerLastHasExitCode = true;
   runnerLastFinishedMs = now_ms;
   runnerBusy = false;
+}
+
+// Epic 06 / S5+S6 — Pexec(3) load + Pexec(4) exec.
+void emul_recordRunnerLoadSubmit(const char *path, uint32_t now_ms) {
+  runnerLastCommand = RUNNER_LAST_PEXEC_LOAD;
+  runnerLastStartedMs = now_ms;
+  runnerLastFinishedMs = 0;
+  runnerLastHasExitCode = false;
+  runnerLastExitCode = 0;
+  runnerLoadHasErrno = false;
+  runnerLoadErrno = 0;
+  if (path != NULL) {
+    size_t n = strlen(path);
+    if (n >= sizeof(runnerLastPath)) n = sizeof(runnerLastPath) - 1;
+    memcpy(runnerLastPath, path, n);
+    runnerLastPath[n] = '\0';
+  } else {
+    runnerLastPath[0] = '\0';
+  }
+  runnerBusy = true;
+}
+
+void emul_recordRunnerLoadDone(int32_t result, uint32_t now_ms) {
+  runnerLastFinishedMs = now_ms;
+  runnerBusy = false;
+  if (result > 0) {
+    runnerPendingBasepage = result;
+    runnerLoadHasErrno = false;
+    runnerLoadErrno = 0;
+  } else {
+    runnerPendingBasepage = 0;
+    runnerLoadHasErrno = true;
+    runnerLoadErrno = result;  // <0 = -GEMDOS errno; 0 = unexpected
+  }
+}
+
+void emul_recordRunnerExecSubmit(uint32_t now_ms) {
+  runnerLastCommand = RUNNER_LAST_PEXEC_EXEC;
+  runnerLastStartedMs = now_ms;
+  runnerLastFinishedMs = 0;
+  runnerLastHasExitCode = false;
+  runnerLastExitCode = 0;
+  // exec doesn't operate on a path — keep the path mirror as it
+  // was set by the prior load so a status query during the in-
+  // flight window still shows which program is running.
+  runnerBusy = true;
+}
+
+void emul_recordRunnerExecDone(int32_t exit_code, uint32_t now_ms) {
+  runnerLastExitCode = exit_code;
+  runnerLastHasExitCode = true;
+  runnerLastFinishedMs = now_ms;
+  runnerBusy = false;
+  // Pexec(4) (PE_GO) does NOT free the basepage — it stays
+  // allocated in m68k RAM and re-exec on the same basepage is
+  // valid. The runner unload command (Epic 06 / S7) is what
+  // explicitly Mfrees the memory and clears pendingBasepage.
+}
+
+// Epic 06 / S7 — runner unload (GEMDOS Mfree).
+void emul_recordRunnerUnloadSubmit(uint32_t now_ms) {
+  runnerLastCommand = RUNNER_LAST_PEXEC_UNLOAD;
+  runnerLastStartedMs = now_ms;
+  runnerLastFinishedMs = 0;
+  runnerLastHasExitCode = false;
+  runnerLastExitCode = 0;
+  runnerLoadHasErrno = false;
+  runnerLoadErrno = 0;
+  runnerBusy = true;
+}
+
+void emul_recordRunnerUnloadDone(int32_t result, uint32_t now_ms) {
+  runnerLastFinishedMs = now_ms;
+  runnerBusy = false;
+  if (result == 0) {
+    // Mfree succeeded — basepage gone from m68k RAM, clear our
+    // mirror so future load works and exec / unload report 409.
+    runnerPendingBasepage = 0;
+    runnerLoadHasErrno = false;
+    runnerLoadErrno = 0;
+  } else {
+    // Mfree failed (e.g. -40 EIMBA). Keep pendingBasepage as-is
+    // so the operator can see "this basepage still claims to be
+    // loaded but a previous unload failed" and act accordingly.
+    runnerLoadHasErrno = true;
+    runnerLoadErrno = result;
+  }
+}
+
+bool emul_isRunnerLoadPending(void) { return runnerPendingBasepage != 0; }
+int32_t emul_getRunnerPendingBasepage(void) { return runnerPendingBasepage; }
+
+bool emul_getRunnerLastLoadErrno(int32_t *out) {
+  if (runnerLoadHasErrno && out != NULL) {
+    *out = runnerLoadErrno;
+  }
+  return runnerLoadHasErrno;
 }
 
 void emul_recordRunnerCdSubmit(const char *path, uint32_t now_ms) {

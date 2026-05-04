@@ -52,6 +52,7 @@ RUNNER_CWD			equ (RUNNER_BASE + $108)	; 128 B
 RUNNER_HELLO			equ (RUNNER_BASE + $188)	; 4 B  ('RNV1')
 RUNNER_PROTO_VER		equ (RUNNER_BASE + $18C)	; 4 B  (u16 min | u16 max)
 RUNNER_REZ			equ (RUNNER_BASE + $190)	; 4 B (u16 target rez for RUNNER_CMD_RES)
+RUNNER_BASEPAGE			equ (RUNNER_BASE + $194)	; 4 B (i32 basepage ptr for Pexec(4); Epic 06 / S5+S6)
 
 RUNNER_HELLO_MAGIC		equ $524E5631	; 'RNV1' big-endian
 RUNNER_PROTO_VERSION		equ $00010001	; min=1, max=1
@@ -66,12 +67,18 @@ RUNNER_CMD_EXECUTE		equ ($02 + APP_RUNNER)	; Pexec mode 0
 RUNNER_CMD_CD			equ ($03 + APP_RUNNER)	; Dsetpath
 RUNNER_CMD_RES			equ ($04 + APP_RUNNER)	; XBIOS Setscreen — rez at RUNNER_REZ
 RUNNER_CMD_MEMINFO		equ ($05 + APP_RUNNER)	; system memory snapshot (synchronous)
+RUNNER_CMD_LOAD			equ ($06 + APP_RUNNER)	; Pexec mode 3 (load only); Epic 06 / S5
+RUNNER_CMD_EXEC			equ ($07 + APP_RUNNER)	; Pexec mode 4 (just go); Epic 06 / S6
+RUNNER_CMD_UNLOAD		equ ($08 + APP_RUNNER)	; Mfree(basepage); Epic 06 / S7
 ; m68k -> RP report commands (sent via send_sync from the Runner).
 RUNNER_CMD_DONE_EXECUTE		equ ($82 + APP_RUNNER)	; payload: i32 exit code
 RUNNER_CMD_DONE_CD		equ ($83 + APP_RUNNER)	; payload: i32 GEMDOS errno
 RUNNER_CMD_DONE_HELLO		equ ($84 + APP_RUNNER)	; no payload — runner entered loop
 RUNNER_CMD_DONE_RES		equ ($85 + APP_RUNNER)	; payload: i32 errno (0 = OK, -1 = mono, -2 = bad rez)
 RUNNER_CMD_DONE_MEMINFO		equ ($86 + APP_RUNNER)	; payload: 24-byte meminfo struct
+RUNNER_CMD_DONE_LOAD		equ ($87 + APP_RUNNER)	; payload: i32 (>0 basepage ptr, <0 -GEMDOS errno)
+RUNNER_CMD_DONE_EXEC		equ ($88 + APP_RUNNER)	; payload: i32 exit code
+RUNNER_CMD_DONE_UNLOAD		equ ($89 + APP_RUNNER)	; payload: i32 Mfree result (0 OK, <0 errno)
 
 ; Constants required by inc/sidecart_macros.s when send_sync expands.
 ; main.s defines these too; we need our own local copies because
@@ -92,6 +99,7 @@ _dskbufp			equ $4C6
 GEMDOS_Cconws			equ 9
 GEMDOS_Cconout			equ 2
 GEMDOS_Dsetdrv			equ $E
+GEMDOS_Mfree			equ $49
 GEMDOS_Super			equ $20
 GEMDOS_Dsetpath			equ $3B
 GEMDOS_Pexec			equ $4B
@@ -100,6 +108,8 @@ XBIOS_Setscreen			equ 5
 XBIOS_Setpalette		equ 6
 XBIOS_Vsync			equ 37
 PE_LOAD_GO			equ 0	; Pexec mode 0: load + go, returns
+PE_LOAD				equ 3	; Pexec mode 3: load only, returns basepage ptr (Epic 06 / S5)
+PE_GO				equ 4	; Pexec mode 4: just go, takes basepage ptr in fname slot (Epic 06 / S6)
 
 ; RUNNER_RES errno codes (i32 in RUNNER_CMD_DONE_RES payload).
 RUNNER_RES_OK			equ 0
@@ -341,6 +351,12 @@ runner_poll_loop:
 	beq	runner_res
 	cmp.l	#RUNNER_CMD_MEMINFO, d6
 	beq	runner_meminfo
+	cmp.l	#RUNNER_CMD_LOAD, d6
+	beq	runner_load
+	cmp.l	#RUNNER_CMD_EXEC, d6
+	beq	runner_exec
+	cmp.l	#RUNNER_CMD_UNLOAD, d6
+	beq	runner_unload
 	bra.s	runner_poll_loop
 
 ; RUNNER_CMD_EXECUTE handler. Reads RUNNER_PATH (NUL-terminated) and
@@ -421,6 +437,211 @@ runner_execute:
 	; Recover exit code and ship it to the RP.
 	move.l	(sp)+, d3
 	send_sync RUNNER_CMD_DONE_EXECUTE, 4
+	bra	runner_poll_loop
+
+; RUNNER_CMD_LOAD handler (Epic 06 / S5). Reads RUNNER_PATH +
+; RUNNER_CMDLINE from APP_FREE, calls GEMDOS Pexec mode 3 (load
+; only), and ships d0.l back to the RP via RUNNER_CMD_DONE_LOAD.
+; Wire-protocol contract: d0 > 0 → basepage pointer (program is
+; in RAM, ready for a future RUNNER_CMD_EXEC). d0 < 0 → -GEMDOS
+; errno (load failed; nothing in RAM). The RP splits on sign.
+runner_load:
+	; Trace: "[LOAD ] - Loading <path>\r\n"
+	pea	text_load(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+	pea	RUNNER_PATH.l
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+	pea	text_crlf(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+
+	; Same Dsetdrv-to-emulated-drive prelude as runner_execute so
+	; gemdrive's .Pexec drive-detection macro recognises this load
+	; as belonging to the emulated drive.
+	move.l	DRIVE_NUMBER_ADDR, d3
+	move.w	d3, -(sp)
+	move.w	#GEMDOS_Dsetdrv, -(sp)
+	trap	#1
+	addq.l	#4, sp
+
+	; Pexec(3) — load only.
+	clr.l	-(sp)			; envstring NULL
+	move.l	#RUNNER_CMDLINE, -(sp)	; cmdline (TOS-format, length-prefixed)
+	move.l	#RUNNER_PATH, -(sp)	; fname (NUL-terminated)
+	move.w	#PE_LOAD, -(sp)
+	move.w	#GEMDOS_Pexec, -(sp)
+	trap	#1
+	lea	16(sp), sp
+
+	; Stash result on stack so Cconws below doesn't trash it.
+	move.l	d0, -(sp)
+
+	; Trace: "[LOAD ] - result <decimal>\r\n" (basepage on success,
+	; -GEMDOS errno on failure — same i32 the RP gets in DONE_LOAD).
+	pea	text_load_result(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+	move.l	(sp), d3		; reload result for the printer
+	bsr	runner_print_dec_d3
+	pea	text_crlf(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+
+	; Recover and ship the result. The RP caches it in its own
+	; runner state and stages it back into RUNNER_BASEPAGE before
+	; the next RUNNER_CMD_EXEC. We can't store it from here —
+	; $FA0000..$FAFFFF is read-only ROM emulation from the m68k's
+	; perspective — a `move.l` into that region is a bus error.
+	move.l	(sp)+, d3
+	send_sync RUNNER_CMD_DONE_LOAD, 4
+
+	; Wait for the RP to clear the sentinel before falling back
+	; into runner_poll_loop. send_sync returns once the RP's
+	; chandler-callback ACK token lands, but `SEND_COMMAND_TO_DISPLAY(0)`
+	; (the sentinel-clear) is dispatched from the same callback —
+	; for fast-completing handlers (Pexec(3), Pexec(4)) the m68k
+	; can race the RP and re-dispatch the same command before the
+	; sentinel is observed cleared. The wait_clear spin guarantees
+	; we never re-enter the handler with stale dispatch state.
+.wait_clear_load:
+	move.l	CMD_MAGIC_SENTINEL_ADDR, d6
+	cmp.l	#RUNNER_CMD_LOAD, d6
+	beq.s	.wait_clear_load
+	bra	runner_poll_loop
+
+; RUNNER_CMD_EXEC handler (Epic 06 / S6). Reads the basepage ptr
+; from RUNNER_BASEPAGE (cached by a prior RUNNER_CMD_LOAD), calls
+; GEMDOS Pexec mode 4 (just go), and ships d0.l (program exit
+; code) back to the RP via RUNNER_CMD_DONE_EXEC. The RP-side
+; "loaded program" state is cleared by emul_recordRunnerExecDone
+; on the DONE_EXEC callback, regardless of exit code.
+runner_exec:
+	; Trace: "[EXEC ] - basepage <decimal>\r\n"
+	pea	text_exec(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+	move.l	RUNNER_BASEPAGE, d3
+	bsr	runner_print_dec_d3
+	pea	text_crlf(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+
+	; No Dsetdrv prelude — Pexec(4) doesn't open the program file
+	; (it was opened in the prior load), so the gemdrive .Pexec
+	; macro's file-load path doesn't fire and the current drive
+	; is irrelevant.
+	;
+	; Pexec(4) — just go. GEMDOS calling convention is
+	; `Pexec(4, NULL, basepage, NULL)` — i.e. the basepage lives
+	; in the CMDLINE slot, NOT the fname slot. (gemdrive's mode 0
+	; → mode 6 rewriter at gemdrive.s:1023 also places the
+	; basepage at 14(a0), the cmdline slot.) Pushing basepage
+	; into fname instead is the classic Pexec(4)-bombs-with-bus-
+	; error gotcha.
+	clr.l	-(sp)			; envstring NULL  (18(a0))
+	move.l	RUNNER_BASEPAGE, -(sp)	; cmdline slot = basepage  (14(a0))
+	clr.l	-(sp)			; fname NULL  (10(a0))
+	move.w	#PE_GO, -(sp)
+	move.w	#GEMDOS_Pexec, -(sp)
+	trap	#1
+	lea	16(sp), sp
+
+	; Stash exit code so the trace below doesn't trash it.
+	move.l	d0, -(sp)
+
+	; Trace: "\r\n[EXIT <code>] - terminated\r\n" — same shape as
+	; runner_execute's trailer so the operator sees a consistent
+	; "[RUN]/[LOAD]/[EXEC] ... [EXIT N] terminated" sequence.
+	pea	text_exit_open(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+	move.l	(sp), d3
+	bsr	runner_print_dec_d3
+	pea	text_exit_close(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+	pea	text_terminated(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+
+	move.l	(sp)+, d3
+	send_sync RUNNER_CMD_DONE_EXEC, 4
+
+	; Same wait_clear rationale as runner_load — Pexec(4) is fast,
+	; the m68k can race the RP's sentinel-clear if we bra back
+	; immediately. Pexec(4) does NOT free the basepage (mode 4
+	; semantics: just go, leave allocation intact), so re-exec
+	; works against the same basepage; the explicit
+	; RUNNER_CMD_UNLOAD path below is what releases the memory.
+.wait_clear_exec:
+	move.l	CMD_MAGIC_SENTINEL_ADDR, d6
+	cmp.l	#RUNNER_CMD_EXEC, d6
+	beq.s	.wait_clear_exec
+	bra	runner_poll_loop
+
+; RUNNER_CMD_UNLOAD handler (Epic 06 / S7). Releases the basepage
+; cached in RUNNER_BASEPAGE via GEMDOS Mfree, so the operator can
+; reclaim the memory after they're done re-exec'ing the loaded
+; program. Companion to runner_load (Pexec(3)) and runner_exec
+; (Pexec(4)) — the three together cover the full load/run/free
+; lifecycle that Pexec(0) does in one shot.
+runner_unload:
+	; Trace: "[UNLD ] - basepage <decimal>\r\n"
+	pea	text_unload(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+	move.l	RUNNER_BASEPAGE, d3
+	bsr	runner_print_dec_d3
+	pea	text_crlf(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+
+	; GEMDOS Mfree(basepage). Returns 0 on success, negative
+	; GEMDOS errno on failure (e.g. -40 EIMBA "improper memory
+	; block address" if the basepage was never allocated).
+	move.l	RUNNER_BASEPAGE, -(sp)
+	move.w	#GEMDOS_Mfree, -(sp)
+	trap	#1
+	addq.l	#6, sp
+
+	; Trace: "[UNLD ] - result <decimal>\r\n"
+	move.l	d0, -(sp)		; preserve result for send_sync
+	pea	text_unload_result(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+	move.l	(sp), d3		; reload result for the printer
+	bsr	runner_print_dec_d3
+	pea	text_crlf(pc)
+	move.w	#GEMDOS_Cconws, -(sp)
+	trap	#1
+	addq.l	#6, sp
+
+	; Ship the i32 Mfree result. RP-side state setter clears
+	; pendingBasepage on result == 0; on failure the RP keeps
+	; the basepage flagged so subsequent unload attempts don't
+	; lie to the operator.
+	move.l	(sp)+, d3
+	send_sync RUNNER_CMD_DONE_UNLOAD, 4
+
+.wait_clear_unload:
+	move.l	CMD_MAGIC_SENTINEL_ADDR, d6
+	cmp.l	#RUNNER_CMD_UNLOAD, d6
+	beq.s	.wait_clear_unload
 	bra	runner_poll_loop
 
 ; RUNNER_CMD_CD handler. Reads RUNNER_PATH (NUL-terminated) and calls
@@ -1052,6 +1273,21 @@ text_terminated:
 	even
 text_crlf:
 	dc.b	13, 10, 0
+	even
+text_load:
+	dc.b	13, 10, "[LOAD ] - Loading ", 0
+	even
+text_load_result:
+	dc.b	"[LOAD ] - result ", 0
+	even
+text_exec:
+	dc.b	13, 10, "[EXEC ] - basepage ", 0
+	even
+text_unload:
+	dc.b	13, 10, "[UNLD ] - basepage ", 0
+	even
+text_unload_result:
+	dc.b	"[UNLD ] - result ", 0
 	even
 
 ; Trailing sentinel: keeps the cartridge-image last-non-zero-byte on

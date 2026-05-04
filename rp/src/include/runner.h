@@ -31,6 +31,12 @@
 // Stateless target rez for RUNNER_CMD_RES (u16 in low half;
 // 0=low, 1=med). Stored as 4 B for word-aligned access.
 #define RUNNER_REZ_OFFSET (RUNNER_BASE_OFFSET + 0x190)          // 4 B
+// Pexec-load basepage cache (Epic 06 / S5+S6). The m68k stashes
+// the Pexec(3) basepage pointer here on RUNNER_CMD_LOAD, then
+// reads it back on RUNNER_CMD_EXEC for the Pexec(4) call. The
+// RP also tracks the basepage in its own state (mirrored from
+// the DONE_LOAD payload) for the strict-refuse semantics.
+#define RUNNER_BASEPAGE_OFFSET (RUNNER_BASE_OFFSET + 0x194)     // 4 B
 
 // Magic the m68k Runner publishes at boot so the RP can detect that
 // Runner mode is active. ASCII 'RNV1' big-endian. Reserved for
@@ -55,6 +61,9 @@
 #define RUNNER_CMD_CD (APP_RUNNER + 0x03)       // Dsetpath
 #define RUNNER_CMD_RES (APP_RUNNER + 0x04)      // XBIOS Setscreen
 #define RUNNER_CMD_MEMINFO (APP_RUNNER + 0x05)  // system memory snapshot
+#define RUNNER_CMD_LOAD (APP_RUNNER + 0x06)     // Pexec mode 3 (Epic 06 / S5)
+#define RUNNER_CMD_EXEC (APP_RUNNER + 0x07)     // Pexec mode 4 (Epic 06 / S6)
+#define RUNNER_CMD_UNLOAD (APP_RUNNER + 0x08)   // Mfree(basepage) (Epic 06 / S7)
 
 // Epic 04 — Advanced Runner. Commands in this range are dispatched
 // by the m68k's VBL ISR (installed at $70 by runner_post_reloc) so
@@ -106,6 +115,9 @@
 #define RUNNER_CMD_DONE_HELLO (APP_RUNNER + 0x84)    // no payload
 #define RUNNER_CMD_DONE_RES (APP_RUNNER + 0x85)      // payload: i32 errno
 #define RUNNER_CMD_DONE_MEMINFO (APP_RUNNER + 0x86)  // payload: 24-byte struct
+#define RUNNER_CMD_DONE_LOAD (APP_RUNNER + 0x87)     // payload: i32 (>0 basepage; <0 -errno)
+#define RUNNER_CMD_DONE_EXEC (APP_RUNNER + 0x88)     // payload: i32 exit code
+#define RUNNER_CMD_DONE_UNLOAD (APP_RUNNER + 0x89)   // payload: i32 Mfree result (0 OK, <0 errno)
 
 // RP-side state machine mirror. cmdRunner sets ACTIVE; per-command
 // handlers update last_command. Used by GET /api/v1/runner.
@@ -117,7 +129,10 @@ typedef enum {
   RUNNER_LAST_RES = 4,
   RUNNER_LAST_MEMINFO = 5,
   RUNNER_LAST_JUMP = 6,
-  RUNNER_LAST_LOAD = 7,
+  RUNNER_LAST_LOAD = 7,         // adv-load (raw RAM upload, Epic 04 / S8)
+  RUNNER_LAST_PEXEC_LOAD = 8,    // runner load (Pexec(3), Epic 06 / S5)
+  RUNNER_LAST_PEXEC_EXEC = 9,    // runner exec (Pexec(4), Epic 06 / S6)
+  RUNNER_LAST_PEXEC_UNLOAD = 10, // runner unload (Mfree, Epic 06 / S7)
 } runner_last_command_t;
 
 // Snapshot returned by RUNNER_CMD_MEMINFO. Mirrors the 24-byte

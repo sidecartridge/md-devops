@@ -90,6 +90,65 @@ void emul_recordRunnerExecuteSubmit(const char *path, uint32_t now_ms);
  */
 void emul_recordRunnerExecuteDone(int32_t exit_code, uint32_t now_ms);
 
+// Epic 06 / S5+S6 — Pexec(3) load + Pexec(4) exec split.
+//
+// Strict-refuse semantics: a `runner load` while
+// emul_isRunnerLoadPending() is already true must return 409
+// program_already_loaded. The user must `runner exec` (or bounce
+// Runner mode) to consume the prior basepage before submitting
+// another load. This keeps the m68k from holding orphan
+// basepages the RP forgot about.
+
+/** @brief Record a LOAD submission (Pexec(3)). Stores `path` for
+ *         the status mirror, marks busy. The actual basepage is
+ *         set by a later DONE_LOAD via emul_recordRunnerLoadDone. */
+void emul_recordRunnerLoadSubmit(const char *path, uint32_t now_ms);
+
+/** @brief Record a LOAD completion. `result > 0` is a basepage
+ *         pointer (success — emul_isRunnerLoadPending becomes
+ *         true). `result < 0` is a -GEMDOS errno (failure —
+ *         emul_getRunnerLastLoadErrno reports it). Clears busy. */
+void emul_recordRunnerLoadDone(int32_t result, uint32_t now_ms);
+
+/** @brief Record an EXEC submission (Pexec(4)). Marks busy.
+ *         Caller must have verified emul_isRunnerLoadPending(). */
+void emul_recordRunnerExecSubmit(uint32_t now_ms);
+
+/** @brief Record an EXEC completion. Stores exit_code and
+ *         clears busy. pendingBasepage is preserved — `Pexec(4)`
+ *         does NOT free the basepage, so the program stays
+ *         loaded for re-exec; explicit unload (S7) is what
+ *         releases the memory. */
+void emul_recordRunnerExecDone(int32_t exit_code, uint32_t now_ms);
+
+/** @brief Record an UNLOAD submission (GEMDOS Mfree on the
+ *         loaded basepage). Marks busy. Caller must have
+ *         verified `emul_isRunnerLoadPending()` first. */
+void emul_recordRunnerUnloadSubmit(uint32_t now_ms);
+
+/** @brief Record an UNLOAD completion. `result == 0` clears
+ *         the pending basepage. `result < 0` (-GEMDOS errno)
+ *         keeps the basepage flagged AND records the errno on
+ *         the load-errno surface so a follow-up status call
+ *         shows what failed. */
+void emul_recordRunnerUnloadDone(int32_t result, uint32_t now_ms);
+
+/** @brief True iff a program has been Pexec(3)-loaded and is
+ *         waiting for an exec. Used to gate the load endpoint
+ *         (strict refuse) and to gate the exec endpoint
+ *         (no_program_loaded if false). */
+bool emul_isRunnerLoadPending(void);
+
+/** @brief Cached Pexec(3) basepage pointer. Returns 0 if no
+ *         program is loaded (matches the "0 = NULL" convention
+ *         the m68k Pexec API uses for an unset basepage). */
+int32_t emul_getRunnerPendingBasepage(void);
+
+/** @brief Returns true if the most recent load failed; *out
+ *         gets the -GEMDOS errno. False if no load has been
+ *         attempted yet OR the most recent load succeeded. */
+bool emul_getRunnerLastLoadErrno(int32_t *out);
+
 /**
  * @brief Record a CD submission. Stores the requested target path
  *        (used both as last_path and as the optimistic cwd while the
