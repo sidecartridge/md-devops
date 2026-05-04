@@ -465,16 +465,25 @@ curl http://sidecart.local/api/v1/runner
   "last_exit_code": 0,
   "last_cd_errno": null,
   "last_res_errno": null,
+  "loaded_basepage": null,
+  "last_load_errno": null,
   "last_started_at_ms": 12345,
   "last_finished_at_ms": 13002
 }
 ```
 
 `last_command` is one of `null`, `RESET`, `EXECUTE`, `CD`, `RES`,
-`MEMINFO`, `JUMP`, or `LOAD`. The `last_cd_errno` / `last_res_errno`
-fields are `null` unless the most-recent command was a CD or RES
-respectively. `JUMP` / `LOAD` reflect the Advanced commands of the
-same name (see *Advanced Runner* below).
+`MEMINFO`, `JUMP`, `LOAD`, `PEXEC_LOAD`, `PEXEC_EXEC`, or
+`PEXEC_UNLOAD`. The `last_cd_errno` / `last_res_errno` fields
+are `null` unless the most-recent command was a `CD` or `RES`
+respectively. `JUMP` / `LOAD` reflect the Advanced commands of
+the same name (see *Advanced Runner* below); `PEXEC_LOAD` /
+`PEXEC_EXEC` / `PEXEC_UNLOAD` are the load / exec / unload
+lifecycle verbs (see [Pexec lifecycle](#pexec-lifecycle-load--exec--unload)).
+`loaded_basepage` is the cached basepage pointer when a program
+is currently loaded (via `runner load`), `null` otherwise.
+`last_load_errno` carries the GEMDOS errno of the most-recent
+failed `load` or `unload` (`null` on success).
 
 **`sidecart`**:
 ```sh
@@ -614,6 +623,11 @@ curl -X POST http://sidecart.local/api/v1/runner/exec
 **`sidecart`**:
 ```sh
 python3 cli/sidecart.py runner exec
+```
+
+Response 202:
+```json
+{ "ok": true, "accepted": true }
 ```
 
 Common error codes: `202 Accepted`, `409 no_program_loaded` (no

@@ -119,12 +119,12 @@ discarded.
 > powered through its own USB cable (e.g. plugged into your
 > workstation for `sidecart debug tail` over CDC, or for serial
 > DPRINTF), it boots *before* the Atari ST. Two side effects:
-> 1. The setup-menu countdown starts running with no ST attached,
->    and once it elapses (~20 s by default) the firmware
->    auto-commits Runner mode (per Epic 06 / S2). When you
->    subsequently power the ST, it sees the cartridge already
->    in Runner state and skips the menu — you never get a
->    chance to press `[U]` / `[E]` / `[F]`.
+> 1. The setup-menu countdown starts running with no ST
+>    attached, and once it elapses (~20 s by default) the
+>    firmware auto-commits Runner mode. When you subsequently
+>    power the ST, it sees the cartridge already in Runner
+>    state and skips the menu — you never get a chance to
+>    press `[U]` / `[E]` / `[F]`.
 > 2. Any Runner state the Pico accumulated before the ST booted
 >    (a previously-loaded program, a stale cwd, etc.) survives
 >    into the new ST session — the Pico has no way to detect
