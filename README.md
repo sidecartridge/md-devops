@@ -128,6 +128,189 @@ Select an option: ▌
 | **Bottom navigation strip** | Top-level command keys + a one-character prompt area for typing them. | `[E]` / `[U]` / `[X]` (and `[F]` does the same as `[E]`). |
 | **Animated countdown bar** | Shrinking white bar; the message "Booting in N s — any key halts" is overlaid in inverted colour so it stays readable both halves. Becomes "Countdown stopped. Press [E], [U] or [X] to continue." once any key has been pressed. | (passive — but pressing any key halts the countdown) |
 
+## 🛜 First-contact: `ping`
+
+Once the device has joined Wi-Fi (the API Endpoint section of
+the menu shows a leased IP and the wifi icon is lit), the very
+first thing to test is `ping` — it confirms the workstation can
+reach the device at all and reports the firmware version + boot
+uptime. No state is touched by `ping`; it's safe to run any
+time.
+
+```sh
+$ python3 cli/sidecart.py ping
+ok  version=v0.0.1dev  uptime=42s
+```
+
+```sh
+$ python3 cli/sidecart.py --json ping
+{"ok":true,"version":"v0.0.1dev","uptime_s":42}
+```
+
+```sh
+$ curl http://sidecart.local/api/v1/ping
+{ "ok": true, "version": "v0.0.1dev", "uptime_s": 42 }
+```
+
+If `ping` fails (`sidecart`: `EXIT_NETWORK = 8`; `curl`:
+connection refused / DNS failure), the rest of the API is
+unreachable too — fix Wi-Fi / mDNS first. Common causes:
+
+- **mDNS not resolving** — try the literal IP shown on the
+  setup-menu's API Endpoint line (`http://192.168.1.42/`).
+  macOS resolves `.local` natively; Linux usually needs
+  `avahi-daemon` running; Windows needs Bonjour Print Services
+  or `nss-mdns`.
+- **Wrong host** — override with the `--host` flag or the
+  `SIDECART_HOST` env var:
+  ```sh
+  python3 cli/sidecart.py --host 192.168.1.42 ping
+  SIDECART_HOST=192.168.1.42 python3 cli/sidecart.py ping
+  ```
+- **Different network segment** — the workstation has to be on
+  the same LAN broadcast domain (mDNS doesn't cross routers).
+
+Once `ping` works, every other CLI command works too — they all
+talk to the same HTTP server.
+
+## 💾 GEMDRIVE commands — manage files and folders remotely
+
+The Atari ST sees a microSD subdirectory as a TOS drive (default
+`C:`, configurable from the setup menu). The `gemdrive`
+subcommand on the workstation gives you full read/write access
+to that same directory tree without ejecting the SD card —
+useful for iterating on a `BUILD.PRG`, copying down assets the
+ST has produced, or just keeping the contents in sync with a
+project folder.
+
+All paths are jailed under the `GEMDRIVE_FOLDER` aconfig
+parameter (default `/devops`) — the API can never read or write
+outside that root. FAT 8.3 names are enforced (stem ≤ 8 chars,
+extension ≤ 3 chars, ASCII, no `*?/\:<>"|+,;=[]`); see
+[`docs/api.md`](docs/api.md#conventions) for the full
+constraints.
+
+### `gemdrive volume` — disk capacity
+
+```sh
+$ python3 cli/sidecart.py gemdrive volume
+free  : 1.0 GB
+total : 8.0 GB
+fs    : FAT32
+```
+
+### `gemdrive ls [PATH]` — list a folder
+
+`PATH` defaults to `/`. Columns: name, size, is_dir, mtime.
+
+```sh
+$ python3 cli/sidecart.py gemdrive ls /
+INVADERS.PRG  12345  -  2026-04-30T12:34:56
+DATA          0      d  2026-04-29T08:00:00
+
+$ python3 cli/sidecart.py gemdrive ls /DATA
+SAVE.DAT      4096   -  2026-05-01T11:22:33
+
+$ python3 cli/sidecart.py --json gemdrive ls /
+{"ok":true,"path":"/","entries":[{"name":"INVADERS.PRG", …}], …}
+```
+
+### `gemdrive get REMOTE [LOCAL]` — download a file
+
+`LOCAL` defaults to the basename of `REMOTE`. `-r/--resume`
+sends a `Range:` header to continue a partial download.
+
+```sh
+$ python3 cli/sidecart.py gemdrive get GAME.TOS                  # → ./GAME.TOS
+$ python3 cli/sidecart.py gemdrive get GAME.TOS local.tos        # custom local name
+$ python3 cli/sidecart.py gemdrive get GAME.TOS -r               # resume after Ctrl-C
+```
+
+Progress prints to stderr (`123 KB / 4096 KB`); silence with
+`-q`.
+
+### `gemdrive put LOCAL [REMOTE]` — upload a file
+
+`REMOTE` defaults to the basename of `LOCAL`. `-f/--force`
+overwrites if the remote file exists; without it, an existing
+target returns `409 conflict`.
+
+```sh
+$ python3 cli/sidecart.py gemdrive put GAME.TOS                  # → /GAME.TOS (fail if exists)
+$ python3 cli/sidecart.py gemdrive put GAME.TOS -f               # overwrite
+$ python3 cli/sidecart.py gemdrive put build/GAME.TOS /GAMES/ -f # different remote dir
+```
+
+Per-request cap: 4 MB. `Content-Length` is required;
+`Transfer-Encoding: chunked` uploads are rejected.
+
+### `gemdrive rm REMOTE` — delete a file
+
+```sh
+$ python3 cli/sidecart.py gemdrive rm STALE.TXT
+ok
+```
+
+Deleting a directory through `rm` returns `404 is_directory`
+with a hint to use `rmdir`. Files that the ST currently has
+open (e.g. a TOS program reading from a save file) return
+`409 conflict`.
+
+### `gemdrive mv FROM TO` — rename / move a file
+
+```sh
+$ python3 cli/sidecart.py gemdrive mv OLD.TXT NEW.TXT
+$ python3 cli/sidecart.py gemdrive mv /TMP/A.PRG /GAMES/A.PRG    # cross-folder
+```
+
+Both endpoints must stay in the same drive (the API can't move
+across drives). The destination must not exist (no implicit
+overwrite — `gemdrive rm` first if you need to replace).
+
+### `gemdrive mkdir REMOTE` — create a folder
+
+```sh
+$ python3 cli/sidecart.py gemdrive mkdir /GAMES
+$ python3 cli/sidecart.py gemdrive mkdir /GAMES/ARKANOID
+```
+
+Parent must exist. Folder name follows the same FAT 8.3 rules
+as files (stem ≤ 8 chars, no extension typically, ASCII).
+
+### `gemdrive rmdir REMOTE` — delete an empty folder
+
+```sh
+$ python3 cli/sidecart.py gemdrive rmdir /GAMES/EMPTY
+```
+
+Refuses non-empty folders with `409 conflict` — `gemdrive ls`
+to inspect, `gemdrive rm` each file first.
+
+### `gemdrive mvdir FROM TO` — rename / move a folder
+
+```sh
+$ python3 cli/sidecart.py gemdrive mvdir OLDNAME NEWNAME
+$ python3 cli/sidecart.py gemdrive mvdir /TMP/STAGE /GAMES/STAGE  # move sub-tree
+```
+
+Refuses moving a folder into one of its own descendants
+(`422 unprocessable`).
+
+### Putting it together — a typical edit-build-test cycle
+
+```sh
+# Build on the workstation, push, run, watch the result.
+make game.tos
+python3 cli/sidecart.py gemdrive put game.tos /GAMES/ -f
+python3 cli/sidecart.py runner run /GAMES/game.tos
+python3 cli/sidecart.py runner status        # check exit code
+```
+
+Full HTTP / `curl` reference + every error code lives in
+[`docs/api.md`](docs/api.md). The HTTP API has **no
+authentication** — treat the network it's reachable on as
+trusted; don't expose it past your LAN.
+
 ## Runner mode
 
 Runner mode is the foreground execution path the firmware ships
@@ -195,47 +378,29 @@ decimal, `0xhex`, or `$hex` — quote `$hex` in your shell
 (`'$FA1C00'`) or the shell will eat it as a variable reference.
 Prefer `0xhex` in scripts.
 
-## Remote HTTP Management API
+## Remote HTTP Management API — under the hood
 
-Once the device joins Wi-Fi it advertises an HTTP/1.1 REST API
-on port 80 at `http://sidecart.local/` (mDNS hostname is the
-gconfig `PARAM_HOSTNAME`, default `sidecart`). The API lets you
-list, upload, download, rename, and delete files inside the
-GEMDRIVE folder (the `GEMDRIVE_FOLDER` aconfig param, default
-`/devops`) from any workstation on the same LAN.
+Every CLI verb above is a thin wrapper over an HTTP/1.1 REST
+endpoint the firmware serves on port 80 at
+`http://sidecart.local/` (mDNS hostname is the gconfig
+`PARAM_HOSTNAME`, default `sidecart`). You can drive the same
+endpoints from any HTTP client — `curl`, `wget`, a browser, a
+shell script — without going through `cli/sidecart.py`. The
+single-file Python CLI exists for ergonomics, not as the only
+supported access path.
 
-A single-file, stdlib-only Python CLI (`cli/sidecart.py`) wraps
-the endpoints with Unix-style verbs (`ls`, `get`, `put`, `rm`,
-`mv`, `mkdir`, `rmdir`, `mvdir`, `volume`, `ping`).
+| Family | Endpoints | CLI prefix |
+| --- | --- | --- |
+| Health | `GET /api/v1/ping` | `sidecart ping` |
+| GEMDRIVE | `GET/PUT/DELETE/POST /api/v1/gemdrive/{volume,files,folders}/…` | `sidecart gemdrive …` |
+| Runner | `GET/POST /api/v1/runner/…` | `sidecart runner …` |
+| Debug | `GET /api/v1/debug`, `GET /api/v1/debug/log` | `sidecart debug …` |
 
-```sh
-# What you'd normally do from a Unix shell, against a remote disk:
-python3 cli/sidecart.py gemdrive ls /                   # list GEMDRIVE root
-python3 cli/sidecart.py gemdrive mkdir /GAMES           # mkdir
-python3 cli/sidecart.py gemdrive put GAME.TOS /GAMES/   # upload
-python3 cli/sidecart.py gemdrive mv /GAMES/GAME.TOS /GAMES/RUN.TOS  # rename
-python3 cli/sidecart.py gemdrive get /GAMES/RUN.TOS                  # download
-python3 cli/sidecart.py gemdrive rm /GAMES/RUN.TOS                   # delete
-python3 cli/sidecart.py gemdrive volume                              # SD capacity / fs type
-python3 cli/sidecart.py ping                                # health
-```
-
-Combine with Runner mode to drive a full edit-build-test cycle
-from your workstation:
-
-```sh
-# build on workstation, push, run, watch the result
-make game.tos
-python3 cli/sidecart.py gemdrive put game.tos /
-python3 cli/sidecart.py runner run /game.tos
-python3 cli/sidecart.py runner status         # check exit code
-```
-
-The full endpoint reference (curl + sidecart examples for every
-verb, error envelope, status codes) lives in
-[`docs/api.md`](docs/api.md). The API has **no authentication**
-— treat the network it's reachable on as trusted; don't expose
-it past your LAN.
+Full reference (curl + sidecart examples for every endpoint,
+JSON envelope shapes, error code vocabulary, status code map)
+lives in [`docs/api.md`](docs/api.md). The HTTP API has **no
+authentication** — treat the network it's reachable on as
+trusted; don't expose it past your LAN.
 
 ## Debug traces
 
