@@ -50,13 +50,15 @@
 
 /**
  * @brief Per-consumer cursor over the debug ring. Each independent
- *        consumer (DPRINTF drainer, HTTP /api/v1/debug/log streamer,
- *        future USB CDC sink) holds one of these. The producer is
+ *        consumer (HTTP `/api/v1/debug/log` streamer, USB CDC
+ *        sink in `usbcdc.c`) holds one of these. The producer is
  *        oblivious to consumer count — it just writes.
  *
  *        Initialise with debugcap_cursor_initSnapshot to start
  *        at the "now" position (the consumer sees only bytes
- *        emitted from this point forward).
+ *        emitted from this point forward), or jump forward later
+ *        with debugcap_cursor_skipToNow which preserves the
+ *        per-cursor `dropped` counter.
  */
 typedef struct debugcap_cursor {
   uint32_t read_pos;  // bytes-since-boot; difference vs producer's
@@ -103,6 +105,16 @@ void debugcap_cursor_skipToNow(debugcap_cursor_t *cur);
  *        high byte is 0xFF (and only when firmware mode is
  *        active). Cheap — single producer-side cursor advance,
  *        no locking.
+ *
+ *        Threading: today this module assumes a single Core 0
+ *        producer (chandler ingest) and single-core consumers
+ *        (HTTP poll context + main-loop USB drain). No memory
+ *        barriers are issued on producer/consumer hand-off. If
+ *        a future change moves any consumer to Core 1 (see the
+ *        "full Core 1 worker" backlog entry on Epic 05), the
+ *        store-then-increment in `debugcap_emit` and the
+ *        `g_debugWritePos` reads in `debugcap_cursor_*` will
+ *        need explicit barriers to preserve ordering.
  */
 void debugcap_emit(uint8_t b);
 

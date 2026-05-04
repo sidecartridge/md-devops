@@ -3,15 +3,26 @@
  * Author: Diego Parrilla Santamaría
  * Date: May 2026
  * Copyright: 2026 - GOODDATA LABS SL
- * Description: Epic 05 v2 / S5 — USB CDC sink for the debugcap ring.
+ * Description: Epic 05 — USB CDC sink for the debugcap ring.
  *
  *              Reuses the pico-sdk's `pico_stdio_usb` plumbing to
- *              bring up TinyUSB + a single CDC interface, then
- *              detaches it from stdio (`stdio_set_driver_enabled`)
- *              so DPRINTF stays UART-only. Debug bytes are written
- *              raw via `tud_cdc_write` — byte-exact, no \r/\n
- *              translation, mirroring the HTTP /api/v1/debug/log
- *              octet-stream contract.
+ *              bring up TinyUSB + a single CDC interface (the
+ *              async_context worker `pico_stdio_usb` registers is
+ *              what keeps `tud_task` alive on Core 0 in the
+ *              background), then detaches it from stdio
+ *              (`stdio_set_driver_enabled(&stdio_usb, false)`) so
+ *              DPRINTF stays UART-only. Debug bytes are written
+ *              raw via `tud_cdc_write` — byte-exact, no `\r` /
+ *              `\n` translation, mirroring the HTTP
+ *              `/api/v1/debug/log` octet-stream contract.
+ *
+ *              Holds its own `debugcap_cursor_t`, so the USB
+ *              consumer doesn't compete with HTTP `tail` for
+ *              bytes — both see the full stream independently.
+ *              On host (re)attach the cursor is skipped to
+ *              "now" (the unread lag is folded into
+ *              `cursor.dropped` so the loss is still visible
+ *              via `usbcdc_dropped` in `/api/v1/debug`).
  */
 
 #ifndef USBCDC_H

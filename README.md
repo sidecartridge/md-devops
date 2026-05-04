@@ -84,6 +84,107 @@ verb, error envelope, status codes) lives in
 treat the network it's reachable on as trusted; don't expose it past
 your LAN.
 
+## Debug traces
+
+The firmware exposes a lightweight debug-byte capture surface
+that the Atari ST (and any TOS / PRG it runs) can write to with
+a single cartridge cycle per byte, and that workstations can
+consume over either HTTP or USB. Public m68k ABI: every read in
+`$FBFF00..$FBFFFF` latches the low address byte (A7..A0) into
+the debug ring; the 8-bit data result is undefined and MUST be
+discarded.
+
+**Emit one byte, C**:
+
+```c
+#define DEBUG_BASE 0xFBFF00UL
+(void)*(volatile char *)(DEBUG_BASE + c);   // emit byte c
+```
+
+**Emit one byte, m68k assembly** (Motorola syntax — `vasm` /
+`stcmd`):
+
+```asm
+DEBUG_BASE  equ $FBFF00
+
+; In:  d0.b = byte to emit
+; Out: -
+; Trashes: d1, a0
+            lea     DEBUG_BASE,a0
+            moveq   #0,d1              ; zero-extend the byte → d1.w
+            move.b  d0,d1
+            tst.b   (a0,d1.w)          ; emit; read result discarded
+```
+
+**Dump a NUL-terminated string, C**:
+
+```c
+#define DEBUG_BASE 0xFBFF00UL
+
+static void debug_putc(unsigned char c) {
+  (void)*(volatile char *)(DEBUG_BASE + c);
+}
+static void debug_puts(const char *s) {
+  while (*s) debug_putc((unsigned char)*s++);
+}
+
+debug_puts("Hello, world!\n");
+```
+
+**Dump a NUL-terminated string, m68k assembly**:
+
+```asm
+DEBUG_BASE  equ $FBFF00
+
+; In:  a1 = pointer to NUL-terminated string
+; Trashes: d0, a0
+debug_puts:
+            lea     DEBUG_BASE,a0
+.loop:      moveq   #0,d0              ; zero-extend so d0.w is clean
+            move.b  (a1)+,d0           ; load byte; sets Z if NUL
+            beq.s   .done
+            tst.b   (a0,d0.w)          ; emit
+            bra.s   .loop
+.done:      rts
+
+; Call site:
+            lea     msg,a1
+            bsr     debug_puts
+            ...
+
+msg:        dc.b    'Hello, world!',$0A,0
+            even
+```
+
+Two transports run side-by-side; pick whichever fits your dev
+setup, or use both at once:
+
+```sh
+# Watch the byte stream over the network (no USB cable needed):
+python3 cli/sidecart.py debug tail
+
+# Or plug in a USB cable to the Pico and use any serial terminal:
+screen /dev/tty.usbmodem*  115200          # macOS — baud is cosmetic
+
+# Diagnostic envelope (firmware mode flag, ring stats, USB drop count):
+python3 cli/sidecart.py debug status
+```
+
+A tiny m68k test program at `target/atarist/test/hello-debug/`
+verifies the path end-to-end:
+
+```sh
+target/atarist/test/hello-debug/build.sh
+python3 cli/sidecart.py put target/atarist/test/hello-debug/dist/HELLODBG.TOS /
+python3 cli/sidecart.py runner run /HELLODBG.TOS
+# → "Hello, world!\n" × 1000 appears on whichever transport you're watching.
+```
+
+The capture is gated on firmware-mode commit (`[U]` / `[E]` /
+`[F]` in the menu) so menu activity never pollutes the stream.
+Full endpoint reference + multi-consumer model is in
+[`docs/api.md`](docs/api.md#debug-traces).
+
 ## License
 
 The source code of the project is licensed under the GNU General Public License v3.0. The full license is accessible in the [LICENSE](LICENSE) file. 

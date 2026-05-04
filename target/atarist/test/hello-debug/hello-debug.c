@@ -28,7 +28,9 @@
  * Try it:
  *   python3 cli/sidecart.py put dist/HELLODBG.TOS /
  *   python3 cli/sidecart.py runner run /HELLODBG.TOS
- *   # → RP debug console shows debugcap[14]: 48 65 6C 6C ... | "Hello, world!."
+ *   # In another shell, watch the bytes via either transport:
+ *   python3 cli/sidecart.py debug tail              # HTTP chunked stream
+ *   screen /dev/tty.usbmodem*  115200               # USB CDC (macOS)
  */
 
 #include <mint/osbind.h>
