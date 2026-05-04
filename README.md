@@ -453,57 +453,231 @@ switching screen resolutions, and reading a live system-memory
 snapshot. See [`docs/api.md`](docs/api.md) for the full reference
 (curl + sidecart examples for every endpoint).
 
-```sh
-python3 cli/sidecart.py runner status
-python3 cli/sidecart.py runner cd /GAMES/ARKANOID
-python3 cli/sidecart.py runner run RUNME.TOS
-python3 cli/sidecart.py runner reset
-python3 cli/sidecart.py runner res low
-python3 cli/sidecart.py runner meminfo
-```
+The surface splits in two:
 
-### Pexec lifecycle (load / exec / unload)
+- **Foreground** — `runner status` / `reset` / `cd` / `res` /
+  `meminfo` / `run` / `load` / `exec` / `unload`. These speak
+  to the m68k Runner poll loop, so they unblock cleanly when
+  the user-program returns but cannot reach a wedged ST.
+- **Advanced** — `runner adv status` / `meminfo` / `jump` /
+  `load`. These speak to a VBL-installed ISR (`$70`, or `$400`
+  if you switched `ADV_HOOK_VECTOR` to `etv_timer`) so they
+  keep working even when the foreground poll loop is wedged
+  (infinite loops, bombs already painted, traps disabled).
+  None of them gate on the foreground busy lock.
 
-For interactive-debugger-style workflows, the firmware also
-splits GEMDOS Pexec mode 0 into three separate verbs so a
-program can be loaded once and re-executed many times before
-its memory is released:
-
-```sh
-python3 cli/sidecart.py runner load /HELLODBG.TOS    # Pexec(3) — load only, returns basepage
-python3 cli/sidecart.py runner exec                   # Pexec(4) — run the loaded program
-python3 cli/sidecart.py runner exec                   # re-exec on the same basepage
-python3 cli/sidecart.py runner unload                 # Mfree the basepage when done
-```
-
-Strict-refuse: a second `load` while a program is still loaded
-returns `409 program_already_loaded` — `unload` it (or restart
-Runner mode) before submitting another. See
-[`docs/api.md`](docs/api.md#pexec-lifecycle-load--exec--unload)
-for the full lifecycle, mode-by-mode mapping, and error
-envelope.
-
-### Advanced Runner
-
-A second command surface runs from inside the m68k's VBL ISR
-(`$70`, or `$400` if you switched `ADV_HOOK_VECTOR` to
-`etv_timer`), so it keeps working when a launched program has
-wedged the foreground poll loop — infinite loops, bombs already
-painted, traps disabled. Two of the three POSTs (`adv jump`,
-`adv load`) require the VBL hook specifically; `adv meminfo`
-works on either vector. None gate on the busy lock.
+### `runner status` — show Runner state
 
 ```sh
-python3 cli/sidecart.py runner adv status                              # is the hook installed? which vector?
-python3 cli/sidecart.py runner adv meminfo                             # snapshot from inside the ISR
-python3 cli/sidecart.py runner adv jump 0xFA1C00                       # rte to a user address
-python3 cli/sidecart.py runner adv load ./kernel.bin 0x40000           # stream a file into RAM
+$ python3 cli/sidecart.py runner status
+active   : true
+busy     : no
+cwd      : /GAMES
+last     : RUN /GAMES/INVADERS.PRG (exit=0)
+loaded   : basepage 0x00078000
 ```
 
-`runner adv jump` and `runner adv load` accept addresses in
-decimal, `0xhex`, or `$hex` — quote `$hex` in your shell
-(`'$FA1C00'`) or the shell will eat it as a variable reference.
-Prefer `0xhex` in scripts.
+If Runner mode hasn't been entered yet, prints
+`Runner mode is not active. Boot via [U] to enable.` and exits
+0. `--json` returns the full envelope (`last_command` /
+`last_path` / `last_exit_code` / `last_cd_errno` /
+`last_res_errno` / `loaded_basepage` / `last_load_errno`).
+
+### `runner reset` — cold-reset the Atari ST
+
+```sh
+$ python3 cli/sidecart.py runner reset
+ok  RESET sent
+```
+
+Fire-and-forget (HTTP `202`). The ST reboots and the setup
+menu runs again — Runner mode is **not** auto-re-entered, so
+press `[U]` again or wait for the countdown.
+
+### `runner cd PATH` — change the Runner's cwd
+
+```sh
+$ python3 cli/sidecart.py runner cd /GAMES/ARKANOID
+ok  CD /GAMES/ARKANOID sent
+
+$ python3 cli/sidecart.py runner status
+…
+cwd      : /GAMES/ARKANOID
+last     : CD /GAMES/ARKANOID (errno=0)
+```
+
+GEMDOS `Dsetpath` under the hood. Path is jailed under
+`GEMDRIVE_FOLDER`. Fire-and-forget (HTTP `202`); the result
+errno is reported back on the next `runner status`.
+
+### `runner res low|med` — change ST screen rez
+
+```sh
+$ python3 cli/sidecart.py runner res low
+ok  RES low sent
+
+$ python3 cli/sidecart.py runner res med
+ok  RES med sent
+```
+
+XBIOS `Setscreen` under the hood. Only `low` (16 colours,
+320×200) and `med` (4 colours, 640×200) are accepted; high-rez
+mono is implicit on a mono monitor and not exposed by this
+verb.
+
+### `runner meminfo` — system memory snapshot
+
+```sh
+$ python3 cli/sidecart.py runner meminfo
+membottom [$432]  : 0x00006A04
+memtop    [$436]  : 0x00080000
+phystop   [$42E]  : 0x00080000
+screenmem [$44E]  : 0x00078000
+basepage  [$4F2]  : 0x00078000
+bank 0    [$FF8001 nibble] : 512 KB
+bank 1    [$FF8001 nibble] : 0 KB
+total RAM         : 512 KB
+```
+
+Synchronous — the m68k Runner reads the sysvars within one
+vsync and returns. Use it for "is this a 0.5 MB or 4 MB ST"
+diagnostics, basepage debugging, and screen-base spotting. If
+the foreground poll loop is wedged (a launched program froze
+the ST), use `runner adv meminfo` instead — same fields, but
+read from inside the VBL ISR.
+
+### `runner run REMOTE [args…]` — Pexec(0) load + go
+
+```sh
+$ python3 cli/sidecart.py runner run /HELLODBG.TOS
+ok  EXECUTE /HELLODBG.TOS sent
+
+$ python3 cli/sidecart.py runner run /TOOLS/CFG.PRG -v --debug
+ok  EXECUTE /TOOLS/CFG.PRG sent
+```
+
+GEMDOS `Pexec(0)` (load + go + free) under the hood —
+identical to typing the program's name on the GEMDOS prompt.
+Fire-and-forget (HTTP `202`); the program runs to completion
+and `runner status` shows the exit code afterwards. The
+command line is captured verbatim — leading dashes are fine,
+no `--` separator needed.
+
+### `runner load` / `runner exec` / `runner unload` — Pexec(3)/(4) lifecycle
+
+For interactive-debugger-style workflows, the firmware splits
+GEMDOS Pexec mode 0 into three separate verbs so a program can
+be loaded once and re-executed many times before its memory is
+released.
+
+```sh
+$ python3 cli/sidecart.py runner load /HELLODBG.TOS
+ok  LOAD /HELLODBG.TOS → basepage 0x00078000
+
+$ python3 cli/sidecart.py runner exec
+ok  EXEC sent
+
+$ python3 cli/sidecart.py runner exec       # re-exec on the same loaded program
+ok  EXEC sent
+
+$ python3 cli/sidecart.py runner unload
+ok  UNLOAD basepage 0x00078000
+```
+
+`runner load` is **synchronous** (Pexec mode 3, ≤ 10 s) — it
+returns the basepage on success, `409 program_already_loaded`
+if a program is still loaded, or `422 pexec_failed` with the
+GEMDOS errno if the load itself fails. `runner exec` is
+**fire-and-forget** (Pexec mode 4); Pexec(4) deliberately
+doesn't auto-free, so re-exec works against the same basepage.
+`runner unload` is synchronous (`Mfree(basepage)`, ≤ 5 s) and
+required to release the memory — it's never implicit on
+disconnect or reset.
+
+See [`docs/api.md`](docs/api.md#pexec-lifecycle-load--exec--unload)
+for the full mode-by-mode mapping and error envelope.
+
+### Advanced Runner — out-of-band VBL surface
+
+The Advanced Runner ISR keeps working even when a launched
+program has wedged the foreground Runner poll loop. `adv
+jump` and `adv load` require the VBL hook (`$70`)
+specifically; `adv meminfo` works on either `$70` or `$400`.
+
+#### `runner adv status` — hook installation state
+
+```sh
+$ python3 cli/sidecart.py runner adv status
+runner active : yes
+hook vector   : installed (vbl @ $70)
+```
+
+Reports whether Runner mode is active **and** whether the ISR
+has actually registered itself. A "yes / not installed"
+pairing means the m68k installer crashed before reaching
+`Setexc`; a "no" first line means Runner mode never started.
+
+#### `runner adv meminfo` — sysvar snapshot from inside the VBL ISR
+
+```sh
+$ python3 cli/sidecart.py runner adv meminfo
+membottom [$432]  : 0x00006A04
+memtop    [$436]  : 0x00080000
+phystop   [$42E]  : 0x00080000
+screenmem [$44E]  : 0x00078000
+basepage  [$4F2]  : 0x00078000
+bank 0    [$FF8001 nibble] : 512 KB
+bank 1    [$FF8001 nibble] : 0 KB
+total RAM         : 512 KB
+```
+
+Same fields and same printout as `runner meminfo`, but
+serviced from inside the VBL ISR — works against wedged
+programs the foreground meminfo can't reach. Reach for this
+when `runner meminfo` hangs.
+
+#### `runner adv jump ADDR` — patch the VBL `rte` PC
+
+```sh
+$ python3 cli/sidecart.py runner adv jump 0xFA1C00
+ok  ADV JUMP 0xFA1C00 sent (VBL ISR rte)
+
+$ python3 cli/sidecart.py runner adv jump '$78000'   # legacy hex — single-quote in the shell
+$ python3 cli/sidecart.py runner adv jump 491520     # decimal also accepted
+```
+
+Patches the saved program counter on the VBL ISR's stack so
+the `rte` resumes at `ADDR` instead of returning to whatever
+the ST was running. Fire-and-forget (HTTP `202`). `ADDR` must
+be even and within 24 bits. `0xhex`, `$hex`, and decimal are
+all accepted; single-quote `$hex` in your shell or it will be
+eaten as a variable reference. Prefer `0xhex` in scripts.
+
+Combine with `runner adv load` to drop a binary into RAM and
+jump straight into it, no Pexec, no GEMDOS:
+
+```sh
+$ python3 cli/sidecart.py runner adv load ./kernel.bin 0x78000
+$ python3 cli/sidecart.py runner adv jump 0x78000
+```
+
+#### `runner adv load LOCAL ADDR [SIZE]` — stream a workstation file into m68k RAM
+
+```sh
+$ python3 cli/sidecart.py runner adv load ./payload.bin 0x78000
+ok  ADV LOAD ./payload.bin → 0x78000 (32768 bytes)
+
+$ python3 cli/sidecart.py runner adv load ./big.bin 0x78000 0x4000   # cap to 16 KB
+ok  ADV LOAD ./big.bin → 0x78000 (16384 bytes)
+```
+
+Synchronous — the workstation file is chunked through
+`APP_FREE` 8 KB at a time. `ADDR` must be even, ≥ `0x800`
+(out of the system reserve), and fit below `phystop` (use
+`runner adv meminfo` to confirm). The optional `SIZE` cap
+(`0xhex` / `$hex` / decimal) truncates the upload — useful
+when `LOCAL` has a header you don't want landing on the ST.
+Same shell-quoting rule as `adv jump`.
 
 ## Debug traces
 
@@ -601,21 +775,73 @@ msg:        dc.b    'Hello, world!',$0A,0
 ```
 
 Two transports run side-by-side; pick whichever fits your dev
-setup, or use both at once:
+setup, or use both at once. The ring fans out internally, so
+each consumer sees every byte independently.
+
+### `debug status` — diagnostics envelope
 
 ```sh
-# Watch the byte stream over the network (no USB cable needed):
-python3 cli/sidecart.py debug tail
-
-# Or plug in a USB cable to the Pico and use any serial terminal:
-screen /dev/tty.usbmodem*  115200          # macOS — baud is cosmetic
-
-# Diagnostic envelope (firmware mode flag, ring stats, USB drop count):
-python3 cli/sidecart.py debug status
+$ python3 cli/sidecart.py debug status
+firmware_mode  : yes
+ring           : 0 / 1024 bytes
+bytes_dropped  : 0
+usbcdc_attached: yes
+usbcdc_dropped : 0
 ```
 
+`firmware_mode` flips to `yes` once the user has committed a
+mode at the menu (`[U]` / `[E]` / `[F]`) — the capture is
+gated on this so menu activity never pollutes the stream.
+`ring used / capacity` is the snapshot fill of the in-RAM
+debug ring at the moment of the request. `bytes_dropped` and
+`usbcdc_dropped` count bytes the firmware had to discard
+because the ring or the USB CDC tx queue was full — non-zero
+values mean the consumer side isn't draining fast enough (a
+slow `tail` reader, a USB serial terminal that isn't open).
+`--json` returns the raw envelope.
+
+### `debug tail` — live byte stream over HTTP
+
+```sh
+$ python3 cli/sidecart.py debug tail
+Hello, world!
+Hello, world!
+…
+^C
+```
+
+Long-poll over HTTP (chunked transfer encoding); the bytes
+the m68k emits to `$FBFF00..$FBFFFF` arrive on stdout as if
+they came off a serial port. Runs until you Ctrl-C, the
+device reboots, or the network drops. No USB cable required —
+this is the path you want when running across the room or
+behind a docking station that owns the Pico's only USB port.
+Pipe through `tee` to capture as well as watch:
+
+```sh
+$ python3 cli/sidecart.py debug tail | tee debug.log
+```
+
+### USB CDC — same stream, no network
+
+When the Pico is plugged into the workstation by USB, a CDC
+device shows up alongside the bus-emulation traffic and
+streams the exact same byte ring. There's no CLI verb — use
+any serial terminal:
+
+```sh
+screen /dev/tty.usbmodem*  115200          # macOS — baud is cosmetic
+# or:  picocom, minicom, miniterm, etc.
+```
+
+You can run `debug tail` and a serial terminal at the same
+time and both will see every byte. `debug status` reports
+whether a CDC client is currently `usbcdc_attached`.
+
+### End-to-end smoke
+
 A tiny m68k test program at `target/atarist/test/hello-debug/`
-verifies the path end-to-end:
+verifies the path:
 
 ```sh
 target/atarist/test/hello-debug/build.sh
@@ -624,8 +850,6 @@ python3 cli/sidecart.py runner run /HELLODBG.TOS
 # → "Hello, world!\n" × 1000 appears on whichever transport you're watching.
 ```
 
-The capture is gated on firmware-mode commit (`[U]` / `[E]` /
-`[F]` in the menu) so menu activity never pollutes the stream.
 Full endpoint reference + multi-consumer model is in
 [`docs/api.md`](docs/api.md#debug-traces).
 
