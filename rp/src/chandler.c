@@ -12,6 +12,8 @@
 #include <string.h>
 
 #include "commemul.h"
+#include "debugcap.h"
+#include "emul.h"
 
 static TransmissionProtocol pendingProtocol;
 static bool protocolPending = false;
@@ -142,6 +144,23 @@ static inline void __not_in_flash_func(handle_protocol_checksum_error)(
 
 static inline void __not_in_flash_func(chandler_consume_rom3_sample)(
     uint16_t sample) {
+  // Consumer 2: debug-byte filter (Epic 05 v2). External programs
+  // emit one byte per cartridge cycle by reading at $FBFF00 + c
+  // (where c is the byte). The captured value's high byte is then
+  // 0xFF, low byte is c. Both consumers run on every captured
+  // sample — TPROTOCOL frames are temporally atomic so an
+  // overlapping debug capture doesn't confuse the parser, and an
+  // overlap between TPROTOCOL payloads and debug bytes is acceptable
+  // by design (printing the noise is fine; corruption is impossible).
+  // Pre-firmware-mode emits get dropped at the handler so menu-mode
+  // activity never pollutes the diagnostic stream.
+  if ((sample & 0xFF00u) == 0xFF00u) {
+    if (emul_isFirmwareMode()) {
+      debugcap_emit((uint8_t)(sample & 0xFFu));
+    }
+  }
+
+  // Consumer 1: existing TPROTOCOL frame parser.
   uint16_t addr_lsb = (uint16_t)(sample ^ CHANDLER_ADDRESS_HIGH_BIT);
 
   tprotocol_parse(addr_lsb, handle_protocol_command,

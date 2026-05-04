@@ -660,6 +660,93 @@ def cmd_runner_adv_status(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_debug_tail(args: argparse.Namespace) -> int:
+    """GET /api/v1/debug/log — stream debug bytes until interrupted.
+
+    Connects to the chunked-transfer-encoding endpoint and writes
+    raw response bytes to stdout (the m68k's debug bytes show up
+    on the workstation as if they came off a serial port). The
+    connection stays open until the user kills it with Ctrl-C, the
+    server closes (e.g., device reboot), or the network drops.
+    """
+    url = base_url(args.host) + "/api/v1/debug/log"
+    req = urllib.request.Request(
+        url, method="GET",
+        headers={"User-Agent": USER_AGENT, "Accept": "application/octet-stream"})
+    try:
+        # No timeout — we deliberately want to block forever.
+        resp = urllib.request.urlopen(req, timeout=None)
+    except urllib.error.HTTPError as exc:
+        # Non-200 from the server — render the error envelope if any.
+        try:
+            raw = exc.read() if exc.fp is not None else b""
+        finally:
+            exc.close()
+        parsed: dict | None = None
+        if raw:
+            try:
+                parsed = json.loads(raw.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                parsed = None
+        render_error(parsed, raw, exc.code)
+        return status_to_exit_code(exc.code)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    try:
+        # Read in small chunks so the bytes appear on the workstation
+        # as soon as the device sends them. urlopen + chunked is
+        # streaming-friendly: each .read(N) returns whatever's
+        # available without waiting for N bytes.
+        out = sys.stdout.buffer
+        while True:
+            chunk = resp.read(256)
+            if not chunk:
+                break  # server closed
+            out.write(chunk)
+            out.flush()
+    except KeyboardInterrupt:
+        return EXIT_OK
+    finally:
+        resp.close()
+    return EXIT_OK
+
+
+def cmd_debug_status(args: argparse.Namespace) -> int:
+    """GET /api/v1/debug — fast-debug-traces diagnostics (Epic 05 v2)."""
+    url = base_url(args.host) + "/api/v1/debug"
+    try:
+        status, parsed, raw = request_json("GET", url)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200 or parsed is None or parsed.get("ok") is not True:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        json.dump(parsed, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return EXIT_OK
+    if args.quiet:
+        return EXIT_OK
+
+    fw = parsed.get("firmware_mode", False)
+    used = parsed.get("ring_used", 0)
+    cap = parsed.get("ring_capacity", 0)
+    dropped = parsed.get("bytes_dropped", 0)
+    usbcdc_attached = parsed.get("usbcdc_attached", False)
+    usbcdc_dropped = parsed.get("usbcdc_dropped", 0)
+    print(f"firmware_mode  : {'yes' if fw else 'no'}")
+    print(f"ring           : {used} / {cap} bytes")
+    print(f"bytes_dropped  : {dropped}")
+    print(f"usbcdc_attached: {'yes' if usbcdc_attached else 'no'}")
+    print(f"usbcdc_dropped : {usbcdc_dropped}")
+    return EXIT_OK
+
+
 def cmd_runner_meminfo(args: argparse.Namespace) -> int:
     """GET /api/v1/runner/meminfo — synchronous system memory snapshot."""
     url = base_url(args.host) + "/api/v1/runner/meminfo"
@@ -1076,6 +1163,20 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Command-line arguments (joined with spaces, ≤127 chars). "
                             "Everything after REMOTE is captured verbatim, including "
                             "leading dashes — no need for --.")
+
+    debug = sub.add_parser(
+        "debug",
+        help="Fast-debug-traces (Epic 05) diagnostics + transports.")
+    debug_sub = debug.add_subparsers(dest="debug_cmd", required=True)
+    debug_sub.add_parser(
+        "status",
+        help="Show whether firmware mode has committed and the "
+             "current debug-byte ring occupancy / drop count.")
+    debug_sub.add_parser(
+        "tail",
+        help="Stream debug bytes as the device emits them. "
+             "Like `tail -f` for the m68k debug output. Runs "
+             "until Ctrl-C, server close, or network drop.")
     return p
 
 
@@ -1120,6 +1221,16 @@ def main(argv: list[str] | None = None) -> int:
         handler = runner_handlers.get(args.runner_cmd)
         if handler is None:
             parser.error(f"unknown runner subcommand: {args.runner_cmd}")
+            return EXIT_USAGE
+        return handler(args)
+    if args.cmd == "debug":
+        debug_handlers = {
+            "status": cmd_debug_status,
+            "tail": cmd_debug_tail,
+        }
+        handler = debug_handlers.get(args.debug_cmd)
+        if handler is None:
+            parser.error(f"unknown debug subcommand: {args.debug_cmd}")
             return EXIT_USAGE
         return handler(args)
     handler = handlers.get(args.cmd)

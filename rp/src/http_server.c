@@ -10,6 +10,7 @@
 #include "aconfig.h"
 #include "chandler.h"
 #include "debug.h"
+#include "debugcap.h"
 #include "display.h"
 #include "emul.h"
 #include "ff.h"
@@ -22,6 +23,7 @@
 #include "pico/time.h"
 #include "runner.h"
 #include "settings.h"
+#include "usbcdc.h"
 
 // Cartridge shared-region mirror in RP RAM (memmap_rp.ld). Used by
 // the Runner endpoints to write path / cmdline buffers the m68k
@@ -72,6 +74,7 @@ typedef enum {
   HC_STREAM_DOWNLOAD,
   HC_STREAM_UPLOAD,
   HC_STREAM_LOAD,
+  HC_STREAM_DEBUG,
   HC_DRAINING,
 } hc_state_t;
 
@@ -153,6 +156,13 @@ typedef struct http_conn {
   uint32_t adv_load_start;         // original target — kept for the response envelope
   uint32_t adv_load_chunk_pos;     // bytes accumulated in the current chunk buffer
 
+  // Streaming debug-log state (Epic 05 v2 / S4). Active while
+  // state == HC_STREAM_DEBUG. The cursor is initialised at the
+  // current producer position when the connection enters the
+  // streaming state so the client sees only bytes emitted from
+  // its connect time forward (tail -f shape, not "show all").
+  debugcap_cursor_t debug_cursor;
+
   // Range request state, populated during header parsing.
   bool has_range;
   bool range_invalid;        // syntactically present but unparseable
@@ -200,6 +210,11 @@ static void srv_err_cb(void *arg, err_t err);
 // download / listing / upload route handlers further down.
 static void stream_listing_drive(http_conn_t *c);
 static void stream_download_drive(http_conn_t *c);
+static void stream_debug_drive(http_conn_t *c);
+// Chunked-encoding helpers (definitions further down).
+static err_t stream_send_chunk(http_conn_t *c, const char *body,
+                               size_t body_len);
+static err_t stream_send_terminator(http_conn_t *c);
 static bool handle_file_upload_init(http_conn_t *c, const char *body_start,
                                     size_t leftover);
 static void upload_finish_ok(http_conn_t *c);
@@ -462,6 +477,8 @@ static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u1
     stream_listing_drive(c);
   } else if (c->state == HC_STREAM_DOWNLOAD) {
     stream_download_drive(c);
+  } else if (c->state == HC_STREAM_DEBUG) {
+    stream_debug_drive(c);
   } else if (c->state == HC_DRAINING && c->stream_body_done) {
     // Streaming finished and the chunked terminator has now been
     // ack'd; safe to close.
@@ -473,10 +490,18 @@ static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u1
 static err_t __not_in_flash_func(srv_poll_cb)(void *arg, struct tcp_pcb *pcb) {
   (void)pcb;
   http_conn_t *c = (http_conn_t *)arg;
-  if (c != NULL) {
-    DPRINTF("http_server: idle timeout, closing connection\n");
-    conn_close(c);
+  if (c == NULL) {
+    return ERR_OK;
   }
+  // /api/v1/debug/log is a long-lived `tail -f` stream — the producer
+  // (m68k debug emits) can be quiet for hours. Don't sweep it on idle.
+  // Try to push any bytes that may have arrived since the last drive.
+  if (c->state == HC_STREAM_DEBUG) {
+    stream_debug_drive(c);
+    return ERR_OK;
+  }
+  DPRINTF("http_server: idle timeout, closing connection\n");
+  conn_close(c);
   return ERR_OK;
 }
 
@@ -2161,6 +2186,133 @@ static void __not_in_flash_func(handle_runner_adv_status)(http_conn_t *c) {
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
+// GET /api/v1/debug — Epic 05 v2 / S3.
+//
+// Diagnostics envelope for the fast-debug-traces feature:
+//   {
+//     "ok": true,
+//     "firmware_mode": <bool>,        // emul_isFirmwareMode()
+//     "ring_used": <bytes pending drain>,
+//     "ring_capacity": <ring size>,
+//     "bytes_dropped": <producer-side drops; always 0 in v2 — the
+//                      producer overwrites and per-cursor drops are
+//                      surfaced on each consumer instead>,
+//     "usbcdc_attached": <true iff a USB CDC host has the port open
+//                        with DTR asserted (Epic 05 v2 / S5)>,
+//     "usbcdc_dropped": <bytes lost on the USB CDC sink's cursor
+//                       — sum of (a) bytes emitted while no host
+//                       was attached (S7 folds the unread lag
+//                       into `dropped` on every (re)attach) and
+//                       (b) in-session drops where the producer
+//                       wrapped past the cursor while the host's
+//                       TX FIFO stalled. Cumulative since boot.>
+//   }
+static void __not_in_flash_func(handle_debug_status)(http_conn_t *c) {
+  uint32_t ring_used = 0;
+  uint32_t ring_capacity = 0;
+  uint32_t bytes_dropped = 0;
+  debugcap_getRingStats(&ring_used, &ring_capacity, &bytes_dropped);
+
+  uint32_t usbcdc_dropped = 0;
+  bool usbcdc_attached = false;
+  usbcdc_getStats(&usbcdc_dropped, &usbcdc_attached);
+
+  char body[224];
+  int n = snprintf(
+      body, sizeof(body),
+      "{\"ok\":true,\"firmware_mode\":%s,"
+      "\"ring_used\":%lu,\"ring_capacity\":%lu,\"bytes_dropped\":%lu,"
+      "\"usbcdc_attached\":%s,\"usbcdc_dropped\":%lu}\n",
+      emul_isFirmwareMode() ? "true" : "false",
+      (unsigned long)ring_used,
+      (unsigned long)ring_capacity,
+      (unsigned long)bytes_dropped,
+      usbcdc_attached ? "true" : "false",
+      (unsigned long)usbcdc_dropped);
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
+// GET /api/v1/debug/log — Epic 05 v2 / S4.
+//
+// Streaming endpoint that pours debug bytes captured by the
+// chandler ingest filter into the response body using HTTP/1.1
+// chunked transfer-encoding. The response stays open until the
+// client disconnects (tail -f shape, not "show all"). Each
+// connection holds its own per-cursor (debugcap_cursor_t) so
+// concurrent consumers — HTTP tail + future USB CDC — don't
+// steal bytes from each other.
+//
+// Content-Type is application/octet-stream because the body is
+// raw bytes the m68k emitted. Treating it as text would force
+// us to encode binary or non-printable bytes; the contract for
+// the public ABI is "you get exactly what was emitted", so
+// octet-stream is honest.
+static void __not_in_flash_func(stream_debug_drive)(http_conn_t *c) {
+  // Pull as many bytes as we can fit in c->resp (re-used as a
+  // scratch buffer for the chunk body).
+  uint8_t *buf = (uint8_t *)c->resp;
+  uint32_t take = debugcap_cursor_pull(&c->debug_cursor, buf,
+                                       (uint32_t)sizeof(c->resp));
+  if (take == 0) {
+    // Nothing to send right now. Don't emit a zero-length chunk
+    // (that's the chunked terminator and would close the stream).
+    // Just return and wait for the next sent_cb / poll_cb fire.
+    // The lwIP poll callback (~16 s default sweeper) will keep
+    // the connection alive even when fully idle; meanwhile any
+    // emit on the producer side will eventually surface here on
+    // a subsequent drive-call.
+    return;
+  }
+
+  if (stream_send_chunk(c, (const char *)buf, (size_t)take) != ERR_OK) {
+    conn_close(c);
+    return;
+  }
+}
+
+static void __not_in_flash_func(handle_debug_log)(http_conn_t *c) {
+  // Send status line + headers (chunked encoding, no Content-Length).
+  int hn = snprintf(c->resp, sizeof(c->resp),
+                    "HTTP/1.1 200 OK\r\n"
+                    "Server: md-devops/%s\r\n"
+                    "Connection: close\r\n"
+                    "Content-Type: application/octet-stream\r\n"
+                    "Transfer-Encoding: chunked\r\n"
+                    "\r\n",
+                    RELEASE_VERSION);
+  if (hn < 0 || (size_t)hn >= sizeof(c->resp)) {
+    conn_close(c);
+    return;
+  }
+  err_t err = tcp_write(c->pcb, c->resp, (u16_t)hn,
+                        TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE);
+  if (err != ERR_OK) {
+    conn_close(c);
+    return;
+  }
+  tcp_output(c->pcb);
+
+  // HEAD: emit the chunked terminator and close.
+  if (c->is_head) {
+    (void)stream_send_terminator(c);
+    conn_close(c);
+    return;
+  }
+
+  // Initialise the per-conn cursor at the current producer
+  // position so the client sees only bytes emitted from now on.
+  debugcap_cursor_initSnapshot(&c->debug_cursor);
+
+  c->state = HC_STREAM_DEBUG;
+
+  // Kick the first drive immediately — if there are bytes already
+  // queued (unlikely for a freshly-snapshotted cursor, but cheap
+  // to check), they go out without waiting for sent_cb. Otherwise
+  // it's a no-op and the next sent_cb / poll_cb picks up.
+  stream_debug_drive(c);
+}
+
 // GET /api/v1/runner/meminfo — Epic 03 / S6.
 //
 // Synchronous: writes RUNNER_CMD_MEMINFO to the cartridge sentinel,
@@ -3547,6 +3699,8 @@ static const route_t g_routes[] = {
     {"/api/v1/volume", M_GET | M_HEAD, handle_volume},
     {"/api/v1/files", M_GET | M_HEAD, handle_files_list},
     {"/api/v1/runner", M_GET | M_HEAD, handle_runner_status},
+    {"/api/v1/debug", M_GET | M_HEAD, handle_debug_status},
+    {"/api/v1/debug/log", M_GET | M_HEAD, handle_debug_log},
 };
 
 #define ROUTES_COUNT (sizeof(g_routes) / sizeof(g_routes[0]))

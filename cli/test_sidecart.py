@@ -1241,6 +1241,108 @@ class RunnerAdvLoadTests(unittest.TestCase):
         self.assertIn("wrong_hook", err)
 
 
+class DebugStatusTests(unittest.TestCase):
+    """Epic 05 v2 / S3 — `sidecart debug status`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_debug_status_human(self) -> None:
+        self._set_response(200, {
+            "ok": True,
+            "firmware_mode": False,
+            "ring_used": 0,
+            "ring_capacity": 8192,
+            "bytes_dropped": 0,
+            "usbcdc_attached": False,
+            "usbcdc_dropped": 0,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "debug", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "GET")
+        self.assertEqual(self.server.state.last_path, "/api/v1/debug")
+        self.assertIn("firmware_mode", out)
+        self.assertIn("8192", out)
+        self.assertIn("usbcdc_attached", out)
+
+    def test_debug_status_firmware_mode_yes(self) -> None:
+        self._set_response(200, {
+            "ok": True,
+            "firmware_mode": True,
+            "ring_used": 42,
+            "ring_capacity": 8192,
+            "bytes_dropped": 0,
+            "usbcdc_attached": True,
+            "usbcdc_dropped": 7,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "debug", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("yes", out)
+        self.assertIn("42 / 8192", out)
+        # usbcdc_attached: yes, usbcdc_dropped: 7
+        self.assertRegex(out, r"usbcdc_attached\s*:\s*yes")
+        self.assertRegex(out, r"usbcdc_dropped\s*:\s*7")
+
+    def test_debug_status_json(self) -> None:
+        self._set_response(200, {
+            "ok": True,
+            "firmware_mode": False,
+            "ring_used": 0,
+            "ring_capacity": 8192,
+            "bytes_dropped": 0,
+            "usbcdc_attached": False,
+            "usbcdc_dropped": 0,
+        })
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "--json", "debug", "status"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        parsed = json.loads(out.strip())
+        self.assertEqual(parsed["ring_capacity"], 8192)
+        self.assertIn("usbcdc_attached", parsed)
+        self.assertIn("usbcdc_dropped", parsed)
+
+
+class DebugTailTests(unittest.TestCase):
+    """Epic 05 v2 / S4 — `sidecart debug tail`.
+
+    Byte-level streaming of the response body is exercised on
+    hardware (urllib + chunked transfer-encoding is stdlib
+    behaviour); these tests cover URL hit + error-envelope
+    rendering at the CLI layer.
+    """
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def test_debug_tail_404_renders_error(self) -> None:
+        body = json.dumps({
+            "ok": False,
+            "code": "not_found",
+            "message": "Route not found",
+        }).encode("utf-8")
+        self.server.state.next_status = 404
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "debug", "tail"])
+        self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
+        self.assertIn("not_found", err)
+        self.assertEqual(self.server.state.last_method, "GET")
+        self.assertEqual(self.server.state.last_path, "/api/v1/debug/log")
+
+
 class HostResolutionTests(unittest.TestCase):
 
     def test_explicit_host_wins_over_env(self) -> None:

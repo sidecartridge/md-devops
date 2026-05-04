@@ -295,8 +295,23 @@ SECTIONS
 
 
 
-    /* stack limit is poorly named, but historically is maximum heap ptr */
-    __StackLimit = ORIGIN(RAM) + LENGTH(RAM) + LENGTH(ROM_IN_RAM);
+    /* stack limit is poorly named, but historically is maximum heap ptr.
+     *
+     * IMPORTANT: cap at the START of ROM_IN_RAM, not its end. Adding
+     * LENGTH(ROM_IN_RAM) (as the original Pico-SDK template does) lets
+     * the heap grow straight through the cartridge mirror once
+     * BSS+heap exceeds the 192 KB RAM region — silently corrupting
+     * whatever the cartridge image had at the addresses malloc grabbed.
+     * Symptom: cartridge boots fine on cold power-on, but breaks on
+     * the first Atari ST reset after lwIP/WiFi/HTTP have allocated
+     * enough heap to spill past ORIGIN(RAM)+LENGTH(RAM).
+     *
+     * With this cap, any future BSS+heap overflow surfaces as either a
+     * hard "region RAM overflowed" link-time error (caught by the
+     * ASSERT below) or an out-of-memory failure at runtime — both of
+     * which are loud and easy to diagnose, instead of a mystery
+     * cartridge boot failure later. */
+    __StackLimit = ORIGIN(RAM) + LENGTH(RAM);
     __StackOneTop = ORIGIN(SCRATCH_X) + LENGTH(SCRATCH_X);
     __StackTop = ORIGIN(SCRATCH_Y) + LENGTH(SCRATCH_Y);
     __StackOneBottom = __StackOneTop - SIZEOF(.stack1_dummy);

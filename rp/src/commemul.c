@@ -14,7 +14,12 @@
 #include "hardware/dma.h"
 #include "hardware/pio.h"
 
-#define COMM_RING_BITS 15u
+// 8 KB ring (4096 × uint16_t samples). Sized at ~2× the largest
+// TPROTOCOL frame's worth of bus traffic (max payload 2048 + ~64 B
+// framing → ~4240 samples worst case) so chandler has comfortable
+// headroom between drain ticks. Must remain a power of two ≤ 15
+// for the RP2040 DMA hardware-ring wrap.
+#define COMM_RING_BITS 13u
 #define COMM_RING_SIZE_BYTES (1ul << COMM_RING_BITS)
 #define COMM_RING_WORDS (COMM_RING_SIZE_BYTES / sizeof(uint16_t))
 #define COMM_RING_MASK (COMM_RING_WORDS - 1u)

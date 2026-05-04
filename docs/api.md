@@ -814,6 +814,137 @@ bad size), `400 ram_overflow`, `409 runner_inactive`,
 
 ---
 
+## Debug traces
+
+A high-bandwidth, zero-CPU-overhead path the Atari ST (and any
+TOS / PRG it runs) can use to stream diagnostic bytes back to a
+workstation. The capture rides on the existing ROM3 protocol
+pipeline: every read in `$FBFF00..$FBFFFF` is filtered on the
+RP side, and the byte (`address & 0xFF`) is appended to a small
+ring drained by HTTP and / or USB CDC consumers.
+
+**m68k emit form (the public ABI)**:
+
+```c
+#define DEBUG_BASE 0xFBFF00UL
+(void)*(volatile char *)(DEBUG_BASE + c);   // emit byte c
+```
+
+One cartridge cycle per byte. The 8-bit read result is undefined
+and MUST be discarded.
+
+The capture is gated on the firmware-mode flag — it goes live
+the moment the user picks `[U]` / `[E]` / `[F]` in the setup
+menu and the device commits to firmware mode. Pre-commit reads
+in the debug window are dropped at the RP filter so menu-mode
+activity never pollutes the diagnostic stream.
+
+Two consumers can read the captured stream in parallel without
+stealing bytes from each other: an HTTP `tail -f`-style
+streamer and a USB CDC sink. Each holds its own logical cursor
+into the ring; both see the full byte stream independently.
+
+### `GET /api/v1/debug` — diagnostics envelope
+
+Reports the firmware-mode flag and ring stats. Does NOT consume
+bytes; safe to poll at any cadence.
+
+**Response 200**:
+```json
+{
+  "ok": true,
+  "firmware_mode": true,
+  "ring_used": 8192,
+  "ring_capacity": 8192,
+  "bytes_dropped": 0,
+  "usbcdc_attached": true,
+  "usbcdc_dropped": 0
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `firmware_mode` | `true` once `[U]` / `[E]` / `[F]` has committed; until then, debug emits are dropped at the RP filter. |
+| `ring_used` | Bytes currently in the producer's ring (capped at `ring_capacity`). |
+| `ring_capacity` | Ring size (8192 today). |
+| `bytes_dropped` | Producer-side drops. Always 0 in the current design (the producer overwrites; per-consumer drops are reported separately). |
+| `usbcdc_attached` | `true` iff a host has the CDC port open with DTR asserted. |
+| `usbcdc_dropped` | Cumulative bytes lost on the USB CDC consumer's cursor since boot — sum of (a) bytes emitted while no host was attached, and (b) in-session drops where the host's TX FIFO stalled. |
+
+**`curl`**:
+```sh
+curl http://sidecart.local/api/v1/debug
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py debug status
+```
+
+### `GET /api/v1/debug/log` — chunked byte stream
+
+Long-lived `tail -f` shape. The response uses HTTP/1.1
+`Transfer-Encoding: chunked` and `Content-Type:
+application/octet-stream` (raw bytes, no encoding). The
+connection stays open until the client disconnects, the device
+reboots, or the network drops.
+
+Each connected client gets its own cursor, snapshotted at the
+moment the connection opens — clients see only bytes emitted
+*from that point forward*, not the ring's stale tail.
+
+**`curl`**:
+```sh
+curl --no-buffer http://sidecart.local/api/v1/debug/log
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py debug tail
+```
+
+Errors: `404 not_found` if the route is unavailable on the
+build (shouldn't happen — included unconditionally).
+
+### USB CDC alternative
+
+After flashing, the device also exposes a USB CDC interface.
+Plug a USB cable into the Pico and the workstation gets a
+serial port (`/dev/tty.usbmodem*` on macOS, `/dev/ttyACM*` on
+Linux, `COM*` on Windows). The same debug bytes the HTTP tail
+streams will land on that port, byte-exact:
+
+```sh
+screen /dev/tty.usbmodem*  115200          # baud is informational
+```
+
+The CDC port is dedicated to debug bytes — the firmware's own
+DPRINTF diagnostics go to the UART debug header, not the CDC
+port. (Toggle `_DEBUG=1` in the build to enable UART DPRINTF.)
+
+### Verifying the path end-to-end
+
+The repo ships a tiny ST test program at
+`target/atarist/test/hello-debug/`. Build it (`./build.sh`),
+upload, run, and watch one of the consumers:
+
+```sh
+# Build, upload, run.
+target/atarist/test/hello-debug/build.sh
+python3 cli/sidecart.py put target/atarist/test/hello-debug/dist/HELLODBG.TOS /
+python3 cli/sidecart.py runner run /HELLODBG.TOS
+
+# In another shell, watch the bytes via either transport:
+python3 cli/sidecart.py debug tail              # → "Hello, world!\n" × 1000
+# or
+screen /dev/tty.usbmodem*  115200
+```
+
+`runner status` should report `last_exit_code: 0` once the
+program exits.
+
+---
+
 ## CLI exit codes
 
 `cli/sidecart.py` maps response status to a granular exit code so
