@@ -105,6 +105,16 @@ static const size_t numCommands = sizeof(commands) / sizeof(commands[0]);
 static bool keepActive = true;
 static bool menuScreenActive = false;
 
+// Epic 06 / S4: cached "USB CDC attached" state from the last
+// menu paint. -1 means "not yet rendered this menu session";
+// any 0/1 transition triggers refreshUsbCdcLine() to overdraw
+// the status line in place. Lives at module scope because both
+// menu() (initial paint) and the main loop (live refresh) touch
+// it. Fixed cursor row so the overdraw doesn't have to walk the
+// terminal state.
+#define MENU_USBCDC_ROW 15
+static int g_menuLastUsbCdcAttached = -1;
+
 // Runner state owned RP-side (the m68k can't write to the cartridge
 // address space — read-only ROM emulation — so any handshake from
 // the Runner has to live in RP RAM). cmdRunner flips active when
@@ -495,6 +505,31 @@ static void refreshSetupInfoLine(void) {
   }
 }
 
+// Epic 06 / S4. Polled from the main loop while the menu screen
+// is up; on a state transition (host plugged in / unplugged) it
+// overdraws just the USB CDC status line at MENU_USBCDC_ROW + 1
+// rather than rebuilding the whole menu. Both display strings
+// are 12 chars long so the overdraw fully covers the previous
+// value with no stale tail bytes. Cheap when there's no change
+// (one bool comparison).
+static void refreshUsbCdcLine(void) {
+  if (!menuScreenActive) return;
+  bool attached = false;
+  usbcdc_getStats(NULL, &attached);
+  if ((int)attached == g_menuLastUsbCdcAttached) return;
+  g_menuLastUsbCdcAttached = (int)attached;
+  vt52Cursor(MENU_USBCDC_ROW + 1, 0);
+  term_printString("  Status      : ");
+  term_printString(attached ? "connected   " : "disconnected");
+  // Restore the cursor home position (right after the
+  // "Select an option: " prompt on the bottom row) so the
+  // overdraw doesn't leave it stranded over the USB CDC line.
+  // "Select an option: " is 18 chars, so col 18 is the spot
+  // the user expects to type into.
+  vt52Cursor(TERM_SCREEN_SIZE_Y - 1, 18);
+  display_refresh();
+}
+
 // --- Directory navigation pager (ported from md-drives-emulator) ------
 
 #define NAV_LINES_PER_PAGE 16
@@ -805,6 +840,19 @@ static void __not_in_flash_func(menu)(void) {
   term_printString(urlLine);
   term_printString("\n");
   term_printString(ipLine);
+
+  // Epic 06 / S4: USB CDC connection status. Painted at a fixed
+  // row so refreshUsbCdcLine() (called from the main loop) can
+  // overdraw the status text in place when the host attaches /
+  // detaches without rebuilding the rest of the menu.
+  bool usbAttached = false;
+  usbcdc_getStats(NULL, &usbAttached);
+  g_menuLastUsbCdcAttached = (int)usbAttached;
+  vt52Cursor(MENU_USBCDC_ROW, 0);
+  term_printString("USB CDC (Debug serial)");
+  vt52Cursor(MENU_USBCDC_ROW + 1, 0);
+  term_printString("  Status      : ");
+  term_printString(usbAttached ? "connected   " : "disconnected");
 
   vt52Cursor(TERM_SCREEN_SIZE_Y - 2, 0);
   term_printString("[E]xit (launch)  r[U]nner  [X] Booster");
@@ -1535,6 +1583,12 @@ void emul_start() {
         }
       }
     }
+
+    // Epic 06 / S4: live-refresh the USB CDC status line on the
+    // menu (independent of countdown halt state — the user should
+    // see the plug/unplug transition whether they've stopped the
+    // counter or not).
+    refreshUsbCdcLine();
   }
 
   // 10. Send RESET computer command
