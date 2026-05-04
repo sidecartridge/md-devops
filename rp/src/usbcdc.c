@@ -67,3 +67,12 @@ void __not_in_flash_func(usbcdc_drain)(void) {
   tud_cdc_write(buf, take);
   tud_cdc_write_flush();
 }
+
+void usbcdc_getStats(uint32_t *dropped, bool *attached) {
+  if (dropped != NULL) {
+    *dropped = g_usbcdcInitialized ? g_usbcdcCursor.dropped : 0u;
+  }
+  if (attached != NULL) {
+    *attached = g_usbcdcInitialized ? tud_cdc_connected() : false;
+  }
+}

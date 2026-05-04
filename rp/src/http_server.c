@@ -23,6 +23,7 @@
 #include "pico/time.h"
 #include "runner.h"
 #include "settings.h"
+#include "usbcdc.h"
 
 // Cartridge shared-region mirror in RP RAM (memmap_rp.ld). Used by
 // the Runner endpoints to write path / cmdline buffers the m68k
@@ -2193,27 +2194,39 @@ static void __not_in_flash_func(handle_runner_adv_status)(http_conn_t *c) {
 //     "firmware_mode": <bool>,        // emul_isFirmwareMode()
 //     "ring_used": <bytes pending drain>,
 //     "ring_capacity": <ring size>,
-//     "bytes_dropped": <cumulative emits lost to ring-full>
+//     "bytes_dropped": <producer-side drops; always 0 in v2 — the
+//                      producer overwrites and per-cursor drops are
+//                      surfaced on each consumer instead>,
+//     "usbcdc_attached": <true iff a USB CDC host has the port open
+//                        with DTR asserted (Epic 05 v2 / S5)>,
+//     "usbcdc_dropped": <bytes lost on the USB CDC sink's cursor
+//                       because the producer wrapped past it
+//                       (e.g. burst arrived while no host attached
+//                        or host TX FIFO stalled). Cumulative since
+//                        boot.>
 //   }
-//
-// In v2 this stays purely informational — no transport state is
-// exposed. Future stories add /api/v1/debug/log (chunked stream)
-// for actual byte exfiltration.
 static void __not_in_flash_func(handle_debug_status)(http_conn_t *c) {
   uint32_t ring_used = 0;
   uint32_t ring_capacity = 0;
   uint32_t bytes_dropped = 0;
   debugcap_getRingStats(&ring_used, &ring_capacity, &bytes_dropped);
 
-  char body[160];
+  uint32_t usbcdc_dropped = 0;
+  bool usbcdc_attached = false;
+  usbcdc_getStats(&usbcdc_dropped, &usbcdc_attached);
+
+  char body[224];
   int n = snprintf(
       body, sizeof(body),
       "{\"ok\":true,\"firmware_mode\":%s,"
-      "\"ring_used\":%lu,\"ring_capacity\":%lu,\"bytes_dropped\":%lu}\n",
+      "\"ring_used\":%lu,\"ring_capacity\":%lu,\"bytes_dropped\":%lu,"
+      "\"usbcdc_attached\":%s,\"usbcdc_dropped\":%lu}\n",
       emul_isFirmwareMode() ? "true" : "false",
       (unsigned long)ring_used,
       (unsigned long)ring_capacity,
-      (unsigned long)bytes_dropped);
+      (unsigned long)bytes_dropped,
+      usbcdc_attached ? "true" : "false",
+      (unsigned long)usbcdc_dropped);
   if (n < 0) n = 0;
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }

@@ -17,6 +17,9 @@
 #ifndef USBCDC_H
 #define USBCDC_H
 
+#include <stdbool.h>
+#include <stdint.h>
+
 /**
  * @brief Initialise stdio (idempotent), bring up TinyUSB / CDC,
  *        detach the CDC interface from stdio so DPRINTF doesn't
@@ -35,5 +38,20 @@ void usbcdc_init(void);
  *        on Core 0.
  */
 void usbcdc_drain(void);
+
+/**
+ * @brief Snapshot the USB CDC sink's runtime stats. Either field
+ *        may be NULL (skipped). `dropped` = the per-cursor count
+ *        of debug bytes that fell off the back of the debugcap
+ *        ring before this consumer could read them (i.e. the
+ *        producer wrapped past the cursor while no host was
+ *        attached, or the host's TX FIFO stalled long enough to
+ *        wrap the ring). `attached` = `tud_cdc_connected()` —
+ *        true iff a host has the CDC port open with DTR asserted.
+ *
+ *        Counts persist for the lifetime of the boot. Pre-init
+ *        callers see attached=false, dropped=0.
+ */
+void usbcdc_getStats(uint32_t *dropped, bool *attached);
 
 #endif  // USBCDC_H

@@ -1260,8 +1260,10 @@ class DebugStatusTests(unittest.TestCase):
             "ok": True,
             "firmware_mode": False,
             "ring_used": 0,
-            "ring_capacity": 256,
+            "ring_capacity": 8192,
             "bytes_dropped": 0,
+            "usbcdc_attached": False,
+            "usbcdc_dropped": 0,
         })
         code, out, _err = _run_cli(
             ["--host", self.server.host, "debug", "status"])
@@ -1269,36 +1271,45 @@ class DebugStatusTests(unittest.TestCase):
         self.assertEqual(self.server.state.last_method, "GET")
         self.assertEqual(self.server.state.last_path, "/api/v1/debug")
         self.assertIn("firmware_mode", out)
-        self.assertIn("256", out)
+        self.assertIn("8192", out)
+        self.assertIn("usbcdc_attached", out)
 
     def test_debug_status_firmware_mode_yes(self) -> None:
         self._set_response(200, {
             "ok": True,
             "firmware_mode": True,
             "ring_used": 42,
-            "ring_capacity": 256,
-            "bytes_dropped": 7,
+            "ring_capacity": 8192,
+            "bytes_dropped": 0,
+            "usbcdc_attached": True,
+            "usbcdc_dropped": 7,
         })
         code, out, _err = _run_cli(
             ["--host", self.server.host, "debug", "status"])
         self.assertEqual(code, sidecart.EXIT_OK)
         self.assertIn("yes", out)
-        self.assertIn("42 / 256", out)
-        self.assertIn("7", out)
+        self.assertIn("42 / 8192", out)
+        # usbcdc_attached: yes, usbcdc_dropped: 7
+        self.assertRegex(out, r"usbcdc_attached\s*:\s*yes")
+        self.assertRegex(out, r"usbcdc_dropped\s*:\s*7")
 
     def test_debug_status_json(self) -> None:
         self._set_response(200, {
             "ok": True,
             "firmware_mode": False,
             "ring_used": 0,
-            "ring_capacity": 256,
+            "ring_capacity": 8192,
             "bytes_dropped": 0,
+            "usbcdc_attached": False,
+            "usbcdc_dropped": 0,
         })
         code, out, _err = _run_cli(
             ["--host", self.server.host, "--json", "debug", "status"])
         self.assertEqual(code, sidecart.EXIT_OK)
         parsed = json.loads(out.strip())
-        self.assertEqual(parsed["ring_capacity"], 256)
+        self.assertEqual(parsed["ring_capacity"], 8192)
+        self.assertIn("usbcdc_attached", parsed)
+        self.assertIn("usbcdc_dropped", parsed)
 
 
 class DebugTailTests(unittest.TestCase):

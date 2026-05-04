@@ -737,9 +737,13 @@ def cmd_debug_status(args: argparse.Namespace) -> int:
     used = parsed.get("ring_used", 0)
     cap = parsed.get("ring_capacity", 0)
     dropped = parsed.get("bytes_dropped", 0)
+    usbcdc_attached = parsed.get("usbcdc_attached", False)
+    usbcdc_dropped = parsed.get("usbcdc_dropped", 0)
     print(f"firmware_mode  : {'yes' if fw else 'no'}")
     print(f"ring           : {used} / {cap} bytes")
     print(f"bytes_dropped  : {dropped}")
+    print(f"usbcdc_attached: {'yes' if usbcdc_attached else 'no'}")
+    print(f"usbcdc_dropped : {usbcdc_dropped}")
     return EXIT_OK
 
 
