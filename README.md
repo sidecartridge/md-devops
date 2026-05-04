@@ -128,6 +128,133 @@ Select an option: ▌
 | **Bottom navigation strip** | Top-level command keys + a one-character prompt area for typing them. | `[E]` / `[U]` / `[X]` (and `[F]` does the same as `[E]`). |
 | **Animated countdown bar** | Shrinking white bar; the message "Booting in N s — any key halts" is overlaid in inverted colour so it stays readable both halves. Becomes "Countdown stopped. Press [E], [U] or [X] to continue." once any key has been pressed. | (passive — but pressing any key halts the countdown) |
 
+## 🌐 Remote HTTP Management API + the `sidecart.py` CLI
+
+Once the device joins Wi-Fi it serves an HTTP/1.1 REST API on
+port 80 at `http://sidecart.local/` (mDNS hostname is the
+gconfig `PARAM_HOSTNAME`, default `sidecart`). The IP is also
+shown on the setup-menu's API Endpoint line if mDNS isn't
+resolving on your workstation. The API is the **single
+control surface** for every remote operation in this firmware
+— file management, program execution, debug streaming. Everything
+the rest of this README documents (`ping`, `gemdrive`, `runner`,
+`debug`) is a thin wrapper around HTTP calls to this service.
+
+| Family | HTTP endpoints | CLI prefix |
+| --- | --- | --- |
+| Health | `GET /api/v1/ping` | `sidecart ping` |
+| GEMDRIVE | `GET/PUT/DELETE/POST /api/v1/gemdrive/{volume,files,folders}/…` | `sidecart gemdrive …` |
+| Runner | `GET/POST /api/v1/runner/…` | `sidecart runner …` |
+| Debug | `GET /api/v1/debug`, `GET /api/v1/debug/log` | `sidecart debug …` |
+
+You can drive the API directly from any HTTP client (`curl`,
+`wget`, `httpie`, a browser, a shell script, your editor's
+REST plugin) — `cli/sidecart.py` is a convenience layer, not
+the only supported access path. The full per-endpoint reference
+lives in [`docs/api.md`](docs/api.md): every URL, JSON envelope
+shape, status code, error vocabulary, and `curl` example.
+
+> ⚠️ **The HTTP API has no authentication.** Treat the network
+> the device is reachable on as trusted. Don't expose
+> `sidecart.local` past your LAN router.
+
+### `cli/sidecart.py` — the Python CLI
+
+A single-file Python script in this repo. It's the easiest way
+to use the API from a workstation: every verb maps 1-to-1 to an
+HTTP call, error envelopes are unwrapped to human-readable
+text, exit codes carry status information so shell scripts can
+branch.
+
+**Requirements**: Python 3.10 or later. **No third-party
+packages needed** — the script is stdlib-only (`urllib`,
+`http.client`, `json`, `argparse`, `os`, `sys`). If `python3`
+finds a recent-enough interpreter, you're done.
+
+**"Installation"**: there is none. The script lives at
+`cli/sidecart.py` in this repo — clone the repo (or just
+download that one file) and call it directly:
+
+```sh
+git clone https://github.com/sidecartridge/md-devops.git
+cd md-devops
+python3 cli/sidecart.py ping
+```
+
+If you prefer not to type `python3 cli/sidecart.py` every time,
+make it executable and stick it on your `PATH`:
+
+```sh
+chmod +x cli/sidecart.py
+ln -s "$(pwd)/cli/sidecart.py" /usr/local/bin/sidecart
+sidecart ping
+```
+
+(The script's shebang is `#!/usr/bin/env python3`, so a symlink
+or copy works the same as the `python3 …` form.)
+
+**Configuring the host**. The CLI talks to `sidecart.local` by
+default. Override that anywhere your mDNS doesn't reach:
+
+```sh
+# Per-invocation flag.
+python3 cli/sidecart.py --host 192.168.1.42 ping
+python3 cli/sidecart.py --host my-pico:8080 ping
+
+# Or environment variable for a whole shell session.
+export SIDECART_HOST=192.168.1.42
+python3 cli/sidecart.py ping
+```
+
+Precedence: `--host` > `$SIDECART_HOST` > `sidecart.local`.
+
+**Global flags** (apply to every subcommand):
+
+| Flag | Effect |
+| --- | --- |
+| `--host HOST[:PORT]` | Override the device address (default `sidecart.local`). |
+| `--json` | Print the raw JSON envelope on stdout instead of human-friendly text. Useful for scripting + piping into `jq`. |
+| `-q` / `--quiet` | Silence successful-output text; errors still go to stderr. |
+| `-h` / `--help` | Per-subcommand help (e.g. `sidecart gemdrive put --help`). |
+
+**Exit codes** (so shell scripts can branch on category):
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success. |
+| `1` | Generic / unexpected error. |
+| `2` | argparse usage error (bad flag, missing required arg). |
+| `3` | Server returned `404`. |
+| `4` | Server returned `409`. |
+| `5` | Server returned `400` / `422` / other 4xx. |
+| `6` | Server returned `503` (busy or SD not mounted). |
+| `7` | Server returned 5xx other than `503`. |
+| `8` | Network / DNS error (couldn't reach the host). |
+
+**Driving the API directly without the CLI**. Two examples to
+make the equivalence concrete:
+
+```sh
+# CLI form:
+python3 cli/sidecart.py ping
+
+# Direct HTTP equivalent:
+curl http://sidecart.local/api/v1/ping
+```
+
+```sh
+# CLI form (upload a file, overwriting if it exists):
+python3 cli/sidecart.py gemdrive put GAME.TOS -f
+
+# Direct HTTP equivalent:
+curl --upload-file ./GAME.TOS \
+     'http://sidecart.local/api/v1/gemdrive/files/GAME.TOS?overwrite=1'
+```
+
+Pick whichever fits your workflow. The next chapters show the
+CLI form because it's terser, but every example has a `curl`
+counterpart documented in [`docs/api.md`](docs/api.md).
+
 ## 🛜 First-contact: `ping`
 
 Once the device has joined Wi-Fi (the API Endpoint section of
@@ -377,30 +504,6 @@ python3 cli/sidecart.py runner adv load ./kernel.bin 0x40000           # stream 
 decimal, `0xhex`, or `$hex` — quote `$hex` in your shell
 (`'$FA1C00'`) or the shell will eat it as a variable reference.
 Prefer `0xhex` in scripts.
-
-## Remote HTTP Management API — under the hood
-
-Every CLI verb above is a thin wrapper over an HTTP/1.1 REST
-endpoint the firmware serves on port 80 at
-`http://sidecart.local/` (mDNS hostname is the gconfig
-`PARAM_HOSTNAME`, default `sidecart`). You can drive the same
-endpoints from any HTTP client — `curl`, `wget`, a browser, a
-shell script — without going through `cli/sidecart.py`. The
-single-file Python CLI exists for ergonomics, not as the only
-supported access path.
-
-| Family | Endpoints | CLI prefix |
-| --- | --- | --- |
-| Health | `GET /api/v1/ping` | `sidecart ping` |
-| GEMDRIVE | `GET/PUT/DELETE/POST /api/v1/gemdrive/{volume,files,folders}/…` | `sidecart gemdrive …` |
-| Runner | `GET/POST /api/v1/runner/…` | `sidecart runner …` |
-| Debug | `GET /api/v1/debug`, `GET /api/v1/debug/log` | `sidecart debug …` |
-
-Full reference (curl + sidecart examples for every endpoint,
-JSON envelope shapes, error code vocabulary, status code map)
-lives in [`docs/api.md`](docs/api.md). The HTTP API has **no
-authentication** — treat the network it's reachable on as
-trusted; don't expose it past your LAN.
 
 ## Debug traces
 
