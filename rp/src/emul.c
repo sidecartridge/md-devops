@@ -761,22 +761,25 @@ static void __not_in_flash_func(menu)(void) {
   }
   term_printString(memtopLine);
 
+  term_printString("\n\n");
+
   // Advanced Runner hook vector — Epic 04 / S4. Toggleable via [V].
+  // Epic 06 / S3: lifted out of the GEMDRIVE block onto its own
+  // top-level row so the menu reads as three distinct config groups
+  // (GEMDRIVE / Adv Vector / API Endpoint) rather than a wall of
+  // GEMDRIVE-prefixed sub-items.
   SettingsConfigEntry *advHookEntry = settings_find_entry(
       aconfig_getContext(), ACONFIG_PARAM_ADV_HOOK_VECTOR);
   const char *advHookValue =
       (advHookEntry != NULL && advHookEntry->value[0] != '\0')
           ? advHookEntry->value
           : "etv_timer";
-  char advHookLine[64];
-  if (strcmp(advHookValue, "vbl") == 0) {
-    snprintf(advHookLine, sizeof(advHookLine),
-             "\n  Adv [V]ector: vbl ($70)");
-  } else {
-    snprintf(advHookLine, sizeof(advHookLine),
-             "\n  Adv [V]ector: etv_timer ($400)");
-  }
-  term_printString(advHookLine);
+  const char *advHookDisplay = (strcmp(advHookValue, "vbl") == 0)
+                                   ? "vbl ($70)"
+                                   : "etv_timer ($400)";
+  term_printString("Adv [V]ector\n");
+  term_printString("  Hook        : ");
+  term_printString(advHookDisplay);
   term_printString("\n\n");
 
   // Remote HTTP API endpoint (Epic 02). Show the leased IP and the
