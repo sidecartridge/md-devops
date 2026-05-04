@@ -1,7 +1,6 @@
-# md-devops — Atari ST developer microfirmware
+# SidecarTridge Multi-device DevOps microfirmware
 
-A SidecarTridge Multi-device microfirmware app that turns the
-cartridge slot of an Atari ST / STE / Mega ST(E) into a remote
+This microfirmware turns the cartridge slot of an Atari ST / STE / Mega ST(E) into a remote
 development surface for the m68k. While it boots, the cartridge
 emulates a ROM, mounts a directory off the microSD card as a
 GEMDOS drive (GEMDRIVE), and exposes a Wi-Fi HTTP API + CLI that

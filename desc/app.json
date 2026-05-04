@@ -1,10 +1,13 @@
 {
   "uuid": "<APP_UUID>",
-  "name": "APP DEV Template",
-  "description": "Microfirmware Application Template for Atari ST",
+  "name": "DevOps toolkit",
+  "description": "Remote development surface for Atari ST/STE/MegaST/MegaSTE: GEMDRIVE folder-as-drive, HTTP-driven program launcher, Pexec load/exec/unload split, system memory snapshots, and high-bandwidth debug-byte streaming over Wi-Fi or USB CDC.  <a target='_blank' href='https://docs.sidecartridge.com/sidecartridge-multidevice/microfirmwares/devops/'>Learn more</a>",
   "image": "https://placehold.co/256x256/png",
   "tags": [
-    "Sample",
+    "Development",
+    "GEMDRIVE",
+    "Debug",
+    "CLI"
   ],
   "devices": [
     "ST",
