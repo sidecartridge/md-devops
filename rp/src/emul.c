@@ -400,7 +400,9 @@ bool emul_isFirmwareMode(void) {
   return firmwareModeActive;
 }
 
-// Boot countdown — auto-launches GEMDRIVE on the Atari ST when it hits 0.
+// Boot countdown — auto-launches Runner mode on the Atari ST when it hits 0
+// (Epic 06 / S2: switched from GEMDRIVE-only to Runner; the GEMDRIVE blob is
+// still installed because Runner runs on top of it).
 // Mirrors md-drives-emulator's behavior. Any key press halts it.
 #define BOOT_COUNTDOWN_SECONDS 20
 static int countdown = BOOT_COUNTDOWN_SECONDS;
@@ -1522,9 +1524,11 @@ void emul_start() {
         display_refresh();
         if (countdown <= 0) {
           haltCountdown = true;
-          // Autoboot expired — launch DevOps on the Atari ST. Same path
-          // as pressing [F].
-          cmdFirmware(NULL);
+          // Autoboot expired — launch DevOps Runner on the Atari ST. Same
+          // path as pressing [U] (Epic 06 / S2). Runner is the more useful
+          // default: it includes the [F]/[E] GEMDRIVE behaviour AND the
+          // workstation-driven Runner control surface.
+          cmdRunner(NULL);
         }
       }
     }
