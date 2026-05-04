@@ -122,11 +122,64 @@ Select an option: ▌
 | Section | What it shows | Keys |
 | --- | --- | --- |
 | **GEMDRIVE** | Which microSD folder is mounted as the emulated drive, the drive letter assigned to it, the GEMDRIVE relocation address (`auto` = `screen_base − 8 KB`), and the patched `_memtop` value. The hard-drive icon appears whenever the section is live. | `[o]` change folder, `[d]` change drive letter, `[r]` change reloc addr, `[t]` change `_memtop`. |
-| **Adv [V]ector** | Which interrupt vector the Advanced Runner installs its hook into — `vbl ($70)` (faster, fires on every VBL) or `etv_timer ($400)` (more compatible). The cog icon appears whenever the section is live. | `[V]` toggle between `vbl` / `etv_timer`. |
+| **Adv [V]ector** | Which interrupt vector the Advanced Runner installs its hook into — `vbl ($70)` or `etv_timer ($400)`. See *Picking a hook vector* below for the trade-off. The cog icon appears whenever the section is live. | `[V]` toggle between `vbl` / `etv_timer`. |
 | **API Endpoint** | mDNS hostname and the IP DHCP leased. The Wi-Fi icon appears once the network is up; if there's no IP yet (Wi-Fi still associating) the icon is hidden. | (read-only) |
 | **USB CDC (Debug serial)** | `connected` / `disconnected` — live-refreshed as you plug or unplug a USB cable into the Pico. The lightbulb icon flips in lock-step. | (read-only) |
 | **Bottom navigation strip** | Top-level command keys + a one-character prompt area for typing them. | `[E]` / `[U]` / `[X]` (and `[F]` does the same as `[E]`). |
 | **Animated countdown bar** | Shrinking white bar; the message "Booting in N s — any key halts" is overlaid in inverted colour so it stays readable both halves. Becomes "Countdown stopped. Press [E], [U] or [X] to continue." once any key has been pressed. | (passive — but pressing any key halts the countdown) |
+
+### Picking a hook vector
+
+The `[V]` setting controls where the Advanced Runner installs
+its m68k-side ISR. The two choices have meaningfully different
+behaviour:
+
+**`vbl ($70)`** — the 68000's hardware vertical-blank exception
+vector. Fires every video frame (50 Hz PAL / 60 Hz NTSC) directly
+from the CPU, *before* TOS dispatches its own VBL chain.
+
+- ✅ Standard m68k exception trap frame on the supervisor stack —
+  saved PC and SR are at known offsets, so the firmware can
+  reliably rewrite them. **`runner adv jump` and `runner adv
+  load` only work on this vector** — they patch the saved PC so
+  the eventual `rte` resumes at a new address.
+- ✅ Sits ahead of TOS' VBL handlers, so it keeps firing even
+  when a launched program has disabled or hijacked TOS' own VBL
+  bookkeeping (some games, demos, and kernel-style code do
+  this).
+- ⚠️ A program that overwrites `$70.l` with its own raw VBL
+  handler will replace ours on the spot. The Advanced Runner
+  goes silent until the program restores the vector.
+
+**`etv_timer ($400)`** — TOS' documented "extension hook" that
+gets called from *inside* TOS' VBL handler chain, after TOS has
+finished its own bookkeeping (cursor blink, keyboard sweep,
+mouse, ACIA). Programs that want a periodic background task
+without disrupting TOS install themselves here — it's the
+"polite" place.
+
+- ✅ Cooperates with TOS' own VBL discipline. Less likely to
+  interfere with anything TOS-aware running in the background.
+- ✅ Survives a program that overwrites `$70.l` (since
+  `etv_timer` is downstream of TOS' main `$70` handler).
+- ⚠️ The trap-frame layout when our code runs is past TOS' MFP
+  scratch and not stable across TOS versions, so the firmware
+  cannot safely patch the saved PC from here. **`runner adv
+  jump` and `runner adv load` refuse with `409 wrong_hook`** on
+  this vector.
+- ⚠️ A program that hijacks `etv_timer` itself shadows our hook.
+
+`runner adv meminfo` and `runner reset` work on **either**
+vector (they don't need to patch a return address — they just
+need the ISR to fire periodically). `runner adv jump` and
+`runner adv load` need `vbl ($70)` specifically.
+
+**Rule of thumb:** keep the default `etv_timer ($400)` for
+running normal TOS programs that respect TOS conventions.
+Switch to `vbl ($70)` when you need `runner adv jump` /
+`runner adv load` (debugger-style code injection), when you're
+debugging programs that bypass TOS' VBL chain entirely, or
+when a program is suspected of hijacking `etv_timer`.
 
 ## 🌐 Remote HTTP Management API + the `sidecart.py` CLI
 
@@ -625,9 +678,26 @@ for the full mode-by-mode mapping and error envelope.
 ### Advanced Runner — out-of-band VBL surface
 
 The Advanced Runner ISR keeps working even when a launched
-program has wedged the foreground Runner poll loop. `adv
-jump` and `adv load` require the VBL hook (`$70`)
-specifically; `adv meminfo` works on either `$70` or `$400`.
+program has wedged the foreground Runner poll loop. The hook
+vector is the `[V]` setting on the setup menu — see *Picking
+a hook vector* in the setup-menu chapter for the full
+trade-off between `vbl ($70)` and `etv_timer ($400)`. The
+short version, here:
+
+| Verb                | `vbl ($70)` | `etv_timer ($400)` |
+| ------------------- | ----------- | ------------------ |
+| `runner adv status` | ✅           | ✅                  |
+| `runner adv meminfo`| ✅           | ✅                  |
+| `runner reset`      | ✅           | ✅                  |
+| `runner adv jump`   | ✅           | ❌ `409 wrong_hook` |
+| `runner adv load`   | ✅           | ❌ `409 wrong_hook` |
+
+`adv jump` and `adv load` patch the saved PC on the supervisor
+stack so the ISR's `rte` resumes at a new address. That's only
+safe on `$70`, where the trap-frame layout is the standard m68k
+exception frame. On `$400` we run from inside TOS' VBL handler
+chain past the MFP scratch area, which is not stable across
+TOS versions, so those two verbs refuse.
 
 #### `runner adv status` — hook installation state
 
