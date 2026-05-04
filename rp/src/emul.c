@@ -609,10 +609,159 @@ static void drawSetupInfoLine(const char *message) {
 
 static void refreshSetupInfoLine(void) {
   if (haltCountdown) {
-    drawSetupInfoLine("Countdown stopped. Press [E] or [X] to continue.");
+    drawSetupInfoLine("Countdown stopped. Press [E], [U] or [X] to continue.");
   } else {
     showCounter(countdown);
   }
+}
+
+// Epic 06 / S8 — u8g2 menu polish (Tier 1). Thin horizontal
+// dividers between the menu's config groups. Drawn in the gap
+// row above each section header (term row 7 = y=56, row 10 =
+// y=80, row 14 = y=112) so they don't overlap any character
+// cell. One pixel tall, full-width edge-to-edge.
+static void drawMenuDividers(void) {
+  u8g2_t *ref = display_getU8g2Ref();
+  u8g2_SetDrawColor(ref, 1);
+  // Above Adv [V]ector (between row 6 GEMDRIVE last and row 8
+  // Adv header).
+  u8g2_DrawHLine(ref, 0, 60, DISPLAY_WIDTH);
+  // Above API Endpoint (between row 9 and row 11).
+  u8g2_DrawHLine(ref, 0, 84, DISPLAY_WIDTH);
+  // Above USB CDC (between row 13 and row 15).
+  u8g2_DrawHLine(ref, 0, 116, DISPLAY_WIDTH);
+}
+
+// Epic 06 / S8 — status icons via u8g2_font_open_iconic_embedded_1x_t.
+// Right-aligned at the section-header rows. Codepoints from the
+// 17-glyph open-iconic-embedded subset (verified via the u8g2
+// upstream BDF):
+//   0x42 cog          — Adv [V]ector (settings / hook handler)
+//   0x4C hard-drive   — GEMDRIVE (file-storage emulation)
+//   0x4D lightbulb    — USB CDC ("on / active connection";
+//                       flash, pulse and bluetooth all proved
+//                       unreadable at 8×8 in hardware testing —
+//                       lightbulb's silhouette is the most
+//                       legible at this resolution)
+//   0x50 wifi         — API Endpoint
+//
+// Each icon's 8×8 cell is cleared first so a re-render flips
+// state cleanly without a stale glyph hanging around. The
+// drawIconCell helper takes y_top (the row's pixel-top); the
+// glyph baseline is at y_top + 7 (font is 8 px tall).
+#define MENU_ICON_X              (DISPLAY_WIDTH - 12)
+#define MENU_ICON_GEMDRIVE_YTOP  16   // term row 2
+#define MENU_ICON_ADV_YTOP       64   // term row 8
+#define MENU_ICON_API_YTOP       88   // term row 11
+#define MENU_ICON_USB_YTOP       120  // term row 15
+#define MENU_ICON_GLYPH_COG          0x42
+#define MENU_ICON_GLYPH_LIGHTBULB    0x4D
+#define MENU_ICON_GLYPH_HARD_DRIVE   0x4C
+#define MENU_ICON_GLYPH_WIFI         0x50
+
+static void drawIconCell(uint16_t x, uint16_t y_top, uint8_t glyph,
+                         bool visible) {
+  u8g2_t *ref = display_getU8g2Ref();
+  // Clear a 9×8 cell starting one pixel above y_top — some
+  // glyphs in u8g2_font_open_iconic_embedded_1x_t (notably the
+  // lightbulb) carry an ascender margin and their topmost
+  // pixel row lands at y_top - 1, NOT y_top. An 8-tall erase
+  // box would leave that row untouched and a hide→show
+  // transition would expose a residual top edge of the prior
+  // glyph. The four icon positions in this menu all have an
+  // unused pixel row directly above (the hrules at y=60/84/116
+  // sit further up still), so the +1 row of erase margin is
+  // safe.
+  u8g2_SetDrawColor(ref, 0);
+  u8g2_DrawBox(ref, x, y_top - 1, 8, 9);
+  if (visible) {
+    u8g2_SetFont(ref, u8g2_font_open_iconic_embedded_1x_t);
+    u8g2_SetDrawColor(ref, 1);
+    u8g2_DrawGlyph(ref, x, y_top + 7, glyph);
+    u8g2_SetFont(ref, u8g2_font_amstrad_cpc_extended_8f);
+  }
+  u8g2_SetDrawColor(ref, 1);
+}
+
+static void drawMenuStatusIcons(void) {
+  // GEMDRIVE: hard-drive icon, always visible — section is
+  // always populated and the icon serves as a static section
+  // identifier rather than a live indicator.
+  drawIconCell(MENU_ICON_X, MENU_ICON_GEMDRIVE_YTOP,
+               MENU_ICON_GLYPH_HARD_DRIVE, true);
+  // Adv [V]ector: cog icon, always visible — same rationale.
+  drawIconCell(MENU_ICON_X, MENU_ICON_ADV_YTOP,
+               MENU_ICON_GLYPH_COG, true);
+  // Wi-Fi: drawn when DHCP has leased an IP. State doesn't
+  // change after early boot in the steady-state menu, so this
+  // doesn't need a live-refresh hook.
+  ip_addr_t ip = network_getCurrentIp();
+  drawIconCell(MENU_ICON_X, MENU_ICON_API_YTOP,
+               MENU_ICON_GLYPH_WIFI, ip.addr != 0);
+  // USB CDC: redrawn live by refreshUsbCdcLine when state flips.
+  bool usb_attached = false;
+  usbcdc_getStats(NULL, &usb_attached);
+  drawIconCell(MENU_ICON_X, MENU_ICON_USB_YTOP,
+               MENU_ICON_GLYPH_LIGHTBULB, usb_attached);
+}
+
+// Epic 06 / S8 — animated countdown progress bar. Replaces the
+// "Boot will continue in N seconds..." text strip with a filled
+// box that shrinks from full-width to zero as the countdown
+// elapses. Text is rendered once over the filled (white) half
+// in black and once over the empty (black) half in white, with
+// u8g2 clip windows masking the two passes — that way each
+// character cell is painted in its proper background-inverted
+// colour. (XOR drawing was the obvious one-pass approach but
+// u8g2's default font mode XORs the full glyph bounding box,
+// so on a white background the letters come out as solid black
+// blocks. Two clipped passes side-step that.)
+static void drawCountdownBar(int sec_left, int sec_total) {
+  if (sec_total <= 0) sec_total = 1;
+  if (sec_left < 0) sec_left = 0;
+  if (sec_left > sec_total) sec_left = sec_total;
+  uint16_t y = DISPLAY_HEIGHT - DISPLAY_TERM_CHAR_HEIGHT;
+  uint16_t h = DISPLAY_TERM_CHAR_HEIGHT;
+  u8g2_t *ref = display_getU8g2Ref();
+
+  // Clear strip (right / empty side stays black).
+  u8g2_SetDrawColor(ref, 0);
+  u8g2_DrawBox(ref, 0, y, DISPLAY_WIDTH, h);
+
+  // Fill the proportional left (elapsed) portion in white.
+  uint16_t bar_w = (uint16_t)((DISPLAY_WIDTH * sec_left) / sec_total);
+  if (bar_w > 0) {
+    u8g2_SetDrawColor(ref, 1);
+    u8g2_DrawBox(ref, 0, y, bar_w, h);
+  }
+
+  // Build the status message once; draw it twice with different
+  // clip windows + colours so each half of the bar reads
+  // correctly. SetClipWindow takes (x0, y0, x1, y1) — y1/x1 are
+  // exclusive upper bounds.
+  char msg[40];
+  int n = snprintf(msg, sizeof(msg),
+                   "Booting in %d s — any key halts", sec_left);
+  if (n < 0) msg[0] = '\0';
+  u8g2_SetFont(ref, u8g2_font_squeezed_b7_tr);
+
+  if (bar_w > 0) {
+    // Filled (white) half: text in black (color 0).
+    u8g2_SetClipWindow(ref, 0, y, bar_w, y + h);
+    u8g2_SetDrawColor(ref, 0);
+    u8g2_DrawStr(ref, 2, DISPLAY_HEIGHT - 1, msg);
+  }
+  if (bar_w < DISPLAY_WIDTH) {
+    // Empty (black) half: text in white (color 1).
+    u8g2_SetClipWindow(ref, bar_w, y, DISPLAY_WIDTH, y + h);
+    u8g2_SetDrawColor(ref, 1);
+    u8g2_DrawStr(ref, 2, DISPLAY_HEIGHT - 1, msg);
+  }
+
+  // Reset clip + state so subsequent draws are unaffected.
+  u8g2_SetMaxClipWindow(ref);
+  u8g2_SetDrawColor(ref, 1);
+  u8g2_SetFont(ref, u8g2_font_amstrad_cpc_extended_8f);
 }
 
 // Epic 06 / S4. Polled from the main loop while the menu screen
@@ -631,6 +780,10 @@ static void refreshUsbCdcLine(void) {
   vt52Cursor(MENU_USBCDC_ROW + 1, 0);
   term_printString("  Status      : ");
   term_printString(attached ? "connected   " : "disconnected");
+  // Epic 06 / S8 — flip the lightbulb ("active") icon at the
+  // USB CDC header in lock-step with the status text.
+  drawIconCell(MENU_ICON_X, MENU_ICON_USB_YTOP,
+               MENU_ICON_GLYPH_LIGHTBULB, attached);
   // Restore the cursor home position (right after the
   // "Select an option: " prompt on the bottom row) so the
   // overdraw doesn't leave it stranded over the USB CDC line.
@@ -969,18 +1122,28 @@ static void __not_in_flash_func(menu)(void) {
 
   vt52Cursor(TERM_SCREEN_SIZE_Y - 1, 0);
   term_printString("Select an option: ");
+
+  // Epic 06 / S8 — overlay u8g2 dividers + icons AFTER all term
+  // writes are done so the term renderer doesn't clobber them.
+  // Frames around config groups are NOT drawn here because
+  // vertical borders would slice through character columns and
+  // corrupt the text — see Tier 2 backlog if framed sections
+  // become a requirement.
+  drawMenuDividers();
+  drawMenuStatusIcons();
+
   refreshSetupInfoLine();
 }
 
 static void __not_in_flash_func(showCounter)(int cdown) {
-  char msg[64];
   if (cdown > 0) {
-    sprintf(msg, "Boot will continue in %d seconds...", cdown);
+    // Epic 06 / S8 — animated progress bar on the bottom strip
+    // instead of plain text. Visual + textual at once.
+    drawCountdownBar(cdown, BOOT_COUNTDOWN_SECONDS);
   } else {
     showTitle();
-    sprintf(msg, "Booting... Please wait...               ");
+    drawSetupInfoLine("Booting... Please wait...");
   }
-  drawSetupInfoLine(msg);
 }
 
 // --- Command handlers (single-key dispatch) ----------------------------
@@ -1671,7 +1834,7 @@ void emul_start() {
     // showCounter is only called inside the decrement branch below.
     static bool lastHaltState = false;
     if (haltCountdown && !lastHaltState) {
-      drawSetupInfoLine("Countdown stopped. Press [E] or [X] to continue.");
+      drawSetupInfoLine("Countdown stopped. Press [E], [U] or [X] to continue.");
       display_refresh();
     }
     lastHaltState = haltCountdown;
