@@ -23,21 +23,21 @@ curl http://sidecart.local/api/v1/ping
 python3 cli/sidecart.py ping
 
 # List the GEMDRIVE folder.
-curl 'http://sidecart.local/api/v1/files?path=/'
-python3 cli/sidecart.py ls /
+curl 'http://sidecart.local/api/v1/gemdrive/files?path=/'
+python3 cli/sidecart.py gemdrive ls /
 
 # Upload a file (overwriting if it exists).
 curl --upload-file ./SWITCHER.TOS \
-     'http://sidecart.local/api/v1/files/SWITCHER.TOS?overwrite=1'
-python3 cli/sidecart.py put SWITCHER.TOS -f
+     'http://sidecart.local/api/v1/gemdrive/files/SWITCHER.TOS?overwrite=1'
+python3 cli/sidecart.py gemdrive put SWITCHER.TOS -f
 
 # Download a file (resume-aware).
-curl -C - -o SWITCHER.TOS http://sidecart.local/api/v1/files/SWITCHER.TOS
-python3 cli/sidecart.py get SWITCHER.TOS -r
+curl -C - -o SWITCHER.TOS http://sidecart.local/api/v1/gemdrive/files/SWITCHER.TOS
+python3 cli/sidecart.py gemdrive get SWITCHER.TOS -r
 
 # Delete a file.
-curl -X DELETE http://sidecart.local/api/v1/files/SWITCHER.TOS
-python3 cli/sidecart.py rm SWITCHER.TOS
+curl -X DELETE http://sidecart.local/api/v1/gemdrive/files/SWITCHER.TOS
+python3 cli/sidecart.py gemdrive rm SWITCHER.TOS
 ```
 
 ## Conventions
@@ -144,7 +144,7 @@ python3 cli/sidecart.py ping
 
 ---
 
-### `GET /api/v1/volume` — SD card capacity
+### `GET /api/v1/gemdrive/volume` — SD card capacity
 
 **Success** (`200`):
 ```json
@@ -157,17 +157,17 @@ python3 cli/sidecart.py ping
 
 **`curl`**:
 ```sh
-curl http://sidecart.local/api/v1/volume
+curl http://sidecart.local/api/v1/gemdrive/volume
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py volume
+python3 cli/sidecart.py gemdrive volume
 ```
 
 ---
 
-### `GET /api/v1/files?path=<rel>` — list folder
+### `GET /api/v1/gemdrive/files?path=<rel>` — list folder
 
 `path` defaults to `/`. Trailing slash optional. Listing the root is
 `?path=/`, `?path=`, or omitting `path=` entirely.
@@ -199,17 +199,17 @@ download form below).
 
 **`curl`**:
 ```sh
-curl 'http://sidecart.local/api/v1/files?path=/games'
+curl 'http://sidecart.local/api/v1/gemdrive/files?path=/games'
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py ls /games
+python3 cli/sidecart.py gemdrive ls /games
 ```
 
 ---
 
-### `GET /api/v1/files/<rel>` — download file
+### `GET /api/v1/gemdrive/files/<rel>` — download file
 
 Optional `Range:` header for resume / partial. Three forms:
 `bytes=N-M`, `bytes=N-`, `bytes=-N` (last N bytes). Multi-range
@@ -234,21 +234,21 @@ in flight).
 
 **`curl`**:
 ```sh
-curl -o SWITV310.TOS http://sidecart.local/api/v1/files/SWITV310.TOS
+curl -o SWITV310.TOS http://sidecart.local/api/v1/gemdrive/files/SWITV310.TOS
 # Resume from a partial download:
-curl -C - -o SWITV310.TOS http://sidecart.local/api/v1/files/SWITV310.TOS
+curl -C - -o SWITV310.TOS http://sidecart.local/api/v1/gemdrive/files/SWITV310.TOS
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py get SWITV310.TOS
-python3 cli/sidecart.py get SWITV310.TOS -r          # resume
-python3 cli/sidecart.py get SWITV310.TOS local.tos   # custom local name
+python3 cli/sidecart.py gemdrive get SWITV310.TOS
+python3 cli/sidecart.py gemdrive get SWITV310.TOS -r          # resume
+python3 cli/sidecart.py gemdrive get SWITV310.TOS local.tos   # custom local name
 ```
 
 ---
 
-### `PUT /api/v1/files/<rel>?overwrite=0|1` — upload file
+### `PUT /api/v1/gemdrive/files/<rel>?overwrite=0|1` — upload file
 
 Body is the raw file bytes. `Content-Length` is required.
 `Content-Length: 0` is legal (creates an empty file or truncates an
@@ -259,7 +259,7 @@ Body cap: **4 MB** (`HTTP_MAX_UPLOAD_BYTES`). Larger → `413`.
 
 **Success:**
 - `201 Created` on a new file (carries
-  `Location: /api/v1/files/<rel>`).
+  `Location: /api/v1/gemdrive/files/<rel>`).
 - `200 OK` on overwrite.
 
 ```json
@@ -279,39 +279,39 @@ file is deleted before the response is sent.
 **`curl`**:
 ```sh
 curl --upload-file ./SWITV310.TOS \
-     'http://sidecart.local/api/v1/files/SWITV310.TOS?overwrite=1'
+     'http://sidecart.local/api/v1/gemdrive/files/SWITV310.TOS?overwrite=1'
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py put SWITV310.TOS              # default REMOTE = basename
-python3 cli/sidecart.py put SWITV310.TOS -f           # overwrite
-python3 cli/sidecart.py put local.tos REMOTE.TOS -f
+python3 cli/sidecart.py gemdrive put SWITV310.TOS              # default REMOTE = basename
+python3 cli/sidecart.py gemdrive put SWITV310.TOS -f           # overwrite
+python3 cli/sidecart.py gemdrive put local.tos REMOTE.TOS -f
 ```
 
 ---
 
-### `DELETE /api/v1/files/<rel>` — delete file
+### `DELETE /api/v1/gemdrive/files/<rel>` — delete file
 
 **Success** (`204 No Content`, no body).
 
 **Errors:** `400 bad_path`, `404 not_found`, `404 is_directory`
-(path is a folder — use `DELETE /api/v1/folders/<rel>`),
+(path is a folder — use `DELETE /api/v1/gemdrive/folders/<rel>`),
 `409 conflict` (file is open elsewhere or marked read-only).
 
 **`curl`**:
 ```sh
-curl -X DELETE http://sidecart.local/api/v1/files/STALE.TXT
+curl -X DELETE http://sidecart.local/api/v1/gemdrive/files/STALE.TXT
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py rm STALE.TXT
+python3 cli/sidecart.py gemdrive rm STALE.TXT
 ```
 
 ---
 
-### `POST /api/v1/files/<rel>/rename` — rename / move file
+### `POST /api/v1/gemdrive/files/<rel>/rename` — rename / move file
 
 `Content-Type: application/json`. Body: `{"to":"<rel>"}`.
 
@@ -332,19 +332,19 @@ python3 cli/sidecart.py rm STALE.TXT
 ```sh
 curl -X POST -H 'Content-Type: application/json' \
      -d '{"to":"/NEW.TXT"}' \
-     http://sidecart.local/api/v1/files/OLD.TXT/rename
+     http://sidecart.local/api/v1/gemdrive/files/OLD.TXT/rename
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py mv OLD.TXT NEW.TXT
+python3 cli/sidecart.py gemdrive mv OLD.TXT NEW.TXT
 ```
 
 ---
 
-### `POST /api/v1/folders/<rel>` — create folder
+### `POST /api/v1/gemdrive/folders/<rel>` — create folder
 
-**Success** (`201 Created`, carries `Location: /api/v1/folders/<rel>`):
+**Success** (`201 Created`, carries `Location: /api/v1/gemdrive/folders/<rel>`):
 ```json
 { "ok": true, "path": "/SUB" }
 ```
@@ -355,38 +355,38 @@ root).
 
 **`curl`**:
 ```sh
-curl -X POST http://sidecart.local/api/v1/folders/SUB
+curl -X POST http://sidecart.local/api/v1/gemdrive/folders/SUB
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py mkdir SUB
+python3 cli/sidecart.py gemdrive mkdir SUB
 ```
 
 ---
 
-### `DELETE /api/v1/folders/<rel>` — delete folder
+### `DELETE /api/v1/gemdrive/folders/<rel>` — delete folder
 
 **Success** (`204 No Content`).
 
 **Errors:** `400 bad_path`, `404 not_found`, `404 is_file` (path is
-a regular file — use `DELETE /api/v1/files/<rel>`),
+a regular file — use `DELETE /api/v1/gemdrive/files/<rel>`),
 `409 conflict` (folder is non-empty, locked open, read-only, or is
 root).
 
 **`curl`**:
 ```sh
-curl -X DELETE http://sidecart.local/api/v1/folders/SUB
+curl -X DELETE http://sidecart.local/api/v1/gemdrive/folders/SUB
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py rmdir SUB
+python3 cli/sidecart.py gemdrive rmdir SUB
 ```
 
 ---
 
-### `POST /api/v1/folders/<rel>/rename` — rename / move folder
+### `POST /api/v1/gemdrive/folders/<rel>/rename` — rename / move folder
 
 Mirrors the file rename. Body: `{"to":"<rel>"}`. Cycle detection:
 renaming a folder into its own descendant returns `422 unprocessable`.
@@ -395,12 +395,12 @@ renaming a folder into its own descendant returns `422 unprocessable`.
 ```sh
 curl -X POST -H 'Content-Type: application/json' \
      -d '{"to":"/NEWNAME"}' \
-     http://sidecart.local/api/v1/folders/OLDNAME/rename
+     http://sidecart.local/api/v1/gemdrive/folders/OLDNAME/rename
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py mvdir OLDNAME NEWNAME
+python3 cli/sidecart.py gemdrive mvdir OLDNAME NEWNAME
 ```
 
 ---
@@ -1064,7 +1064,7 @@ upload, run, and watch one of the consumers:
 ```sh
 # Build, upload, run.
 target/atarist/test/hello-debug/build.sh
-python3 cli/sidecart.py put target/atarist/test/hello-debug/dist/HELLODBG.TOS /
+python3 cli/sidecart.py gemdrive put target/atarist/test/hello-debug/dist/HELLODBG.TOS /
 python3 cli/sidecart.py runner run /HELLODBG.TOS
 
 # In another shell, watch the bytes via either transport:

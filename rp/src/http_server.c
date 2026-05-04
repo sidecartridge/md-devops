@@ -141,7 +141,7 @@ typedef struct http_conn {
   bool upload_file_open;
   bool upload_was_overwrite;       // true -> reply 200, false -> 201 Created
   uint32_t upload_received;        // bytes already written to file
-  char upload_norm[HTTP_PATH_BUF_BYTES];      // for response Location: /api/v1/files<rel>
+  char upload_norm[HTTP_PATH_BUF_BYTES];      // for response Location: /api/v1/gemdrive/files<rel>
   char upload_abs[HTTP_FAT_PATH_BUF_BYTES];   // for cleanup f_unlink
 
   // Streaming Advanced-Runner load state (Epic 04 / S8). Active while
@@ -689,10 +689,10 @@ static void __not_in_flash_func(parse_and_dispatch)(http_conn_t *c) {
                              ? c->hdr_len - header_consumed_total
                              : 0;
 
-  // Special-case PUT-on-/api/v1/files/ for streaming upload — it
+  // Special-case PUT-on-/api/v1/gemdrive/files/ for streaming upload — it
   // bypasses the small JSON-body buffer (which has a 256-byte cap)
   // and writes directly into FatFs as bytes arrive.
-  static const char files_prefix[] = "/api/v1/files/";
+  static const char files_prefix[] = "/api/v1/gemdrive/files/";
   static const size_t files_prefix_len = sizeof(files_prefix) - 1;
   if (c->method == HM_PUT &&
       strncmp(c->path, files_prefix, files_prefix_len) == 0) {
@@ -3002,7 +3002,7 @@ static void __not_in_flash_func(handle_files_list)(http_conn_t *c) {
     return;
   } else if (!(info.fattrib & AM_DIR)) {
     write_error(c, 422, "Unprocessable Entity", "is_file",
-                "Path is a file; use GET /api/v1/files/<rel> to download");
+                "Path is a file; use GET /api/v1/gemdrive/files/<rel> to download");
     return;
   }
 
@@ -3080,7 +3080,7 @@ static void __not_in_flash_func(handle_files_list)(http_conn_t *c) {
 
 // --- Folder mutation handlers (S3) ---
 //
-// `rel` is the URL path component AFTER /api/v1/folders/, possibly
+// `rel` is the URL path component AFTER /api/v1/gemdrive/folders/, possibly
 // still containing percent-encoded bytes. The handlers URL-decode,
 // normalise, jail, validate 8.3 on the last segment, then call FatFs.
 
@@ -3173,7 +3173,7 @@ static void __not_in_flash_func(handle_folder_create)(http_conn_t *c, const char
   if (n < 0) n = 0;
   char extra[256];
   int en = snprintf(extra, sizeof(extra),
-                    "Location: /api/v1/folders%s\r\n", norm);
+                    "Location: /api/v1/gemdrive/folders%s\r\n", norm);
   if (en < 0 || (size_t)en >= sizeof(extra)) extra[0] = '\0';
   write_response_ex(c, 201, "Created", "application/json",
                     (extra[0] != '\0') ? extra : NULL, body, (size_t)n);
@@ -3206,7 +3206,7 @@ static void __not_in_flash_func(handle_folder_delete)(http_conn_t *c, const char
   }
   if (!finfo_is_dir(&info)) {
     write_error(c, 404, "Not Found", "is_file",
-                "Path is a file; use DELETE /api/v1/files/<rel>");
+                "Path is a file; use DELETE /api/v1/gemdrive/files/<rel>");
     return;
   }
   fr = f_unlink(abs_path);
@@ -3327,7 +3327,7 @@ static void __not_in_flash_func(handle_folder_rename)(http_conn_t *c, const char
   }
   if (!finfo_is_dir(&info)) {
     write_error(c, 404, "Not Found", "is_file",
-                "Path is a file; use POST /api/v1/files/<rel>/rename");
+                "Path is a file; use POST /api/v1/gemdrive/files/<rel>/rename");
     return;
   }
 
@@ -3463,7 +3463,7 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
   }
   if (finfo_is_dir(&info)) {
     write_error(c, 404, "Not Found", "is_directory",
-                "Path is a directory; use GET /api/v1/files?path=<rel> to list");
+                "Path is a directory; use GET /api/v1/gemdrive/files?path=<rel> to list");
     return;
   }
 
@@ -3629,7 +3629,7 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
 
 // --- Streaming file upload (S6) ---
 //
-// PUT /api/v1/files/<rel>?overwrite=0|1 streams the body straight
+// PUT /api/v1/gemdrive/files/<rel>?overwrite=0|1 streams the body straight
 // into FatFs as bytes arrive. The init step is invoked from
 // parse_and_dispatch BEFORE the generic body-bearing block (whose
 // 256-byte buffer is too small for real uploads). After validation
@@ -3674,7 +3674,7 @@ static void __not_in_flash_func(upload_finish_ok)(http_conn_t *c) {
   } else {
     char extra[256];
     int en = snprintf(extra, sizeof(extra),
-                      "Location: /api/v1/files%s\r\n", c->upload_norm);
+                      "Location: /api/v1/gemdrive/files%s\r\n", c->upload_norm);
     if (en < 0 || (size_t)en >= sizeof(extra)) extra[0] = '\0';
     write_response_ex(c, 201, "Created", "application/json",
                       (extra[0] != '\0') ? extra : NULL, body, (size_t)n);
@@ -3701,9 +3701,9 @@ static bool __not_in_flash_func(handle_file_upload_init)(
     return false;
   }
 
-  // Extract <rel> from /api/v1/files/<rel>; strip the trailing
+  // Extract <rel> from /api/v1/gemdrive/files/<rel>; strip the trailing
   // /rename action suffix (which is POST-only — PUT here is 405).
-  static const char prefix[] = "/api/v1/files/";
+  static const char prefix[] = "/api/v1/gemdrive/files/";
   static const size_t prefix_len = sizeof(prefix) - 1;
   const char *url_rel = c->path + prefix_len;
   if (url_rel[0] == '\0') {
@@ -3869,7 +3869,7 @@ static void __not_in_flash_func(handle_file_delete)(http_conn_t *c,
   }
   if (finfo_is_dir(&info)) {
     write_error(c, 404, "Not Found", "is_directory",
-                "Path is a directory; use DELETE /api/v1/folders/<rel>");
+                "Path is a directory; use DELETE /api/v1/gemdrive/folders/<rel>");
     return;
   }
   fr = f_unlink(abs_path);
@@ -3972,7 +3972,7 @@ static void __not_in_flash_func(handle_file_rename)(http_conn_t *c,
   }
   if (finfo_is_dir(&info)) {
     write_error(c, 404, "Not Found", "is_directory",
-                "Path is a directory; use POST /api/v1/folders/<rel>/rename");
+                "Path is a directory; use POST /api/v1/gemdrive/folders/<rel>/rename");
     return;
   }
 
@@ -4041,8 +4041,8 @@ typedef struct {
 
 static const route_t g_routes[] = {
     {"/api/v1/ping", M_GET | M_HEAD, handle_ping},
-    {"/api/v1/volume", M_GET | M_HEAD, handle_volume},
-    {"/api/v1/files", M_GET | M_HEAD, handle_files_list},
+    {"/api/v1/gemdrive/volume", M_GET | M_HEAD, handle_volume},
+    {"/api/v1/gemdrive/files", M_GET | M_HEAD, handle_files_list},
     {"/api/v1/runner", M_GET | M_HEAD, handle_runner_status},
     {"/api/v1/debug", M_GET | M_HEAD, handle_debug_status},
     {"/api/v1/debug/log", M_GET | M_HEAD, handle_debug_log},
@@ -4108,8 +4108,8 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
     return;
   }
 
-  // Prefix routes: /api/v1/folders/<rel> [+ /rename action].
-  static const char folders_prefix[] = "/api/v1/folders/";
+  // Prefix routes: /api/v1/gemdrive/folders/<rel> [+ /rename action].
+  static const char folders_prefix[] = "/api/v1/gemdrive/folders/";
   static const size_t folders_prefix_len = sizeof(folders_prefix) - 1;
   if (strncmp(c->path, folders_prefix, folders_prefix_len) == 0) {
     char *rel = c->path + folders_prefix_len;
@@ -4138,11 +4138,11 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
     return;
   }
 
-  // Prefix routes: /api/v1/files/<rel> [+ /rename action]. The
-  // exact-match /api/v1/files (no trailing slash) is the listing
+  // Prefix routes: /api/v1/gemdrive/files/<rel> [+ /rename action]. The
+  // exact-match /api/v1/gemdrive/files (no trailing slash) is the listing
   // endpoint and is handled by g_routes above; only the slash-prefixed
   // form falls through here.
-  static const char files_prefix[] = "/api/v1/files/";
+  static const char files_prefix[] = "/api/v1/gemdrive/files/";
   static const size_t files_prefix_len = sizeof(files_prefix) - 1;
   if (strncmp(c->path, files_prefix, files_prefix_len) == 0) {
     char *rel = c->path + files_prefix_len;

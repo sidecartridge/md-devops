@@ -210,13 +210,13 @@ the endpoints with Unix-style verbs (`ls`, `get`, `put`, `rm`,
 
 ```sh
 # What you'd normally do from a Unix shell, against a remote disk:
-python3 cli/sidecart.py ls /                   # list GEMDRIVE root
-python3 cli/sidecart.py mkdir /GAMES           # mkdir
-python3 cli/sidecart.py put GAME.TOS /GAMES/   # upload
-python3 cli/sidecart.py mv /GAMES/GAME.TOS /GAMES/RUN.TOS  # rename
-python3 cli/sidecart.py get /GAMES/RUN.TOS                  # download
-python3 cli/sidecart.py rm /GAMES/RUN.TOS                   # delete
-python3 cli/sidecart.py volume                              # SD capacity / fs type
+python3 cli/sidecart.py gemdrive ls /                   # list GEMDRIVE root
+python3 cli/sidecart.py gemdrive mkdir /GAMES           # mkdir
+python3 cli/sidecart.py gemdrive put GAME.TOS /GAMES/   # upload
+python3 cli/sidecart.py gemdrive mv /GAMES/GAME.TOS /GAMES/RUN.TOS  # rename
+python3 cli/sidecart.py gemdrive get /GAMES/RUN.TOS                  # download
+python3 cli/sidecart.py gemdrive rm /GAMES/RUN.TOS                   # delete
+python3 cli/sidecart.py gemdrive volume                              # SD capacity / fs type
 python3 cli/sidecart.py ping                                # health
 ```
 
@@ -226,7 +226,7 @@ from your workstation:
 ```sh
 # build on workstation, push, run, watch the result
 make game.tos
-python3 cli/sidecart.py put game.tos /
+python3 cli/sidecart.py gemdrive put game.tos /
 python3 cli/sidecart.py runner run /game.tos
 python3 cli/sidecart.py runner status         # check exit code
 ```
@@ -351,7 +351,7 @@ verifies the path end-to-end:
 
 ```sh
 target/atarist/test/hello-debug/build.sh
-python3 cli/sidecart.py put target/atarist/test/hello-debug/dist/HELLODBG.TOS /
+python3 cli/sidecart.py gemdrive put target/atarist/test/hello-debug/dist/HELLODBG.TOS /
 python3 cli/sidecart.py runner run /HELLODBG.TOS
 # → "Hello, world!\n" × 1000 appears on whichever transport you're watching.
 ```
