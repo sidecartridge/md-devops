@@ -39,7 +39,17 @@
 #include "term.h"
 #include "usbcdc.h"
 
-#define SLEEP_LOOP_MS 100
+// Main-loop tick (Epic 05 v2 / S9). Drives chandler_loop +
+// usbcdc_drain at ~100 Hz so chandler can drain the 4096-sample
+// commemul ring (~4 ms wrap at full m68k emit rate) with 10×
+// headroom, and so CDC bytes appear on the workstation with
+// minimal latency. Lower than this gets into busy-loop
+// territory; higher and we re-introduce the visibility / drop
+// problems that motivated the optimization stories. The full
+// Core 1 worker plan (chandler + tud_task + usbcdc_drain on a
+// dedicated core) is parked in the Epic 05 backlog — escalate
+// there only if 100 Hz proves insufficient.
+#define SLEEP_LOOP_MS 10
 
 enum {
   APP_MODE_SETUP = 255  // Setup
