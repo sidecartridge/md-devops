@@ -58,6 +58,14 @@ uint32_t debugcap_cursor_pull(debugcap_cursor_t *cur, uint8_t *out,
   return take;
 }
 
+void debugcap_cursor_skipToNow(debugcap_cursor_t *cur) {
+  if (cur == NULL) return;
+  uint32_t write = g_debugWritePos;
+  uint32_t lag = write - cur->read_pos;
+  cur->dropped += lag;
+  cur->read_pos = write;
+}
+
 void debugcap_getRingStats(uint32_t *used, uint32_t *capacity,
                            uint32_t *dropped) {
   uint32_t write = g_debugWritePos;

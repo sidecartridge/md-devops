@@ -20,6 +20,12 @@
 
 static bool g_usbcdcInitialized = false;
 static debugcap_cursor_t g_usbcdcCursor = {.read_pos = 0, .dropped = 0};
+// Tracks the previous tud_cdc_connected() observation so the drain
+// can detect the false→true rising edge when a host (re)attaches.
+// Initial value `false` means a host that's already attached at
+// boot still gets the snapshot on the first drain call — the same
+// "bytes from connect time forward" UX as a late attach.
+static bool g_usbcdcLastConnected = false;
 
 void usbcdc_init(void) {
   if (g_usbcdcInitialized) {
@@ -48,10 +54,22 @@ void __not_in_flash_func(usbcdc_drain)(void) {
   if (!g_usbcdcInitialized) {
     return;
   }
+  bool connected = tud_cdc_connected();
+  if (connected && !g_usbcdcLastConnected) {
+    // Rising edge: the host just attached (or reattached). Skip
+    // the cursor to "now" so the workstation sees only bytes
+    // emitted from this point forward (no stale tail of pre-
+    // attach data) and fold the unread lag into cur->dropped so
+    // the loss is still visible. The drain doesn't run while
+    // disconnected — without this catch-up, drops accumulated
+    // during the disconnect window would simply vanish.
+    debugcap_cursor_skipToNow(&g_usbcdcCursor);
+  }
+  g_usbcdcLastConnected = connected;
   // No host on the other end → don't fill the TX FIFO. The
   // producer keeps writing the ring; the cursor lazily catches
   // up (per-cursor drop count) when a host eventually attaches.
-  if (!tud_cdc_connected()) {
+  if (!connected) {
     return;
   }
   uint32_t avail = tud_cdc_write_available();

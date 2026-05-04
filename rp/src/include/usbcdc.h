@@ -44,13 +44,17 @@ void usbcdc_drain(void);
  *        may be NULL (skipped). `dropped` = the per-cursor count
  *        of debug bytes that fell off the back of the debugcap
  *        ring before this consumer could read them (i.e. the
- *        producer wrapped past the cursor while no host was
- *        attached, or the host's TX FIFO stalled long enough to
- *        wrap the ring). `attached` = `tud_cdc_connected()` —
- *        true iff a host has the CDC port open with DTR asserted.
+ *        producer wrapped past the cursor while the host's TX
+ *        FIFO stalled). `attached` = `tud_cdc_connected()` — true
+ *        iff a host has the CDC port open with DTR asserted.
  *
- *        Counts persist for the lifetime of the boot. Pre-init
- *        callers see attached=false, dropped=0.
+ *        Cumulative since boot — includes disconnect-window
+ *        loss (S7 folds the unread lag into `dropped` on every
+ *        host (re)attach, so bursts that arrived while no one
+ *        was listening are still counted) and any in-session
+ *        drops where the host's TX FIFO stalled long enough
+ *        for the producer to wrap. Pre-init callers see
+ *        attached=false, dropped=0.
  */
 void usbcdc_getStats(uint32_t *dropped, bool *attached);
 

@@ -2200,10 +2200,12 @@ static void __not_in_flash_func(handle_runner_adv_status)(http_conn_t *c) {
 //     "usbcdc_attached": <true iff a USB CDC host has the port open
 //                        with DTR asserted (Epic 05 v2 / S5)>,
 //     "usbcdc_dropped": <bytes lost on the USB CDC sink's cursor
-//                       because the producer wrapped past it
-//                       (e.g. burst arrived while no host attached
-//                        or host TX FIFO stalled). Cumulative since
-//                        boot.>
+//                       — sum of (a) bytes emitted while no host
+//                       was attached (S7 folds the unread lag
+//                       into `dropped` on every (re)attach) and
+//                       (b) in-session drops where the producer
+//                       wrapped past the cursor while the host's
+//                       TX FIFO stalled. Cumulative since boot.>
 //   }
 static void __not_in_flash_func(handle_debug_status)(http_conn_t *c) {
   uint32_t ring_used = 0;

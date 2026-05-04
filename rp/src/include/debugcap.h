@@ -85,6 +85,19 @@ uint32_t debugcap_cursor_pull(debugcap_cursor_t *cur, uint8_t *out,
                               uint32_t max_bytes);
 
 /**
+ * @brief Skip the cursor forward to the producer's current write
+ *        position, accounting for ALL unread bytes as drops on
+ *        cur->dropped. Useful when a consumer wants to discard
+ *        the unread tail (e.g. USB CDC just reattached and we
+ *        want the workstation to see only bytes from now on)
+ *        without losing the visibility that lossage occurred.
+ *        Differs from debugcap_cursor_initSnapshot, which also
+ *        zeros cur->dropped and therefore destroys the loss
+ *        signal.
+ */
+void debugcap_cursor_skipToNow(debugcap_cursor_t *cur);
+
+/**
  * @brief Append one debug byte to the ring. Called by the
  *        chandler ingest filter on every captured sample whose
  *        high byte is 0xFF (and only when firmware mode is
