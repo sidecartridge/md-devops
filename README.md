@@ -46,6 +46,27 @@ python3 cli/sidecart.py runner res low
 python3 cli/sidecart.py runner meminfo
 ```
 
+### Pexec lifecycle (load / exec / unload)
+
+For interactive-debugger-style workflows, the firmware also
+splits GEMDOS Pexec mode 0 into three separate verbs so a
+program can be loaded once and re-executed many times before
+its memory is released:
+
+```sh
+python3 cli/sidecart.py runner load /HELLODBG.TOS    # Pexec(3) — load only, returns basepage
+python3 cli/sidecart.py runner exec                   # Pexec(4) — run the loaded program
+python3 cli/sidecart.py runner exec                   # re-exec on the same basepage
+python3 cli/sidecart.py runner unload                 # Mfree the basepage when done
+```
+
+Strict-refuse: a second `load` while a program is still loaded
+returns `409 program_already_loaded` — `unload` it (or restart
+Runner mode) before submitting another. See
+[`docs/api.md`](docs/api.md#pexec-lifecycle-load--exec--unload)
+for the full lifecycle, mode-by-mode mapping, and error
+envelope.
+
 ### Advanced Runner
 
 A second command surface (Epic 04) runs from inside the m68k's VBL ISR (`$70`, or `$400` if you switched `ADV_HOOK_VECTOR` to `etv_timer`), so it keeps working when a launched program has wedged the foreground poll loop — infinite loops, bombs already painted, traps disabled. Two of the three POSTs (`adv jump`, `adv load`) require the VBL hook specifically; `adv meminfo` works on either vector. None gate on the busy lock.

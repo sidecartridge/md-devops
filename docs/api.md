@@ -540,6 +540,125 @@ long), `409 runner_inactive`, `503 busy`.
 
 ---
 
+### Pexec lifecycle: `load` / `exec` / `unload`
+
+Three verbs that split GEMDOS Pexec mode 0 ("load and go") into
+separate steps so a workstation can drive ST programs the way an
+interactive debugger would: load once, exec many times, unload
+when done. The corresponding Pexec mode for each verb is:
+
+| Verb | GEMDOS mode | Effect |
+| --- | --- | --- |
+| `load` | `Pexec(3)` | Load file → relocate → return basepage. Program is in m68k RAM but has not run. |
+| `exec` | `Pexec(4)` | "Just go" — execute the program at the previously-loaded basepage. Does **not** free the basepage on exit, so re-exec on the same loaded program is valid. |
+| `unload` | `Mfree(basepage)` | Release the basepage back to GEMDOS. Required before another `load` (strict-refuse — see below). |
+
+**RP-side state**: a single basepage slot is held server-side
+between `load` and `unload`. Surfaced in `GET /api/v1/runner` as:
+- `loaded_basepage` — the cached basepage pointer, or `null` if
+  no program is loaded.
+- `last_load_errno` — `null` on success, the negative GEMDOS
+  errno if the most recent `load` (or `unload`) returned an
+  error.
+
+**Strict-refuse semantics**: `load` while a program is already
+loaded returns `409 program_already_loaded` — the caller must
+`unload` (or restart Runner mode) before submitting a new load.
+This keeps the m68k from holding orphan basepages the RP forgot
+about.
+
+#### `POST /api/v1/runner/load` — `Pexec(3)` load only
+
+Body: `{"path":"<rel>", "cmdline":"<≤127 chars>"}` — same shape
+as `/runner/run`. **Synchronous** — the response includes the
+basepage on success; failure returns the GEMDOS errno
+synchronously instead of via a follow-up `runner status`.
+
+**`curl`**:
+```sh
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"path":"/HELLODBG.TOS","cmdline":""}' \
+     http://sidecart.local/api/v1/runner/load
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py runner load /HELLODBG.TOS
+python3 cli/sidecart.py runner load PROG.TOS -- -v --file foo
+```
+
+Response 200:
+```json
+{ "ok": true, "loaded": true, "basepage": 65566 }
+```
+
+Common error codes: `200 OK` (success — basepage in body), `422
+pexec_failed` (GEMDOS errno in `gemdos_errno` field — file too
+big, out of memory, etc.), `404 not_found`, `409
+runner_inactive`, `409 program_already_loaded`, `503 busy`,
+`504 gateway_timeout` (m68k didn't respond within 10 s).
+
+#### `POST /api/v1/runner/exec` — `Pexec(4)` just-go
+
+Empty body. Executes the program previously loaded via
+`/runner/load`. **Fire-and-forget** like `/runner/run` — the
+exit code arrives asynchronously and surfaces on the next
+`/runner/status` as `last_exit_code`. The basepage stays loaded
+after exit, so calling `exec` again re-runs the same program.
+
+**`curl`**:
+```sh
+curl -X POST http://sidecart.local/api/v1/runner/exec
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py runner exec
+```
+
+Common error codes: `202 Accepted`, `409 no_program_loaded` (no
+prior `load`), `409 runner_inactive`, `503 busy`.
+
+#### `POST /api/v1/runner/unload` — release the basepage
+
+Empty body. Issues GEMDOS `Mfree` on the loaded basepage and
+clears the RP-side state. **Synchronous** — the response
+confirms the freed basepage on success.
+
+**`curl`**:
+```sh
+curl -X POST http://sidecart.local/api/v1/runner/unload
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py runner unload
+```
+
+Response 200:
+```json
+{ "ok": true, "unloaded": true, "basepage": 65566 }
+```
+
+Common error codes: `200 OK`, `422 mfree_failed` (GEMDOS errno
+in `gemdos_errno` — rare, typically means the basepage was
+already freed), `409 no_program_loaded`, `409 runner_inactive`,
+`503 busy`, `504 gateway_timeout`.
+
+#### Full lifecycle example
+
+```sh
+python3 cli/sidecart.py runner load /HELLODBG.TOS    # → basepage 0x...
+python3 cli/sidecart.py runner status                # loaded_basepage shows the pointer
+python3 cli/sidecart.py runner exec                  # runs, "Hello, world!" output
+python3 cli/sidecart.py runner exec                  # runs AGAIN — re-exec is supported
+python3 cli/sidecart.py runner unload                # frees the basepage
+python3 cli/sidecart.py runner status                # loaded_basepage: null
+python3 cli/sidecart.py runner exec                  # → 409 no_program_loaded
+```
+
+---
+
 ### `POST /api/v1/runner/cd` — change the Runner cwd
 
 Body: `{"path":"<rel>"}`. The m68k issues a GEMDOS `Dsetpath` and
