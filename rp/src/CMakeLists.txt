@@ -89,9 +89,6 @@ add_subdirectory(settings)
 # Add u8g2 library
 add_subdirectory(u8g2)
 
-# Add HTTP client library
-add_subdirectory(httpc)
-
 # Tell CMake where to find other source code
 add_subdirectory(${FATFS_SDK_PATH}/src build)
   
@@ -111,7 +108,6 @@ target_sources(${PROJECT_NAME} PRIVATE
         debugcap.c
         display.c
         display_term.c
-        download.c
         emul.c
         gconfig.c
         gemdrive.c
@@ -139,7 +135,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     pico_stdlib              # Core functionality
     pico_multicore          # Multicore support
     pico_lwip_mdns           # lwIP mDNS responder so <hostname>.local works
-    httpc                    # HTTP client
     settings                 # Custom settings library
     u8g2                     # for display
 )
@@ -213,7 +208,7 @@ if(NOT RELEASE_DATE)
 endif()
 
 if (NOT _DEBUG)
-        set(_DEBUG 1)
+        set(_DEBUG 0)
 endif()
 
 # Debug outputs
@@ -267,9 +262,6 @@ add_definitions(-DPICO_FLASH_ASSUME_CORE0_SAFE=1)
 # the FS bulk hard limit (64) — bumping it past 64 on FS is
 # undefined behaviour.
 add_definitions(-DCFG_TUD_CDC_TX_BUFSIZE=1024)
-
-# Select HTTPS or HTTP downloads of the firmware
-add_definitions(-DAPP_DOWNLOAD_HTTPS=0)
 
 # Remove unused data
 target_link_options(${PROJECT_NAME} PRIVATE
