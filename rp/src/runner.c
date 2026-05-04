@@ -31,6 +31,51 @@ static void __not_in_flash_func(runner_command_cb)(
       SEND_COMMAND_TO_DISPLAY(0);
       return;
     }
+    case RUNNER_CMD_DONE_LOAD: {
+      // Epic 06 / S5. Payload is i32: >0 = basepage pointer
+      // (success), <0 = -GEMDOS errno (load failed), 0 =
+      // unexpected (treat as error). The RP-side state setter
+      // splits on sign and updates pendingBasepage / load errno
+      // accordingly.
+      uint32_t raw = TPROTO_GET_PAYLOAD_PARAM32(payload);
+      int32_t result = (int32_t)raw;
+      uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+      DPRINTF("Runner: LOAD done, result=%ld (%s)\n",
+              (long)result,
+              result > 0 ? "basepage" : "errno");
+      emul_recordRunnerLoadDone(result, now_ms);
+      SEND_COMMAND_TO_DISPLAY(0);
+      return;
+    }
+    case RUNNER_CMD_DONE_EXEC: {
+      // Epic 06 / S6. Payload i32 = program exit code. The
+      // basepage stays loaded (Pexec(4) does NOT free it — that's
+      // S7's runner unload), so re-exec on the same basepage
+      // works without a fresh load.
+      uint32_t raw = TPROTO_GET_PAYLOAD_PARAM32(payload);
+      int32_t exit_code = (int32_t)raw;
+      uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+      DPRINTF("Runner: EXEC done, exit_code=%ld\n",
+              (long)exit_code);
+      emul_recordRunnerExecDone(exit_code, now_ms);
+      SEND_COMMAND_TO_DISPLAY(0);
+      return;
+    }
+    case RUNNER_CMD_DONE_UNLOAD: {
+      // Epic 06 / S7. Payload i32 = GEMDOS Mfree result (0 on
+      // success, negative GEMDOS errno on failure). The state
+      // setter clears pendingBasepage on success and preserves
+      // it on failure — so a follow-up `runner status` honestly
+      // reports the basepage is still allocated if Mfree balked.
+      uint32_t raw = TPROTO_GET_PAYLOAD_PARAM32(payload);
+      int32_t result = (int32_t)raw;
+      uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+      DPRINTF("Runner: UNLOAD done, mfree_result=%ld\n",
+              (long)result);
+      emul_recordRunnerUnloadDone(result, now_ms);
+      SEND_COMMAND_TO_DISPLAY(0);
+      return;
+    }
     case RUNNER_CMD_DONE_CD: {
       uint32_t raw = TPROTO_GET_PAYLOAD_PARAM32(payload);
       int32_t errnum = (int32_t)raw;

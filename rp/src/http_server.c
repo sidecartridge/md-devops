@@ -141,7 +141,7 @@ typedef struct http_conn {
   bool upload_file_open;
   bool upload_was_overwrite;       // true -> reply 200, false -> 201 Created
   uint32_t upload_received;        // bytes already written to file
-  char upload_norm[HTTP_PATH_BUF_BYTES];      // for response Location: /api/v1/files<rel>
+  char upload_norm[HTTP_PATH_BUF_BYTES];      // for response Location: /api/v1/gemdrive/files<rel>
   char upload_abs[HTTP_FAT_PATH_BUF_BYTES];   // for cleanup f_unlink
 
   // Streaming Advanced-Runner load state (Epic 04 / S8). Active while
@@ -689,10 +689,10 @@ static void __not_in_flash_func(parse_and_dispatch)(http_conn_t *c) {
                              ? c->hdr_len - header_consumed_total
                              : 0;
 
-  // Special-case PUT-on-/api/v1/files/ for streaming upload — it
+  // Special-case PUT-on-/api/v1/gemdrive/files/ for streaming upload — it
   // bypasses the small JSON-body buffer (which has a 256-byte cap)
   // and writes directly into FatFs as bytes arrive.
-  static const char files_prefix[] = "/api/v1/files/";
+  static const char files_prefix[] = "/api/v1/gemdrive/files/";
   static const size_t files_prefix_len = sizeof(files_prefix) - 1;
   if (c->method == HM_PUT &&
       strncmp(c->path, files_prefix, files_prefix_len) == 0) {
@@ -1200,6 +1200,9 @@ static const char *runner_last_command_str(runner_last_command_t cmd) {
     case RUNNER_LAST_MEMINFO: return "MEMINFO";
     case RUNNER_LAST_JUMP: return "JUMP";
     case RUNNER_LAST_LOAD: return "LOAD";
+    case RUNNER_LAST_PEXEC_LOAD: return "PEXEC_LOAD";
+    case RUNNER_LAST_PEXEC_EXEC: return "PEXEC_EXEC";
+    case RUNNER_LAST_PEXEC_UNLOAD: return "PEXEC_UNLOAD";
     default: return NULL;  // RUNNER_LAST_NONE → JSON null
   }
 }
@@ -1271,7 +1274,26 @@ static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
     snprintf(last_res_errno_buf, sizeof(last_res_errno_buf), "null");
   }
 
-  char body[512];
+  // Epic 06 / S5+S6 — Pexec load+exec split state.
+  int32_t pending_basepage = emul_getRunnerPendingBasepage();
+  int32_t load_errno = 0;
+  bool has_load_errno = emul_getRunnerLastLoadErrno(&load_errno);
+  char loaded_basepage_buf[24];
+  if (pending_basepage != 0) {
+    snprintf(loaded_basepage_buf, sizeof(loaded_basepage_buf), "%ld",
+             (long)pending_basepage);
+  } else {
+    snprintf(loaded_basepage_buf, sizeof(loaded_basepage_buf), "null");
+  }
+  char last_load_errno_buf[24];
+  if (has_load_errno) {
+    snprintf(last_load_errno_buf, sizeof(last_load_errno_buf), "%ld",
+             (long)load_errno);
+  } else {
+    snprintf(last_load_errno_buf, sizeof(last_load_errno_buf), "null");
+  }
+
+  char body[640];
   int n = snprintf(
       body, sizeof(body),
       "{\"ok\":true,\"active\":%s,\"busy\":%s,\"cwd\":\"%s\","
@@ -1280,6 +1302,8 @@ static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
       "\"last_exit_code\":%s,"
       "\"last_cd_errno\":%s,"
       "\"last_res_errno\":%s,"
+      "\"loaded_basepage\":%s,"
+      "\"last_load_errno\":%s,"
       "\"last_started_at_ms\":%s,\"last_finished_at_ms\":%s}\n",
       active ? "true" : "false",
       busy ? "true" : "false",
@@ -1293,6 +1317,8 @@ static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
       last_exit_buf,
       last_cd_errno_buf,
       last_res_errno_buf,
+      loaded_basepage_buf,
+      last_load_errno_buf,
       last_started_buf, last_finished_buf);
   if (n < 0) n = 0;
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
@@ -1301,6 +1327,10 @@ static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
 // Forward decls for path-resolution helpers defined further down
 // (with the file-mutation handlers from S3-S4).
 static void write_path_error(http_conn_t *c, norm_status_t s);
+// Defined further down with the other byte-pair-swapped APP_FREE
+// writers; forward-decl'd here so handle_runner_exec (Epic 06 / S6)
+// can stage the cached basepage before the runner_write_rez block.
+static void runner_write_u32(uint32_t offset, uint32_t value);
 static norm_status_t resolve_pair(const char *url_rel, char *norm,
                                   size_t norm_cap, char *abs,
                                   size_t abs_cap);
@@ -1526,6 +1556,303 @@ static void __not_in_flash_func(handle_runner_run)(http_conn_t *c) {
   write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
 }
 
+// POST /api/v1/runner/load — Epic 06 / S5.
+//
+// JSON body: { "remote": "<rel>", "cmdline": "<args>" } — same
+// shape as /runner/run. Loads the program into m68k RAM via
+// GEMDOS Pexec mode 3 (load only). On success the response
+// envelope reports the basepage pointer, and a subsequent
+// /runner/exec will run it. Strict-refuse: a 409
+// program_already_loaded if a prior load is still pending
+// (the user must `exec` it or restart Runner first).
+//
+// Synchronous (spin-waits on chandler_loop until the m68k's
+// DONE_LOAD callback lands). Pexec(3) typically completes well
+// under 1 s for normal-sized TOS programs; uses the same 10 s
+// outer timeout as a generous worst-case.
+#define RUNNER_LOAD_TIMEOUT_US 10000000
+static void __not_in_flash_func(handle_runner_load)(http_conn_t *c) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return;
+  }
+  if (emul_isRunnerBusy()) {
+    write_response_ex(c, 503, "Service Unavailable", "application/json",
+                      "Retry-After: 1\r\n",
+                      "{\"ok\":false,\"code\":\"busy\","
+                      "\"message\":\"Runner is busy with another command\"}\n",
+                      0);
+    return;
+  }
+  if (emul_isRunnerLoadPending()) {
+    write_error(c, 409, "Conflict", "program_already_loaded",
+                "A program is already loaded; exec it or reset Runner first");
+    return;
+  }
+  if (c->content_length == 0) {
+    write_error(c, 411, "Length Required", "length_required",
+                "JSON body required");
+    return;
+  }
+  if (!c->content_type_json) {
+    write_error(c, 415, "Unsupported Media Type", "unsupported_media",
+                "Content-Type must be application/json");
+    return;
+  }
+
+  char path[RUNNER_PATH_LEN];
+  json_status_t js = json_extract_string(c->body, c->body_received, "path",
+                                         path, sizeof(path));
+  if (js == JSON_BAD) {
+    write_error(c, 422, "Unprocessable Entity", "bad_json",
+                "Malformed JSON body");
+    return;
+  }
+  if (js != JSON_OK) {
+    write_error(c, 422, "Unprocessable Entity", "unprocessable",
+                "Missing or non-string `path` field");
+    return;
+  }
+
+  char cmdline[128] = {0};
+  js = json_extract_string(c->body, c->body_received, "cmdline", cmdline,
+                           sizeof(cmdline));
+  if (js == JSON_BAD) {
+    write_error(c, 422, "Unprocessable Entity", "bad_json",
+                "Malformed JSON body");
+    return;
+  }
+  if (js != JSON_OK) {
+    cmdline[0] = '\0';
+  }
+  if (strlen(cmdline) > 127) {
+    write_error(c, 400, "Bad Request", "bad_request",
+                "cmdline exceeds 127 chars");
+    return;
+  }
+
+  // Same path-resolution + jail-check + f_stat as /runner/run.
+  char rebased[RUNNER_PATH_LEN];
+  if (!runner_resolve_relative(path, rebased, sizeof(rebased))) {
+    write_error(c, 400, "Bad Request", "name_too_long",
+                "Path too long after cwd resolution");
+    return;
+  }
+  char norm[HTTP_PATH_BUF_BYTES];
+  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  norm_status_t s = resolve_pair(rebased, norm, sizeof(norm), abs_path,
+                                 sizeof(abs_path));
+  if (s != NORM_OK) {
+    write_path_error(c, s);
+    return;
+  }
+  if (strcmp(norm, "/") == 0) {
+    write_error(c, 400, "Bad Request", "bad_path",
+                "Cannot load root");
+    return;
+  }
+  FILINFO info;
+  FRESULT fr = f_stat(abs_path, &info);
+  if (fr == FR_NO_FILE || fr == FR_NO_PATH) {
+    write_error(c, 404, "Not Found", "not_found", "Program file not found");
+    return;
+  }
+  if (fr != FR_OK) {
+    write_error(c, 500, "Internal Server Error", "disk_error",
+                "f_stat failed");
+    return;
+  }
+  if (finfo_is_dir(&info)) {
+    write_error(c, 404, "Not Found", "is_directory",
+                "Path is a directory; cannot load");
+    return;
+  }
+
+  // Same backslash-form path translation as /runner/run.
+  char st_path[RUNNER_PATH_LEN];
+  size_t out = 0;
+  for (size_t i = 0; path[i] != '\0' && out < sizeof(st_path) - 1; i++) {
+    char ch = path[i];
+    st_path[out++] = (ch == '/') ? '\\' : ch;
+  }
+  st_path[out] = '\0';
+
+  runner_write_path(st_path);
+  runner_write_cmdline(cmdline);
+
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  emul_recordRunnerLoadSubmit(norm, now_ms);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_CMD_LOAD);
+
+  // Spin-wait on chandler_loop until DONE_LOAD lands (which
+  // clears busy via emul_recordRunnerLoadDone). Generous 10 s
+  // timeout to cover slow disk loads.
+  absolute_time_t deadline =
+      delayed_by_us(get_absolute_time(), RUNNER_LOAD_TIMEOUT_US);
+  while (emul_isRunnerBusy()) {
+    chandler_loop();
+    if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+      uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+      // Treat the timeout as a load failure with a synthetic
+      // errno so the RP-side state stays consistent (busy=false,
+      // pendingBasepage=0, load errno populated).
+      emul_recordRunnerLoadDone(0, fail_ms);
+      write_error(c, 504, "Gateway Timeout", "gateway_timeout",
+                  "Runner did not respond within 10 s");
+      return;
+    }
+  }
+
+  // DONE_LOAD landed. Inspect the result.
+  int32_t load_errno = 0;
+  if (emul_getRunnerLastLoadErrno(&load_errno)) {
+    char body[160];
+    int n = snprintf(body, sizeof(body),
+                     "{\"ok\":false,\"code\":\"pexec_failed\","
+                     "\"gemdos_errno\":%ld,"
+                     "\"message\":\"GEMDOS Pexec(3) returned %ld\"}\n",
+                     (long)load_errno, (long)load_errno);
+    if (n < 0) n = 0;
+    write_response(c, 422, "Unprocessable Entity", "application/json",
+                   body, (size_t)n);
+    return;
+  }
+  int32_t basepage = emul_getRunnerPendingBasepage();
+  char body[120];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"loaded\":true,\"basepage\":%ld}\n",
+                   (long)basepage);
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
+// POST /api/v1/runner/exec — Epic 06 / S6.
+//
+// Empty body. Executes the program previously loaded via
+// /runner/load (GEMDOS Pexec mode 4 — just go). The basepage
+// pointer cached by the m68k at load time is the input;
+// nothing to validate beyond "is something loaded?".
+//
+// Fire-and-forget like /runner/run: returns 202 Accepted as
+// soon as RUNNER_CMD_EXEC is on the sentinel. The exit code
+// arrives asynchronously via DONE_EXEC and surfaces on the
+// next /runner/status as last_exit_code.
+static void __not_in_flash_func(handle_runner_exec)(http_conn_t *c) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return;
+  }
+  if (emul_isRunnerBusy()) {
+    write_response_ex(c, 503, "Service Unavailable", "application/json",
+                      "Retry-After: 1\r\n",
+                      "{\"ok\":false,\"code\":\"busy\","
+                      "\"message\":\"Runner is busy with another command\"}\n",
+                      0);
+    return;
+  }
+  if (!emul_isRunnerLoadPending()) {
+    write_error(c, 409, "Conflict", "no_program_loaded",
+                "No program is loaded; call /runner/load first");
+    return;
+  }
+
+  // Stage the cached basepage pointer into the m68k-readable
+  // RUNNER_BASEPAGE slot so the Runner's exec handler picks up
+  // the right pointer when it does `move.l RUNNER_BASEPAGE, ...`.
+  // The m68k can't write that slot itself (read-only ROM emulation
+  // from its perspective); the RP owns every cartridge-region
+  // write. Must happen BEFORE we fire the sentinel, otherwise the
+  // m68k may read the slot before the RP gets there.
+  int32_t basepage = emul_getRunnerPendingBasepage();
+  runner_write_u32(RUNNER_BASEPAGE_OFFSET, (uint32_t)basepage);
+
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  emul_recordRunnerExecSubmit(now_ms);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_CMD_EXEC);
+
+  char body[80];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"accepted\":true}\n");
+  if (n < 0) n = 0;
+  write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
+}
+
+// POST /api/v1/runner/unload — Epic 06 / S7.
+//
+// Empty body. Frees the basepage previously loaded via
+// /runner/load via GEMDOS Mfree. Synchronous like /load —
+// Mfree is fast (typically << 1 ms) but spin-wait + 5 s
+// timeout for safety.
+//
+// Returns 200 with the freed basepage on success, 422
+// mfree_failed with the GEMDOS errno on failure (rare —
+// usually means the basepage was never allocated). 409
+// no_program_loaded if nothing to free.
+#define RUNNER_UNLOAD_TIMEOUT_US 5000000
+static void __not_in_flash_func(handle_runner_unload)(http_conn_t *c) {
+  if (!emul_isRunnerActive()) {
+    write_error(c, 409, "Conflict", "runner_inactive",
+                "Runner mode is not active; boot via [U] first");
+    return;
+  }
+  if (emul_isRunnerBusy()) {
+    write_response_ex(c, 503, "Service Unavailable", "application/json",
+                      "Retry-After: 1\r\n",
+                      "{\"ok\":false,\"code\":\"busy\","
+                      "\"message\":\"Runner is busy with another command\"}\n",
+                      0);
+    return;
+  }
+  if (!emul_isRunnerLoadPending()) {
+    write_error(c, 409, "Conflict", "no_program_loaded",
+                "No program is loaded; nothing to unload");
+    return;
+  }
+
+  int32_t basepage_before = emul_getRunnerPendingBasepage();
+
+  uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+  emul_recordRunnerUnloadSubmit(now_ms);
+  SEND_COMMAND_TO_DISPLAY(RUNNER_CMD_UNLOAD);
+
+  absolute_time_t deadline =
+      delayed_by_us(get_absolute_time(), RUNNER_UNLOAD_TIMEOUT_US);
+  while (emul_isRunnerBusy()) {
+    chandler_loop();
+    if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+      uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+      // Synthetic timeout failure — keeps state consistent
+      // (busy=false, load errno populated, basepage preserved).
+      emul_recordRunnerUnloadDone(-1, fail_ms);
+      write_error(c, 504, "Gateway Timeout", "gateway_timeout",
+                  "Runner did not respond within 5 s");
+      return;
+    }
+  }
+
+  int32_t mfree_errno = 0;
+  if (emul_getRunnerLastLoadErrno(&mfree_errno)) {
+    char body[160];
+    int n = snprintf(body, sizeof(body),
+                     "{\"ok\":false,\"code\":\"mfree_failed\","
+                     "\"gemdos_errno\":%ld,"
+                     "\"message\":\"GEMDOS Mfree returned %ld\"}\n",
+                     (long)mfree_errno, (long)mfree_errno);
+    if (n < 0) n = 0;
+    write_response(c, 422, "Unprocessable Entity", "application/json",
+                   body, (size_t)n);
+    return;
+  }
+  char body[120];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"unloaded\":true,\"basepage\":%ld}\n",
+                   (long)basepage_before);
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
 // POST /api/v1/runner/cd — Epic 03 / S4.
 //
 // JSON body: {"path": "<rel>"}.
@@ -1644,6 +1971,24 @@ static void __not_in_flash_func(handle_runner_cd)(http_conn_t *c) {
 }
 
 // Stage the requested rez (low | med) into the RUNNER_REZ slot of
+// Write a 32-bit value (e.g. the Pexec(3) basepage pointer cached
+// for a future RUNNER_CMD_EXEC, Epic 06 / S5+S6) into the
+// m68k-readable cartridge slot. Byte-pair-swapped so the m68k's
+// `move.l RUNNER_BASEPAGE, ...` lands the right value, same
+// cartridge-bus quirk as runner_write_path.
+static void __not_in_flash_func(runner_write_u32)(uint32_t offset,
+                                                   uint32_t value) {
+  uint8_t *dst = (uint8_t *)(runner_app_free_address() + offset);
+  uint8_t b0 = (uint8_t)((value >> 24) & 0xFF);
+  uint8_t b1 = (uint8_t)((value >> 16) & 0xFF);
+  uint8_t b2 = (uint8_t)((value >> 8) & 0xFF);
+  uint8_t b3 = (uint8_t)(value & 0xFF);
+  dst[0 ^ 1u] = b0;
+  dst[1 ^ 1u] = b1;
+  dst[2 ^ 1u] = b2;
+  dst[3 ^ 1u] = b3;
+}
+
 // APP_FREE so the m68k handler can read it. u16 in the low half of
 // the longword. Byte-pair-swapped so the m68k's word-load lands
 // the right value (cartridge-bus quirk — same as runner_write_path).
@@ -2657,7 +3002,7 @@ static void __not_in_flash_func(handle_files_list)(http_conn_t *c) {
     return;
   } else if (!(info.fattrib & AM_DIR)) {
     write_error(c, 422, "Unprocessable Entity", "is_file",
-                "Path is a file; use GET /api/v1/files/<rel> to download");
+                "Path is a file; use GET /api/v1/gemdrive/files/<rel> to download");
     return;
   }
 
@@ -2735,7 +3080,7 @@ static void __not_in_flash_func(handle_files_list)(http_conn_t *c) {
 
 // --- Folder mutation handlers (S3) ---
 //
-// `rel` is the URL path component AFTER /api/v1/folders/, possibly
+// `rel` is the URL path component AFTER /api/v1/gemdrive/folders/, possibly
 // still containing percent-encoded bytes. The handlers URL-decode,
 // normalise, jail, validate 8.3 on the last segment, then call FatFs.
 
@@ -2828,7 +3173,7 @@ static void __not_in_flash_func(handle_folder_create)(http_conn_t *c, const char
   if (n < 0) n = 0;
   char extra[256];
   int en = snprintf(extra, sizeof(extra),
-                    "Location: /api/v1/folders%s\r\n", norm);
+                    "Location: /api/v1/gemdrive/folders%s\r\n", norm);
   if (en < 0 || (size_t)en >= sizeof(extra)) extra[0] = '\0';
   write_response_ex(c, 201, "Created", "application/json",
                     (extra[0] != '\0') ? extra : NULL, body, (size_t)n);
@@ -2861,7 +3206,7 @@ static void __not_in_flash_func(handle_folder_delete)(http_conn_t *c, const char
   }
   if (!finfo_is_dir(&info)) {
     write_error(c, 404, "Not Found", "is_file",
-                "Path is a file; use DELETE /api/v1/files/<rel>");
+                "Path is a file; use DELETE /api/v1/gemdrive/files/<rel>");
     return;
   }
   fr = f_unlink(abs_path);
@@ -2982,7 +3327,7 @@ static void __not_in_flash_func(handle_folder_rename)(http_conn_t *c, const char
   }
   if (!finfo_is_dir(&info)) {
     write_error(c, 404, "Not Found", "is_file",
-                "Path is a file; use POST /api/v1/files/<rel>/rename");
+                "Path is a file; use POST /api/v1/gemdrive/files/<rel>/rename");
     return;
   }
 
@@ -3118,7 +3463,7 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
   }
   if (finfo_is_dir(&info)) {
     write_error(c, 404, "Not Found", "is_directory",
-                "Path is a directory; use GET /api/v1/files?path=<rel> to list");
+                "Path is a directory; use GET /api/v1/gemdrive/files?path=<rel> to list");
     return;
   }
 
@@ -3284,7 +3629,7 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
 
 // --- Streaming file upload (S6) ---
 //
-// PUT /api/v1/files/<rel>?overwrite=0|1 streams the body straight
+// PUT /api/v1/gemdrive/files/<rel>?overwrite=0|1 streams the body straight
 // into FatFs as bytes arrive. The init step is invoked from
 // parse_and_dispatch BEFORE the generic body-bearing block (whose
 // 256-byte buffer is too small for real uploads). After validation
@@ -3329,7 +3674,7 @@ static void __not_in_flash_func(upload_finish_ok)(http_conn_t *c) {
   } else {
     char extra[256];
     int en = snprintf(extra, sizeof(extra),
-                      "Location: /api/v1/files%s\r\n", c->upload_norm);
+                      "Location: /api/v1/gemdrive/files%s\r\n", c->upload_norm);
     if (en < 0 || (size_t)en >= sizeof(extra)) extra[0] = '\0';
     write_response_ex(c, 201, "Created", "application/json",
                       (extra[0] != '\0') ? extra : NULL, body, (size_t)n);
@@ -3356,9 +3701,9 @@ static bool __not_in_flash_func(handle_file_upload_init)(
     return false;
   }
 
-  // Extract <rel> from /api/v1/files/<rel>; strip the trailing
+  // Extract <rel> from /api/v1/gemdrive/files/<rel>; strip the trailing
   // /rename action suffix (which is POST-only — PUT here is 405).
-  static const char prefix[] = "/api/v1/files/";
+  static const char prefix[] = "/api/v1/gemdrive/files/";
   static const size_t prefix_len = sizeof(prefix) - 1;
   const char *url_rel = c->path + prefix_len;
   if (url_rel[0] == '\0') {
@@ -3524,7 +3869,7 @@ static void __not_in_flash_func(handle_file_delete)(http_conn_t *c,
   }
   if (finfo_is_dir(&info)) {
     write_error(c, 404, "Not Found", "is_directory",
-                "Path is a directory; use DELETE /api/v1/folders/<rel>");
+                "Path is a directory; use DELETE /api/v1/gemdrive/folders/<rel>");
     return;
   }
   fr = f_unlink(abs_path);
@@ -3627,7 +3972,7 @@ static void __not_in_flash_func(handle_file_rename)(http_conn_t *c,
   }
   if (finfo_is_dir(&info)) {
     write_error(c, 404, "Not Found", "is_directory",
-                "Path is a directory; use POST /api/v1/folders/<rel>/rename");
+                "Path is a directory; use POST /api/v1/gemdrive/folders/<rel>/rename");
     return;
   }
 
@@ -3696,8 +4041,8 @@ typedef struct {
 
 static const route_t g_routes[] = {
     {"/api/v1/ping", M_GET | M_HEAD, handle_ping},
-    {"/api/v1/volume", M_GET | M_HEAD, handle_volume},
-    {"/api/v1/files", M_GET | M_HEAD, handle_files_list},
+    {"/api/v1/gemdrive/volume", M_GET | M_HEAD, handle_volume},
+    {"/api/v1/gemdrive/files", M_GET | M_HEAD, handle_files_list},
     {"/api/v1/runner", M_GET | M_HEAD, handle_runner_status},
     {"/api/v1/debug", M_GET | M_HEAD, handle_debug_status},
     {"/api/v1/debug/log", M_GET | M_HEAD, handle_debug_log},
@@ -3763,8 +4108,8 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
     return;
   }
 
-  // Prefix routes: /api/v1/folders/<rel> [+ /rename action].
-  static const char folders_prefix[] = "/api/v1/folders/";
+  // Prefix routes: /api/v1/gemdrive/folders/<rel> [+ /rename action].
+  static const char folders_prefix[] = "/api/v1/gemdrive/folders/";
   static const size_t folders_prefix_len = sizeof(folders_prefix) - 1;
   if (strncmp(c->path, folders_prefix, folders_prefix_len) == 0) {
     char *rel = c->path + folders_prefix_len;
@@ -3793,11 +4138,11 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
     return;
   }
 
-  // Prefix routes: /api/v1/files/<rel> [+ /rename action]. The
-  // exact-match /api/v1/files (no trailing slash) is the listing
+  // Prefix routes: /api/v1/gemdrive/files/<rel> [+ /rename action]. The
+  // exact-match /api/v1/gemdrive/files (no trailing slash) is the listing
   // endpoint and is handled by g_routes above; only the slash-prefixed
   // form falls through here.
-  static const char files_prefix[] = "/api/v1/files/";
+  static const char files_prefix[] = "/api/v1/gemdrive/files/";
   static const size_t files_prefix_len = sizeof(files_prefix) - 1;
   if (strncmp(c->path, files_prefix, files_prefix_len) == 0) {
     char *rel = c->path + files_prefix_len;
@@ -3845,6 +4190,30 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
     if (strcmp(action, "run") == 0) {
       if (c->method == HM_POST) {
         handle_runner_run(c);
+        return;
+      }
+      write_405(c, "POST");
+      return;
+    }
+    if (strcmp(action, "load") == 0) {
+      if (c->method == HM_POST) {
+        handle_runner_load(c);
+        return;
+      }
+      write_405(c, "POST");
+      return;
+    }
+    if (strcmp(action, "exec") == 0) {
+      if (c->method == HM_POST) {
+        handle_runner_exec(c);
+        return;
+      }
+      write_405(c, "POST");
+      return;
+    }
+    if (strcmp(action, "unload") == 0) {
+      if (c->method == HM_POST) {
+        handle_runner_unload(c);
         return;
       }
       write_405(c, "POST");

@@ -13,8 +13,13 @@ static SettingsConfigEntry defaultEntries[] = {
     {ACONFIG_PARAM_GEMDRIVE_DRIVE, SETTINGS_TYPE_STRING, "C"},
     {ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR, SETTINGS_TYPE_INT, "0"},
     {ACONFIG_PARAM_DEVOPS_MEMTOP, SETTINGS_TYPE_INT, "0"},
-    // Advanced Runner — Epic 04 / S4. Default "etv_timer".
-    {ACONFIG_PARAM_ADV_HOOK_VECTOR, SETTINGS_TYPE_STRING, "etv_timer"},
+    // Advanced Runner — default "vbl" ($70 hardware VBL exception
+    // vector). The full feature set (adv jump / adv load) only
+    // works on this vector because we need a stable trap-frame
+    // layout to patch the saved PC; "etv_timer" ($400) is the
+    // alternative for callers that prefer to ride downstream of
+    // TOS' VBL chain at the cost of jump/load support.
+    {ACONFIG_PARAM_ADV_HOOK_VECTOR, SETTINGS_TYPE_STRING, "vbl"},
 };
 
 // Create a global context for our settings

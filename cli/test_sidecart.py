@@ -220,25 +220,25 @@ class VolumeTests(unittest.TestCase):
             "free_b": 1 * 1024 * 1024 * 1024,
             "fs_type": "FAT32",
         })
-        code, out, _err = _run_cli(["--host", self.server.host, "volume"])
+        code, out, _err = _run_cli(["--host", self.server.host, "gemdrive", "volume"])
         self.assertEqual(code, sidecart.EXIT_OK)
         self.assertIn("FAT32", out)
         self.assertIn("GB", out)
-        self.assertEqual(self.server.state.last_path, "/api/v1/volume")
+        self.assertEqual(self.server.state.last_path, "/api/v1/gemdrive/volume")
         self.assertEqual(self.server.state.last_method, "GET")
 
     def test_volume_json(self) -> None:
         self._set_response(200, {"ok": True, "total_b": 1, "free_b": 1,
                                  "fs_type": "FAT16"})
         code, out, _err = _run_cli(
-            ["--host", self.server.host, "--json", "volume"])
+            ["--host", self.server.host, "--json", "gemdrive", "volume"])
         self.assertEqual(code, sidecart.EXIT_OK)
         self.assertEqual(json.loads(out)["fs_type"], "FAT16")
 
     def test_volume_503_busy(self) -> None:
         self._set_response(503, {"ok": False, "code": "busy",
                                  "message": "SD not mounted"})
-        code, _out, err = _run_cli(["--host", self.server.host, "volume"])
+        code, _out, err = _run_cli(["--host", self.server.host, "gemdrive", "volume"])
         self.assertEqual(code, sidecart.EXIT_BUSY)
         self.assertIn("busy", err)
 
@@ -265,21 +265,21 @@ class LsTests(unittest.TestCase):
             ],
             "truncated": False,
         })
-        code, out, _err = _run_cli(["--host", self.server.host, "ls"])
+        code, out, _err = _run_cli(["--host", self.server.host, "gemdrive", "ls"])
         self.assertEqual(code, sidecart.EXIT_OK)
         self.assertIn("FOO.TXT", out)
         self.assertIn("SUB", out)
         self.assertIn("file", out)
         self.assertIn("dir", out)
-        # Default path resolves to /api/v1/files?path=%2F or /api/v1/files?path=/.
-        self.assertTrue(self.server.state.last_path.startswith("/api/v1/files"))
+        # Default path resolves to /api/v1/gemdrive/files?path=%2F or /api/v1/gemdrive/files?path=/.
+        self.assertTrue(self.server.state.last_path.startswith("/api/v1/gemdrive/files"))
         self.assertIn("path=", self.server.state.last_path)
 
     def test_ls_explicit_path(self) -> None:
         self._set_response(200, {"ok": True, "path": "/sub",
                                  "entries": [], "truncated": False})
         code, _out, _err = _run_cli(
-            ["--host", self.server.host, "ls", "/sub/foo bar"])
+            ["--host", self.server.host, "gemdrive", "ls", "/sub/foo bar"])
         self.assertEqual(code, sidecart.EXIT_OK)
         # Spaces must be URL-encoded.
         self.assertIn("foo%20bar", self.server.state.last_path)
@@ -291,7 +291,7 @@ class LsTests(unittest.TestCase):
                          "mtime": None}],
             "truncated": True,
         })
-        code, out, _err = _run_cli(["--host", self.server.host, "ls"])
+        code, out, _err = _run_cli(["--host", self.server.host, "gemdrive", "ls"])
         self.assertEqual(code, sidecart.EXIT_OK)
         self.assertIn("truncated", out)
 
@@ -299,7 +299,7 @@ class LsTests(unittest.TestCase):
         self._set_response(404, {"ok": False, "code": "not_found",
                                  "message": "Path not found"})
         code, _out, err = _run_cli(
-            ["--host", self.server.host, "ls", "/missing"])
+            ["--host", self.server.host, "gemdrive", "ls", "/missing"])
         self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
         self.assertIn("not_found", err)
 
@@ -307,7 +307,7 @@ class LsTests(unittest.TestCase):
         self._set_response(422, {"ok": False, "code": "is_file",
                                  "message": "Path is a file"})
         code, _out, err = _run_cli(
-            ["--host", self.server.host, "ls", "/foo.txt"])
+            ["--host", self.server.host, "gemdrive", "ls", "/foo.txt"])
         self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
         self.assertIn("is_file", err)
 
@@ -329,17 +329,17 @@ class FolderMutationTests(unittest.TestCase):
     def test_mkdir_201(self) -> None:
         self._set_response(201, {"ok": True, "path": "/sub"})
         code, out, _err = _run_cli(
-            ["--host", self.server.host, "mkdir", "/sub"])
+            ["--host", self.server.host, "gemdrive", "mkdir", "/sub"])
         self.assertEqual(code, sidecart.EXIT_OK)
         self.assertEqual(self.server.state.last_method, "POST")
-        self.assertEqual(self.server.state.last_path, "/api/v1/folders/sub")
+        self.assertEqual(self.server.state.last_path, "/api/v1/gemdrive/folders/sub")
         self.assertIn("/sub", out)
 
     def test_mkdir_409_conflict(self) -> None:
         self._set_response(409, {"ok": False, "code": "conflict",
                                  "message": "Folder already exists"})
         code, _out, err = _run_cli(
-            ["--host", self.server.host, "mkdir", "/sub"])
+            ["--host", self.server.host, "gemdrive", "mkdir", "/sub"])
         self.assertEqual(code, sidecart.EXIT_CONFLICT)
         self.assertIn("conflict", err)
 
@@ -347,7 +347,7 @@ class FolderMutationTests(unittest.TestCase):
         self._set_response(400, {"ok": False, "code": "name_too_long",
                                  "message": "Stem > 8 chars"})
         code, _out, err = _run_cli(
-            ["--host", self.server.host, "mkdir", "/longerthan8"])
+            ["--host", self.server.host, "gemdrive", "mkdir", "/longerthan8"])
         self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
         self.assertIn("name_too_long", err)
 
@@ -357,17 +357,17 @@ class FolderMutationTests(unittest.TestCase):
         # 204 No Content — empty body, no JSON.
         self._set_response(204, None)
         code, out, _err = _run_cli(
-            ["--host", self.server.host, "rmdir", "/sub"])
+            ["--host", self.server.host, "gemdrive", "rmdir", "/sub"])
         self.assertEqual(code, sidecart.EXIT_OK)
         self.assertEqual(self.server.state.last_method, "DELETE")
-        self.assertEqual(self.server.state.last_path, "/api/v1/folders/sub")
+        self.assertEqual(self.server.state.last_path, "/api/v1/gemdrive/folders/sub")
         self.assertIn("ok", out)
 
     def test_rmdir_409_not_empty(self) -> None:
         self._set_response(409, {"ok": False, "code": "conflict",
                                  "message": "Folder is not empty"})
         code, _out, err = _run_cli(
-            ["--host", self.server.host, "rmdir", "/sub"])
+            ["--host", self.server.host, "gemdrive", "rmdir", "/sub"])
         self.assertEqual(code, sidecart.EXIT_CONFLICT)
         self.assertIn("not empty", err)
 
@@ -375,7 +375,7 @@ class FolderMutationTests(unittest.TestCase):
         self._set_response(404, {"ok": False, "code": "is_file",
                                  "message": "Path is a file"})
         code, _out, err = _run_cli(
-            ["--host", self.server.host, "rmdir", "/foo.txt"])
+            ["--host", self.server.host, "gemdrive", "rmdir", "/foo.txt"])
         self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
         self.assertIn("is_file", err)
 
@@ -384,11 +384,11 @@ class FolderMutationTests(unittest.TestCase):
     def test_mvdir_200(self) -> None:
         self._set_response(200, {"ok": True, "from": "/old", "to": "/new"})
         code, out, _err = _run_cli(
-            ["--host", self.server.host, "mvdir", "/old", "/new"])
+            ["--host", self.server.host, "gemdrive", "mvdir", "/old", "/new"])
         self.assertEqual(code, sidecart.EXIT_OK)
         self.assertEqual(self.server.state.last_method, "POST")
         self.assertEqual(self.server.state.last_path,
-                         "/api/v1/folders/old/rename")
+                         "/api/v1/gemdrive/folders/old/rename")
         body = json.loads(self.server.state.last_body.decode("utf-8"))
         self.assertEqual(body, {"to": "/new"})
         self.assertEqual(
@@ -400,7 +400,7 @@ class FolderMutationTests(unittest.TestCase):
         self._set_response(422, {"ok": False, "code": "unprocessable",
                                  "message": "Cannot rename into descendant"})
         code, _out, err = _run_cli(
-            ["--host", self.server.host, "mvdir", "/foo", "/foo/bar"])
+            ["--host", self.server.host, "gemdrive", "mvdir", "/foo", "/foo/bar"])
         self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
         self.assertIn("unprocessable", err)
 
@@ -422,17 +422,17 @@ class FileMutationTests(unittest.TestCase):
     def test_rm_204(self) -> None:
         self._set_response(204, None)
         code, out, _err = _run_cli(
-            ["--host", self.server.host, "rm", "/foo.txt"])
+            ["--host", self.server.host, "gemdrive", "rm", "/foo.txt"])
         self.assertEqual(code, sidecart.EXIT_OK)
         self.assertEqual(self.server.state.last_method, "DELETE")
-        self.assertEqual(self.server.state.last_path, "/api/v1/files/foo.txt")
+        self.assertEqual(self.server.state.last_path, "/api/v1/gemdrive/files/foo.txt")
         self.assertIn("ok", out)
 
     def test_rm_404_is_directory(self) -> None:
         self._set_response(404, {"ok": False, "code": "is_directory",
                                  "message": "Path is a directory"})
         code, _out, err = _run_cli(
-            ["--host", self.server.host, "rm", "/sub"])
+            ["--host", self.server.host, "gemdrive", "rm", "/sub"])
         self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
         self.assertIn("is_directory", err)
 
@@ -440,7 +440,7 @@ class FileMutationTests(unittest.TestCase):
         self._set_response(404, {"ok": False, "code": "not_found",
                                  "message": "File not found"})
         code, _out, err = _run_cli(
-            ["--host", self.server.host, "rm", "/missing"])
+            ["--host", self.server.host, "gemdrive", "rm", "/missing"])
         self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
         self.assertIn("not_found", err)
 
@@ -450,11 +450,11 @@ class FileMutationTests(unittest.TestCase):
         self._set_response(200, {"ok": True, "from": "/old.txt",
                                  "to": "/new.txt"})
         code, out, _err = _run_cli(
-            ["--host", self.server.host, "mv", "/old.txt", "/new.txt"])
+            ["--host", self.server.host, "gemdrive", "mv", "/old.txt", "/new.txt"])
         self.assertEqual(code, sidecart.EXIT_OK)
         self.assertEqual(self.server.state.last_method, "POST")
         self.assertEqual(self.server.state.last_path,
-                         "/api/v1/files/old.txt/rename")
+                         "/api/v1/gemdrive/files/old.txt/rename")
         body = json.loads(self.server.state.last_body.decode("utf-8"))
         self.assertEqual(body, {"to": "/new.txt"})
         self.assertEqual(
@@ -466,7 +466,7 @@ class FileMutationTests(unittest.TestCase):
         self._set_response(409, {"ok": False, "code": "conflict",
                                  "message": "Target already exists"})
         code, _out, err = _run_cli(
-            ["--host", self.server.host, "mv", "/a.txt", "/b.txt"])
+            ["--host", self.server.host, "gemdrive", "mv", "/a.txt", "/b.txt"])
         self.assertEqual(code, sidecart.EXIT_CONFLICT)
         self.assertIn("conflict", err)
 
@@ -474,7 +474,7 @@ class FileMutationTests(unittest.TestCase):
         self._set_response(404, {"ok": False, "code": "is_directory",
                                  "message": "Path is a directory"})
         code, _out, err = _run_cli(
-            ["--host", self.server.host, "mv", "/sub", "/sub2"])
+            ["--host", self.server.host, "gemdrive", "mv", "/sub", "/sub2"])
         self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
         self.assertIn("is_directory", err)
 
@@ -517,18 +517,18 @@ class GetTests(unittest.TestCase):
         payload = b"A" * 5000
         self._set_octets(200, payload)
         code, _out, _err = _run_cli(
-            ["--host", self.server.host, "-q", "get", "/foo.bin"])
+            ["--host", self.server.host, "-q", "gemdrive", "get", "/foo.bin"])
         self.assertEqual(code, sidecart.EXIT_OK)
         with open("foo.bin", "rb") as f:
             self.assertEqual(f.read(), payload)
         self.assertEqual(self.server.state.last_method, "GET")
         self.assertEqual(self.server.state.last_path,
-                         "/api/v1/files/foo.bin")
+                         "/api/v1/gemdrive/files/foo.bin")
 
     def test_get_local_override(self) -> None:
         self._set_octets(200, b"hello")
         code, _out, _err = _run_cli(
-            ["--host", self.server.host, "-q", "get", "/foo.bin", "out.bin"])
+            ["--host", self.server.host, "-q", "gemdrive", "get", "/foo.bin", "out.bin"])
         self.assertEqual(code, sidecart.EXIT_OK)
         with open("out.bin", "rb") as f:
             self.assertEqual(f.read(), b"hello")
@@ -542,7 +542,7 @@ class GetTests(unittest.TestCase):
         self._set_octets(206, slice_data, {
             "Content-Range": "bytes 100-149/150"})
         code, _out, _err = _run_cli(
-            ["--host", self.server.host, "-q", "get", "/foo.bin", "-r"])
+            ["--host", self.server.host, "-q", "gemdrive", "get", "/foo.bin", "-r"])
         self.assertEqual(code, sidecart.EXIT_OK)
         # The CLI must have sent Range: bytes=100-.
         self.assertEqual(
@@ -555,7 +555,7 @@ class GetTests(unittest.TestCase):
         self._set_json_error(404, {"ok": False, "code": "not_found",
                                    "message": "File not found"})
         code, _out, err = _run_cli(
-            ["--host", self.server.host, "-q", "get", "/missing"])
+            ["--host", self.server.host, "-q", "gemdrive", "get", "/missing"])
         self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
         self.assertIn("not_found", err)
 
@@ -566,7 +566,7 @@ class GetTests(unittest.TestCase):
         self._set_json_error(416, {"ok": False, "code": "range_invalid",
                                    "message": "Range outside file"})
         code, _out, err = _run_cli(
-            ["--host", self.server.host, "-q", "get", "/foo.bin", "-r"])
+            ["--host", self.server.host, "-q", "gemdrive", "get", "/foo.bin", "-r"])
         # 416 falls into the "other 4xx" bucket = EXIT_BAD_REQUEST.
         self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
         self.assertIn("range_invalid", err)
@@ -606,10 +606,10 @@ class PutTests(unittest.TestCase):
         self._set_response(201, {"ok": True, "path": "/up.bin",
                                  "size": len(payload)})
         code, out, _err = _run_cli(
-            ["--host", self.server.host, "-q", "put", "up.bin"])
+            ["--host", self.server.host, "-q", "gemdrive", "put", "up.bin"])
         self.assertEqual(code, sidecart.EXIT_OK)
         self.assertEqual(self.server.state.last_method, "PUT")
-        self.assertEqual(self.server.state.last_path, "/api/v1/files/up.bin")
+        self.assertEqual(self.server.state.last_path, "/api/v1/gemdrive/files/up.bin")
         self.assertEqual(
             self.server.state.last_headers.get("Content-Type"),
             "application/octet-stream")
@@ -622,7 +622,7 @@ class PutTests(unittest.TestCase):
         self._write_local("a.txt", b"hello")
         self._set_response(200, {"ok": True, "path": "/a.txt", "size": 5})
         code, _out, _err = _run_cli(
-            ["--host", self.server.host, "-q", "put", "a.txt", "/a.txt", "-f"])
+            ["--host", self.server.host, "-q", "gemdrive", "put", "a.txt", "/a.txt", "-f"])
         self.assertEqual(code, sidecart.EXIT_OK)
         self.assertIn("overwrite=1", self.server.state.last_path)
         self.assertEqual(self.server.state.last_body, b"hello")
@@ -632,7 +632,7 @@ class PutTests(unittest.TestCase):
         self._set_response(409, {"ok": False, "code": "conflict",
                                  "message": "File exists"})
         code, _out, err = _run_cli(
-            ["--host", self.server.host, "-q", "put", "a.txt"])
+            ["--host", self.server.host, "-q", "gemdrive", "put", "a.txt"])
         self.assertEqual(code, sidecart.EXIT_CONFLICT)
         self.assertIn("conflict", err)
         # No overwrite query when --force is absent.
@@ -643,7 +643,7 @@ class PutTests(unittest.TestCase):
         self._set_response(503, {"ok": False, "code": "busy",
                                  "message": "Another upload in progress"})
         code, _out, err = _run_cli(
-            ["--host", self.server.host, "-q", "put", "a.txt", "/a.txt", "-f"])
+            ["--host", self.server.host, "-q", "gemdrive", "put", "a.txt", "/a.txt", "-f"])
         self.assertEqual(code, sidecart.EXIT_BUSY)
         self.assertIn("busy", err)
 
@@ -786,6 +786,192 @@ class RunnerRunTests(unittest.TestCase):
             ["--host", self.server.host, "runner", "run", "/MISSING.TOS"])
         self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
         self.assertIn("not_found", err)
+
+
+class RunnerLoadTests(unittest.TestCase):
+    """Epic 06 / S5 — `sidecart runner load`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_load_200_returns_basepage(self) -> None:
+        self._set_response(200, {
+            "ok": True, "loaded": True, "basepage": 0x800000})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "load", "/PROG.TOS"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path,
+                         "/api/v1/runner/load")
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body["path"], "/PROG.TOS")
+        self.assertEqual(body["cmdline"], "")
+        self.assertIn("LOAD", out)
+        self.assertIn("0x00800000", out)
+
+    def test_runner_load_with_cmdline(self) -> None:
+        self._set_response(200, {
+            "ok": True, "loaded": True, "basepage": 0x123456})
+        code, _out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "load",
+             "/PROG.TOS", "-v", "--file", "foo.txt"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        body = json.loads(self.server.state.last_body.decode("utf-8"))
+        self.assertEqual(body["cmdline"], "-v --file foo.txt")
+
+    def test_runner_load_409_already_loaded(self) -> None:
+        self._set_response(
+            409, {"ok": False, "code": "program_already_loaded",
+                  "message": "A program is already loaded"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "load", "/PROG.TOS"])
+        self.assertEqual(code, sidecart.EXIT_CONFLICT)
+        self.assertIn("program_already_loaded", err)
+
+    def test_runner_load_409_runner_inactive(self) -> None:
+        self._set_response(
+            409, {"ok": False, "code": "runner_inactive",
+                  "message": "Runner mode not active"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "load", "/PROG.TOS"])
+        self.assertEqual(code, sidecart.EXIT_CONFLICT)
+        self.assertIn("runner_inactive", err)
+
+    def test_runner_load_503_busy(self) -> None:
+        self._set_response(503, {"ok": False, "code": "busy",
+                                 "message": "Runner busy"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "load", "/PROG.TOS"])
+        self.assertEqual(code, sidecart.EXIT_BUSY)
+        self.assertIn("busy", err)
+
+    def test_runner_load_422_pexec_failed(self) -> None:
+        # Pexec(3) returned a GEMDOS errno; surface it as a 422.
+        self._set_response(
+            422, {"ok": False, "code": "pexec_failed",
+                  "gemdos_errno": -33,
+                  "message": "GEMDOS Pexec(3) returned -33"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "load", "/PROG.TOS"])
+        self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
+        self.assertIn("pexec_failed", err)
+
+
+class RunnerExecTests(unittest.TestCase):
+    """Epic 06 / S6 — `sidecart runner exec`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_exec_202_no_args(self) -> None:
+        self._set_response(202, {"ok": True, "accepted": True})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "exec"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path,
+                         "/api/v1/runner/exec")
+        # Empty body — exec takes no parameters; basepage is server-side state.
+        self.assertEqual(self.server.state.last_body, b"")
+        self.assertIn("EXEC", out)
+
+    def test_runner_exec_409_no_program_loaded(self) -> None:
+        self._set_response(
+            409, {"ok": False, "code": "no_program_loaded",
+                  "message": "No program is loaded"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "exec"])
+        self.assertEqual(code, sidecart.EXIT_CONFLICT)
+        self.assertIn("no_program_loaded", err)
+
+    def test_runner_exec_409_runner_inactive(self) -> None:
+        self._set_response(
+            409, {"ok": False, "code": "runner_inactive",
+                  "message": "Runner mode not active"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "exec"])
+        self.assertEqual(code, sidecart.EXIT_CONFLICT)
+        self.assertIn("runner_inactive", err)
+
+    def test_runner_exec_503_busy(self) -> None:
+        self._set_response(503, {"ok": False, "code": "busy",
+                                 "message": "Runner busy"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "exec"])
+        self.assertEqual(code, sidecart.EXIT_BUSY)
+        self.assertIn("busy", err)
+
+
+class RunnerUnloadTests(unittest.TestCase):
+    """Epic 06 / S7 — `sidecart runner unload`."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_status = status
+        self.server.state.next_body = body
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_runner_unload_200_ok(self) -> None:
+        self._set_response(200, {
+            "ok": True, "unloaded": True, "basepage": 0xAC1E})
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "runner", "unload"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(self.server.state.last_method, "POST")
+        self.assertEqual(self.server.state.last_path,
+                         "/api/v1/runner/unload")
+        self.assertEqual(self.server.state.last_body, b"")
+        self.assertIn("UNLOAD", out)
+        self.assertIn("0x0000AC1E", out)
+
+    def test_runner_unload_409_no_program_loaded(self) -> None:
+        self._set_response(
+            409, {"ok": False, "code": "no_program_loaded",
+                  "message": "Nothing to unload"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "unload"])
+        self.assertEqual(code, sidecart.EXIT_CONFLICT)
+        self.assertIn("no_program_loaded", err)
+
+    def test_runner_unload_409_runner_inactive(self) -> None:
+        self._set_response(
+            409, {"ok": False, "code": "runner_inactive",
+                  "message": "Runner mode not active"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "unload"])
+        self.assertEqual(code, sidecart.EXIT_CONFLICT)
+        self.assertIn("runner_inactive", err)
+
+    def test_runner_unload_422_mfree_failed(self) -> None:
+        self._set_response(
+            422, {"ok": False, "code": "mfree_failed",
+                  "gemdos_errno": -40,
+                  "message": "GEMDOS Mfree returned -40"})
+        code, _out, err = _run_cli(
+            ["--host", self.server.host, "runner", "unload"])
+        self.assertEqual(code, sidecart.EXIT_BAD_REQUEST)
+        self.assertIn("mfree_failed", err)
 
 
 class RunnerCdTests(unittest.TestCase):

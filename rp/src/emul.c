@@ -105,6 +105,16 @@ static const size_t numCommands = sizeof(commands) / sizeof(commands[0]);
 static bool keepActive = true;
 static bool menuScreenActive = false;
 
+// Epic 06 / S4: cached "USB CDC attached" state from the last
+// menu paint. -1 means "not yet rendered this menu session";
+// any 0/1 transition triggers refreshUsbCdcLine() to overdraw
+// the status line in place. Lives at module scope because both
+// menu() (initial paint) and the main loop (live refresh) touch
+// it. Fixed cursor row so the overdraw doesn't have to walk the
+// terminal state.
+#define MENU_USBCDC_ROW 15
+static int g_menuLastUsbCdcAttached = -1;
+
 // Runner state owned RP-side (the m68k can't write to the cartridge
 // address space — read-only ROM emulation — so any handshake from
 // the Runner has to live in RP RAM). cmdRunner flips active when
@@ -141,6 +151,19 @@ static int32_t runnerLastResErrno = 0;
 static runner_meminfo_t runnerMeminfo = {0};
 static bool runnerMeminfoHasSnapshot = false;
 static bool runnerMeminfoPending = false;
+// Epic 06 / S5+S6 — Pexec(3)/(4) load+exec split state. The
+// m68k Runner's RUNNER_CMD_LOAD handler (Pexec mode 3) returns a
+// basepage pointer in the DONE_LOAD payload; we cache it here so
+// a subsequent RUNNER_CMD_EXEC fires Pexec(4) on the right
+// program, and so the strict-refuse semantics on a second LOAD
+// stay enforceable from the RP side without any m68k roundtrip.
+// pendingBasepage is signed — the m68k payload format is "i32:
+// >0 basepage ptr, <0 -GEMDOS errno". On error we store 0 so
+// emul_isRunnerLoadPending() reads correctly; the errno survives
+// in runnerLoadErrno for the status endpoint.
+static int32_t runnerPendingBasepage = 0;
+static bool runnerLoadHasErrno = false;
+static int32_t runnerLoadErrno = 0;
 // Epic 04 — Advanced Runner installation flag, set by the m68k's
 // HELLO payload byte after runner_post_reloc installs its VBL hook.
 static bool runnerAdvancedInstalled = false;
@@ -215,6 +238,103 @@ void emul_recordRunnerExecuteDone(int32_t exit_code, uint32_t now_ms) {
   runnerLastHasExitCode = true;
   runnerLastFinishedMs = now_ms;
   runnerBusy = false;
+}
+
+// Epic 06 / S5+S6 — Pexec(3) load + Pexec(4) exec.
+void emul_recordRunnerLoadSubmit(const char *path, uint32_t now_ms) {
+  runnerLastCommand = RUNNER_LAST_PEXEC_LOAD;
+  runnerLastStartedMs = now_ms;
+  runnerLastFinishedMs = 0;
+  runnerLastHasExitCode = false;
+  runnerLastExitCode = 0;
+  runnerLoadHasErrno = false;
+  runnerLoadErrno = 0;
+  if (path != NULL) {
+    size_t n = strlen(path);
+    if (n >= sizeof(runnerLastPath)) n = sizeof(runnerLastPath) - 1;
+    memcpy(runnerLastPath, path, n);
+    runnerLastPath[n] = '\0';
+  } else {
+    runnerLastPath[0] = '\0';
+  }
+  runnerBusy = true;
+}
+
+void emul_recordRunnerLoadDone(int32_t result, uint32_t now_ms) {
+  runnerLastFinishedMs = now_ms;
+  runnerBusy = false;
+  if (result > 0) {
+    runnerPendingBasepage = result;
+    runnerLoadHasErrno = false;
+    runnerLoadErrno = 0;
+  } else {
+    runnerPendingBasepage = 0;
+    runnerLoadHasErrno = true;
+    runnerLoadErrno = result;  // <0 = -GEMDOS errno; 0 = unexpected
+  }
+}
+
+void emul_recordRunnerExecSubmit(uint32_t now_ms) {
+  runnerLastCommand = RUNNER_LAST_PEXEC_EXEC;
+  runnerLastStartedMs = now_ms;
+  runnerLastFinishedMs = 0;
+  runnerLastHasExitCode = false;
+  runnerLastExitCode = 0;
+  // exec doesn't operate on a path — keep the path mirror as it
+  // was set by the prior load so a status query during the in-
+  // flight window still shows which program is running.
+  runnerBusy = true;
+}
+
+void emul_recordRunnerExecDone(int32_t exit_code, uint32_t now_ms) {
+  runnerLastExitCode = exit_code;
+  runnerLastHasExitCode = true;
+  runnerLastFinishedMs = now_ms;
+  runnerBusy = false;
+  // Pexec(4) (PE_GO) does NOT free the basepage — it stays
+  // allocated in m68k RAM and re-exec on the same basepage is
+  // valid. The runner unload command (Epic 06 / S7) is what
+  // explicitly Mfrees the memory and clears pendingBasepage.
+}
+
+// Epic 06 / S7 — runner unload (GEMDOS Mfree).
+void emul_recordRunnerUnloadSubmit(uint32_t now_ms) {
+  runnerLastCommand = RUNNER_LAST_PEXEC_UNLOAD;
+  runnerLastStartedMs = now_ms;
+  runnerLastFinishedMs = 0;
+  runnerLastHasExitCode = false;
+  runnerLastExitCode = 0;
+  runnerLoadHasErrno = false;
+  runnerLoadErrno = 0;
+  runnerBusy = true;
+}
+
+void emul_recordRunnerUnloadDone(int32_t result, uint32_t now_ms) {
+  runnerLastFinishedMs = now_ms;
+  runnerBusy = false;
+  if (result == 0) {
+    // Mfree succeeded — basepage gone from m68k RAM, clear our
+    // mirror so future load works and exec / unload report 409.
+    runnerPendingBasepage = 0;
+    runnerLoadHasErrno = false;
+    runnerLoadErrno = 0;
+  } else {
+    // Mfree failed (e.g. -40 EIMBA). Keep pendingBasepage as-is
+    // so the operator can see "this basepage still claims to be
+    // loaded but a previous unload failed" and act accordingly.
+    runnerLoadHasErrno = true;
+    runnerLoadErrno = result;
+  }
+}
+
+bool emul_isRunnerLoadPending(void) { return runnerPendingBasepage != 0; }
+int32_t emul_getRunnerPendingBasepage(void) { return runnerPendingBasepage; }
+
+bool emul_getRunnerLastLoadErrno(int32_t *out) {
+  if (runnerLoadHasErrno && out != NULL) {
+    *out = runnerLoadErrno;
+  }
+  return runnerLoadHasErrno;
 }
 
 void emul_recordRunnerCdSubmit(const char *path, uint32_t now_ms) {
@@ -400,7 +520,9 @@ bool emul_isFirmwareMode(void) {
   return firmwareModeActive;
 }
 
-// Boot countdown — auto-launches GEMDRIVE on the Atari ST when it hits 0.
+// Boot countdown — auto-launches Runner mode on the Atari ST when it hits 0
+// (Epic 06 / S2: switched from GEMDRIVE-only to Runner; the GEMDRIVE blob is
+// still installed because Runner runs on top of it).
 // Mirrors md-drives-emulator's behavior. Any key press halts it.
 #define BOOT_COUNTDOWN_SECONDS 20
 static int countdown = BOOT_COUNTDOWN_SECONDS;
@@ -487,10 +609,188 @@ static void drawSetupInfoLine(const char *message) {
 
 static void refreshSetupInfoLine(void) {
   if (haltCountdown) {
-    drawSetupInfoLine("Countdown stopped. Press [E] or [X] to continue.");
+    drawSetupInfoLine("Countdown stopped. Press [E], [U] or [X] to continue.");
   } else {
     showCounter(countdown);
   }
+}
+
+// Epic 06 / S8 — u8g2 menu polish (Tier 1). Thin horizontal
+// dividers between the menu's config groups. Drawn in the gap
+// row above each section header (term row 7 = y=56, row 10 =
+// y=80, row 14 = y=112) so they don't overlap any character
+// cell. One pixel tall, full-width edge-to-edge.
+static void drawMenuDividers(void) {
+  u8g2_t *ref = display_getU8g2Ref();
+  u8g2_SetDrawColor(ref, 1);
+  // Above Adv [V]ector (between row 6 GEMDRIVE last and row 8
+  // Adv header).
+  u8g2_DrawHLine(ref, 0, 60, DISPLAY_WIDTH);
+  // Above API Endpoint (between row 9 and row 11).
+  u8g2_DrawHLine(ref, 0, 84, DISPLAY_WIDTH);
+  // Above USB CDC (between row 13 and row 15).
+  u8g2_DrawHLine(ref, 0, 116, DISPLAY_WIDTH);
+}
+
+// Epic 06 / S8 — status icons via u8g2_font_open_iconic_embedded_1x_t.
+// Right-aligned at the section-header rows. Codepoints from the
+// 17-glyph open-iconic-embedded subset (verified via the u8g2
+// upstream BDF):
+//   0x42 cog          — Adv [V]ector (settings / hook handler)
+//   0x4C hard-drive   — GEMDRIVE (file-storage emulation)
+//   0x4D lightbulb    — USB CDC ("on / active connection";
+//                       flash, pulse and bluetooth all proved
+//                       unreadable at 8×8 in hardware testing —
+//                       lightbulb's silhouette is the most
+//                       legible at this resolution)
+//   0x50 wifi         — API Endpoint
+//
+// Each icon's 8×8 cell is cleared first so a re-render flips
+// state cleanly without a stale glyph hanging around. The
+// drawIconCell helper takes y_top (the row's pixel-top); the
+// glyph baseline is at y_top + 7 (font is 8 px tall).
+#define MENU_ICON_X              (DISPLAY_WIDTH - 12)
+#define MENU_ICON_GEMDRIVE_YTOP  16   // term row 2
+#define MENU_ICON_ADV_YTOP       64   // term row 8
+#define MENU_ICON_API_YTOP       88   // term row 11
+#define MENU_ICON_USB_YTOP       120  // term row 15
+#define MENU_ICON_GLYPH_COG          0x42
+#define MENU_ICON_GLYPH_LIGHTBULB    0x4D
+#define MENU_ICON_GLYPH_HARD_DRIVE   0x4C
+#define MENU_ICON_GLYPH_WIFI         0x50
+
+static void drawIconCell(uint16_t x, uint16_t y_top, uint8_t glyph,
+                         bool visible) {
+  u8g2_t *ref = display_getU8g2Ref();
+  // Clear a 9×8 cell starting one pixel above y_top — some
+  // glyphs in u8g2_font_open_iconic_embedded_1x_t (notably the
+  // lightbulb) carry an ascender margin and their topmost
+  // pixel row lands at y_top - 1, NOT y_top. An 8-tall erase
+  // box would leave that row untouched and a hide→show
+  // transition would expose a residual top edge of the prior
+  // glyph. The four icon positions in this menu all have an
+  // unused pixel row directly above (the hrules at y=60/84/116
+  // sit further up still), so the +1 row of erase margin is
+  // safe.
+  u8g2_SetDrawColor(ref, 0);
+  u8g2_DrawBox(ref, x, y_top - 1, 8, 9);
+  if (visible) {
+    u8g2_SetFont(ref, u8g2_font_open_iconic_embedded_1x_t);
+    u8g2_SetDrawColor(ref, 1);
+    u8g2_DrawGlyph(ref, x, y_top + 7, glyph);
+    u8g2_SetFont(ref, u8g2_font_amstrad_cpc_extended_8f);
+  }
+  u8g2_SetDrawColor(ref, 1);
+}
+
+static void drawMenuStatusIcons(void) {
+  // GEMDRIVE: hard-drive icon, always visible — section is
+  // always populated and the icon serves as a static section
+  // identifier rather than a live indicator.
+  drawIconCell(MENU_ICON_X, MENU_ICON_GEMDRIVE_YTOP,
+               MENU_ICON_GLYPH_HARD_DRIVE, true);
+  // Adv [V]ector: cog icon, always visible — same rationale.
+  drawIconCell(MENU_ICON_X, MENU_ICON_ADV_YTOP,
+               MENU_ICON_GLYPH_COG, true);
+  // Wi-Fi: drawn when DHCP has leased an IP. State doesn't
+  // change after early boot in the steady-state menu, so this
+  // doesn't need a live-refresh hook.
+  ip_addr_t ip = network_getCurrentIp();
+  drawIconCell(MENU_ICON_X, MENU_ICON_API_YTOP,
+               MENU_ICON_GLYPH_WIFI, ip.addr != 0);
+  // USB CDC: redrawn live by refreshUsbCdcLine when state flips.
+  bool usb_attached = false;
+  usbcdc_getStats(NULL, &usb_attached);
+  drawIconCell(MENU_ICON_X, MENU_ICON_USB_YTOP,
+               MENU_ICON_GLYPH_LIGHTBULB, usb_attached);
+}
+
+// Epic 06 / S8 — animated countdown progress bar. Replaces the
+// "Boot will continue in N seconds..." text strip with a filled
+// box that shrinks from full-width to zero as the countdown
+// elapses. Text is rendered once over the filled (white) half
+// in black and once over the empty (black) half in white, with
+// u8g2 clip windows masking the two passes — that way each
+// character cell is painted in its proper background-inverted
+// colour. (XOR drawing was the obvious one-pass approach but
+// u8g2's default font mode XORs the full glyph bounding box,
+// so on a white background the letters come out as solid black
+// blocks. Two clipped passes side-step that.)
+static void drawCountdownBar(int sec_left, int sec_total) {
+  if (sec_total <= 0) sec_total = 1;
+  if (sec_left < 0) sec_left = 0;
+  if (sec_left > sec_total) sec_left = sec_total;
+  uint16_t y = DISPLAY_HEIGHT - DISPLAY_TERM_CHAR_HEIGHT;
+  uint16_t h = DISPLAY_TERM_CHAR_HEIGHT;
+  u8g2_t *ref = display_getU8g2Ref();
+
+  // Clear strip (right / empty side stays black).
+  u8g2_SetDrawColor(ref, 0);
+  u8g2_DrawBox(ref, 0, y, DISPLAY_WIDTH, h);
+
+  // Fill the proportional left (elapsed) portion in white.
+  uint16_t bar_w = (uint16_t)((DISPLAY_WIDTH * sec_left) / sec_total);
+  if (bar_w > 0) {
+    u8g2_SetDrawColor(ref, 1);
+    u8g2_DrawBox(ref, 0, y, bar_w, h);
+  }
+
+  // Build the status message once; draw it twice with different
+  // clip windows + colours so each half of the bar reads
+  // correctly. SetClipWindow takes (x0, y0, x1, y1) — y1/x1 are
+  // exclusive upper bounds.
+  char msg[40];
+  int n = snprintf(msg, sizeof(msg),
+                   "Booting in %d s — any key halts", sec_left);
+  if (n < 0) msg[0] = '\0';
+  u8g2_SetFont(ref, u8g2_font_squeezed_b7_tr);
+
+  if (bar_w > 0) {
+    // Filled (white) half: text in black (color 0).
+    u8g2_SetClipWindow(ref, 0, y, bar_w, y + h);
+    u8g2_SetDrawColor(ref, 0);
+    u8g2_DrawStr(ref, 2, DISPLAY_HEIGHT - 1, msg);
+  }
+  if (bar_w < DISPLAY_WIDTH) {
+    // Empty (black) half: text in white (color 1).
+    u8g2_SetClipWindow(ref, bar_w, y, DISPLAY_WIDTH, y + h);
+    u8g2_SetDrawColor(ref, 1);
+    u8g2_DrawStr(ref, 2, DISPLAY_HEIGHT - 1, msg);
+  }
+
+  // Reset clip + state so subsequent draws are unaffected.
+  u8g2_SetMaxClipWindow(ref);
+  u8g2_SetDrawColor(ref, 1);
+  u8g2_SetFont(ref, u8g2_font_amstrad_cpc_extended_8f);
+}
+
+// Epic 06 / S4. Polled from the main loop while the menu screen
+// is up; on a state transition (host plugged in / unplugged) it
+// overdraws just the USB CDC status line at MENU_USBCDC_ROW + 1
+// rather than rebuilding the whole menu. Both display strings
+// are 12 chars long so the overdraw fully covers the previous
+// value with no stale tail bytes. Cheap when there's no change
+// (one bool comparison).
+static void refreshUsbCdcLine(void) {
+  if (!menuScreenActive) return;
+  bool attached = false;
+  usbcdc_getStats(NULL, &attached);
+  if ((int)attached == g_menuLastUsbCdcAttached) return;
+  g_menuLastUsbCdcAttached = (int)attached;
+  vt52Cursor(MENU_USBCDC_ROW + 1, 0);
+  term_printString("  Status      : ");
+  term_printString(attached ? "connected   " : "disconnected");
+  // Epic 06 / S8 — flip the lightbulb ("active") icon at the
+  // USB CDC header in lock-step with the status text.
+  drawIconCell(MENU_ICON_X, MENU_ICON_USB_YTOP,
+               MENU_ICON_GLYPH_LIGHTBULB, attached);
+  // Restore the cursor home position (right after the
+  // "Select an option: " prompt on the bottom row) so the
+  // overdraw doesn't leave it stranded over the USB CDC line.
+  // "Select an option: " is 18 chars, so col 18 is the spot
+  // the user expects to type into.
+  vt52Cursor(TERM_SCREEN_SIZE_Y - 1, 18);
+  display_refresh();
 }
 
 // --- Directory navigation pager (ported from md-drives-emulator) ------
@@ -759,22 +1059,25 @@ static void __not_in_flash_func(menu)(void) {
   }
   term_printString(memtopLine);
 
+  term_printString("\n\n");
+
   // Advanced Runner hook vector — Epic 04 / S4. Toggleable via [V].
+  // Epic 06 / S3: lifted out of the GEMDRIVE block onto its own
+  // top-level row so the menu reads as three distinct config groups
+  // (GEMDRIVE / Adv Vector / API Endpoint) rather than a wall of
+  // GEMDRIVE-prefixed sub-items.
   SettingsConfigEntry *advHookEntry = settings_find_entry(
       aconfig_getContext(), ACONFIG_PARAM_ADV_HOOK_VECTOR);
   const char *advHookValue =
       (advHookEntry != NULL && advHookEntry->value[0] != '\0')
           ? advHookEntry->value
-          : "etv_timer";
-  char advHookLine[64];
-  if (strcmp(advHookValue, "vbl") == 0) {
-    snprintf(advHookLine, sizeof(advHookLine),
-             "\n  Adv [V]ector: vbl ($70)");
-  } else {
-    snprintf(advHookLine, sizeof(advHookLine),
-             "\n  Adv [V]ector: etv_timer ($400)");
-  }
-  term_printString(advHookLine);
+          : "vbl";
+  const char *advHookDisplay = (strcmp(advHookValue, "etv_timer") == 0)
+                                   ? "etv_timer ($400)"
+                                   : "vbl ($70)";
+  term_printString("Adv [V]ector\n");
+  term_printString("  Hook        : ");
+  term_printString(advHookDisplay);
   term_printString("\n\n");
 
   // Remote HTTP API endpoint (Epic 02). Show the leased IP and the
@@ -801,23 +1104,46 @@ static void __not_in_flash_func(menu)(void) {
   term_printString("\n");
   term_printString(ipLine);
 
+  // Epic 06 / S4: USB CDC connection status. Painted at a fixed
+  // row so refreshUsbCdcLine() (called from the main loop) can
+  // overdraw the status text in place when the host attaches /
+  // detaches without rebuilding the rest of the menu.
+  bool usbAttached = false;
+  usbcdc_getStats(NULL, &usbAttached);
+  g_menuLastUsbCdcAttached = (int)usbAttached;
+  vt52Cursor(MENU_USBCDC_ROW, 0);
+  term_printString("USB CDC (Debug serial)");
+  vt52Cursor(MENU_USBCDC_ROW + 1, 0);
+  term_printString("  Status      : ");
+  term_printString(usbAttached ? "connected   " : "disconnected");
+
   vt52Cursor(TERM_SCREEN_SIZE_Y - 2, 0);
   term_printString("[E]xit (launch)  r[U]nner  [X] Booster");
 
   vt52Cursor(TERM_SCREEN_SIZE_Y - 1, 0);
   term_printString("Select an option: ");
+
+  // Epic 06 / S8 — overlay u8g2 dividers + icons AFTER all term
+  // writes are done so the term renderer doesn't clobber them.
+  // Frames around config groups are NOT drawn here because
+  // vertical borders would slice through character columns and
+  // corrupt the text — see Tier 2 backlog if framed sections
+  // become a requirement.
+  drawMenuDividers();
+  drawMenuStatusIcons();
+
   refreshSetupInfoLine();
 }
 
 static void __not_in_flash_func(showCounter)(int cdown) {
-  char msg[64];
   if (cdown > 0) {
-    sprintf(msg, "Boot will continue in %d seconds...", cdown);
+    // Epic 06 / S8 — animated progress bar on the bottom strip
+    // instead of plain text. Visual + textual at once.
+    drawCountdownBar(cdown, BOOT_COUNTDOWN_SECONDS);
   } else {
     showTitle();
-    sprintf(msg, "Booting... Please wait...               ");
+    drawSetupInfoLine("Booting... Please wait...");
   }
-  drawSetupInfoLine(msg);
 }
 
 // --- Command handlers (single-key dispatch) ----------------------------
@@ -1057,9 +1383,9 @@ void cmdAdvHookVector(const char *arg) {
       aconfig_getContext(), ACONFIG_PARAM_ADV_HOOK_VECTOR);
   const char *current = (entry != NULL && entry->value[0] != '\0')
                             ? entry->value
-                            : "etv_timer";
+                            : "vbl";
   const char *next =
-      (strcmp(current, "vbl") == 0) ? "etv_timer" : "vbl";
+      (strcmp(current, "etv_timer") == 0) ? "vbl" : "etv_timer";
   settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ADV_HOOK_VECTOR,
                       next);
   settings_save(aconfig_getContext(), true);
@@ -1508,7 +1834,7 @@ void emul_start() {
     // showCounter is only called inside the decrement branch below.
     static bool lastHaltState = false;
     if (haltCountdown && !lastHaltState) {
-      drawSetupInfoLine("Countdown stopped. Press [E] or [X] to continue.");
+      drawSetupInfoLine("Countdown stopped. Press [E], [U] or [X] to continue.");
       display_refresh();
     }
     lastHaltState = haltCountdown;
@@ -1522,12 +1848,20 @@ void emul_start() {
         display_refresh();
         if (countdown <= 0) {
           haltCountdown = true;
-          // Autoboot expired — launch DevOps on the Atari ST. Same path
-          // as pressing [F].
-          cmdFirmware(NULL);
+          // Autoboot expired — launch DevOps Runner on the Atari ST. Same
+          // path as pressing [U] (Epic 06 / S2). Runner is the more useful
+          // default: it includes the [F]/[E] GEMDRIVE behaviour AND the
+          // workstation-driven Runner control surface.
+          cmdRunner(NULL);
         }
       }
     }
+
+    // Epic 06 / S4: live-refresh the USB CDC status line on the
+    // menu (independent of countdown halt state — the user should
+    // see the plug/unplug transition whether they've stopped the
+    // counter or not).
+    refreshUsbCdcLine();
   }
 
   // 10. Send RESET computer command

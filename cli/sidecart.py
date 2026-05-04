@@ -15,16 +15,18 @@ on stdout instead of human-readable output. `-q/--quiet` silences
 normal output; errors always go to stderr.
 
 Subcommands:
-    ping                                 GET  /api/v1/ping
-    volume                               GET  /api/v1/volume
-    ls [PATH]                            GET  /api/v1/files?path=...
-    get REMOTE [LOCAL] [-r/--resume]     GET  /api/v1/files/<rel>
-    put LOCAL [REMOTE] [-f/--force]      PUT  /api/v1/files/<rel>
-    rm REMOTE                            DEL  /api/v1/files/<rel>
-    mv FROM TO                           POST /api/v1/files/<from>/rename
-    mkdir REMOTE                         POST /api/v1/folders/<rel>
-    rmdir REMOTE                         DEL  /api/v1/folders/<rel>
-    mvdir FROM TO                        POST /api/v1/folders/<from>/rename
+    ping                                          GET  /api/v1/ping
+    gemdrive volume                               GET  /api/v1/gemdrive/volume
+    gemdrive ls [PATH]                            GET  /api/v1/gemdrive/files?path=...
+    gemdrive get REMOTE [LOCAL] [-r/--resume]     GET  /api/v1/gemdrive/files/<rel>
+    gemdrive put LOCAL [REMOTE] [-f/--force]      PUT  /api/v1/gemdrive/files/<rel>
+    gemdrive rm REMOTE                            DEL  /api/v1/gemdrive/files/<rel>
+    gemdrive mv FROM TO                           POST /api/v1/gemdrive/files/<from>/rename
+    gemdrive mkdir REMOTE                         POST /api/v1/gemdrive/folders/<rel>
+    gemdrive rmdir REMOTE                         DEL  /api/v1/gemdrive/folders/<rel>
+    gemdrive mvdir FROM TO                        POST /api/v1/gemdrive/folders/<from>/rename
+    runner …                                      /api/v1/runner/*    (see docs/api.md)
+    debug …                                       /api/v1/debug, /api/v1/debug/log
 
 Exit codes:
     0  success
@@ -39,10 +41,12 @@ Exit codes:
 
 Examples:
     python3 cli/sidecart.py ping
-    SIDECART_HOST=192.168.1.42 python3 cli/sidecart.py ls /games
-    python3 cli/sidecart.py get FILE.TOS -r
-    python3 cli/sidecart.py put LOCAL.PRG -f
-    python3 cli/sidecart.py mvdir OLDNAME NEWNAME
+    SIDECART_HOST=192.168.1.42 python3 cli/sidecart.py gemdrive ls /games
+    python3 cli/sidecart.py gemdrive get FILE.TOS -r
+    python3 cli/sidecart.py gemdrive put LOCAL.PRG -f
+    python3 cli/sidecart.py gemdrive mvdir OLDNAME NEWNAME
+    python3 cli/sidecart.py runner run /HELLODBG.TOS
+    python3 cli/sidecart.py debug status
 """
 
 from __future__ import annotations
@@ -209,8 +213,8 @@ def _format_bytes(n: int) -> str:
 
 
 def cmd_volume(args: argparse.Namespace) -> int:
-    """GET /api/v1/volume → print free / total / fs_type."""
-    url = base_url(args.host) + "/api/v1/volume"
+    """GET /api/v1/gemdrive/volume → print free / total / fs_type."""
+    url = base_url(args.host) + "/api/v1/gemdrive/volume"
     try:
         status, parsed, raw = request_json("GET", url)
     except urllib.error.URLError as exc:
@@ -234,15 +238,15 @@ def cmd_volume(args: argparse.Namespace) -> int:
 
 
 def _folders_url(host: str, remote: str) -> str:
-    """Build /api/v1/folders/<remote>, URL-encoding everything except '/'."""
+    """Build /api/v1/gemdrive/folders/<remote>, URL-encoding everything except '/'."""
     encoded = urllib.parse.quote(remote.lstrip("/"), safe="/")
-    return base_url(host) + "/api/v1/folders/" + encoded
+    return base_url(host) + "/api/v1/gemdrive/folders/" + encoded
 
 
 def _files_url(host: str, remote: str) -> str:
-    """Build /api/v1/files/<remote>, URL-encoding everything except '/'."""
+    """Build /api/v1/gemdrive/files/<remote>, URL-encoding everything except '/'."""
     encoded = urllib.parse.quote(remote.lstrip("/"), safe="/")
-    return base_url(host) + "/api/v1/files/" + encoded
+    return base_url(host) + "/api/v1/gemdrive/files/" + encoded
 
 
 def _do_mutation(args: argparse.Namespace, method: str, url: str,
@@ -280,19 +284,19 @@ def _do_mutation(args: argparse.Namespace, method: str, url: str,
 
 
 def cmd_mkdir(args: argparse.Namespace) -> int:
-    """POST /api/v1/folders/<remote>."""
+    """POST /api/v1/gemdrive/folders/<remote>."""
     url = _folders_url(args.host, args.remote)
     return _do_mutation(args, "POST", url, body=None, headers=None)
 
 
 def cmd_rmdir(args: argparse.Namespace) -> int:
-    """DELETE /api/v1/folders/<remote>."""
+    """DELETE /api/v1/gemdrive/folders/<remote>."""
     url = _folders_url(args.host, args.remote)
     return _do_mutation(args, "DELETE", url, body=None, headers=None)
 
 
 def cmd_mvdir(args: argparse.Namespace) -> int:
-    """POST /api/v1/folders/<from>/rename body {'to': '<to>'}."""
+    """POST /api/v1/gemdrive/folders/<from>/rename body {'to': '<to>'}."""
     url = _folders_url(args.host, args.from_) + "/rename"
     body = json.dumps({"to": args.to}, separators=(",", ":")).encode("utf-8")
     headers = {"Content-Type": "application/json"}
@@ -300,13 +304,13 @@ def cmd_mvdir(args: argparse.Namespace) -> int:
 
 
 def cmd_rm(args: argparse.Namespace) -> int:
-    """DELETE /api/v1/files/<remote>."""
+    """DELETE /api/v1/gemdrive/files/<remote>."""
     url = _files_url(args.host, args.remote)
     return _do_mutation(args, "DELETE", url, body=None, headers=None)
 
 
 def cmd_mv(args: argparse.Namespace) -> int:
-    """POST /api/v1/files/<from>/rename body {'to': '<to>'}."""
+    """POST /api/v1/gemdrive/files/<from>/rename body {'to': '<to>'}."""
     url = _files_url(args.host, args.from_) + "/rename"
     body = json.dumps({"to": args.to}, separators=(",", ":")).encode("utf-8")
     headers = {"Content-Type": "application/json"}
@@ -320,7 +324,7 @@ def _format_progress(done: int, total: int) -> str:
 
 
 def cmd_get(args: argparse.Namespace) -> int:
-    """GET /api/v1/files/<remote> → stream raw bytes to LOCAL."""
+    """GET /api/v1/gemdrive/files/<remote> → stream raw bytes to LOCAL."""
     url = _files_url(args.host, args.remote)
     local_path = args.local or os.path.basename(args.remote.rstrip("/"))
     if not local_path:
@@ -446,6 +450,104 @@ def cmd_runner_run(args: argparse.Namespace) -> int:
             sys.stdout.write("\n")
     elif not args.quiet:
         print(f"ok  EXECUTE {args.remote} sent")
+    return EXIT_OK
+
+
+def cmd_runner_load(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/load — synchronous Pexec(3) load-only.
+
+    Returns the basepage pointer on success. The program is then in
+    m68k RAM, ready for `runner exec`. Use `runner status` to inspect
+    the loaded state at any time.
+    """
+    cmdline = " ".join(args.cmdline) if args.cmdline else ""
+    body_json = {"path": args.remote, "cmdline": cmdline}
+    body = json.dumps(body_json, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    url = base_url(args.host) + "/api/v1/runner/load"
+    try:
+        # Synchronous on the server side (spin-waits up to 10 s); use
+        # a slightly longer client timeout so we never give up before
+        # the device does.
+        status, parsed, raw = request_json(
+            "POST", url, body=body, headers=headers, timeout=15)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        bp = parsed.get("basepage", 0) if parsed else 0
+        print(f"ok  LOAD {args.remote} → basepage 0x{bp:08X}")
+    return EXIT_OK
+
+
+def cmd_runner_exec(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/exec — fire-and-forget Pexec(4).
+
+    Executes the program previously loaded via `runner load`. No
+    arguments — the basepage pointer is held server-side as state.
+    Re-exec on the same loaded program is supported (Pexec(4) does
+    not free the basepage); use `runner unload` to release the
+    memory when you're done.
+    """
+    headers = {"Content-Type": "application/json"}
+    url = base_url(args.host) + "/api/v1/runner/exec"
+    try:
+        status, parsed, raw = request_json(
+            "POST", url, body=b"", headers=headers)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 202:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        print("ok  EXEC sent")
+    return EXIT_OK
+
+
+def cmd_runner_unload(args: argparse.Namespace) -> int:
+    """POST /api/v1/runner/unload — synchronous GEMDOS Mfree.
+
+    Releases the basepage of the program previously loaded via
+    `runner load`. Pairs with the Pexec(4)-based `runner exec`
+    (which deliberately doesn't auto-free, so re-exec works).
+    """
+    headers = {"Content-Type": "application/json"}
+    url = base_url(args.host) + "/api/v1/runner/unload"
+    try:
+        # Server spin-waits up to 5 s; client allows a bit more.
+        status, parsed, raw = request_json(
+            "POST", url, body=b"", headers=headers, timeout=10)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        if parsed is not None:
+            json.dump(parsed, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+    elif not args.quiet:
+        bp = parsed.get("basepage", 0) if parsed else 0
+        print(f"ok  UNLOAD basepage 0x{int(bp):08X}")
     return EXIT_OK
 
 
@@ -908,11 +1010,21 @@ def cmd_runner_status(args: argparse.Namespace) -> int:
         print(f"last     : {last_cmd} (exit={last_exit})")
     else:
         print(f"last     : {last_cmd} {last_path} (exit={last_exit})")
+
+    # Epic 06 / S5+S6 — Pexec load+exec split state. Print only
+    # when there's a basepage pending or a load error to report,
+    # so a fresh-boot status stays uncluttered.
+    loaded_basepage = parsed.get("loaded_basepage")
+    last_load_errno = parsed.get("last_load_errno")
+    if loaded_basepage is not None:
+        print(f"loaded   : basepage 0x{int(loaded_basepage):08X}")
+    elif last_load_errno is not None:
+        print(f"loaded   : (last load failed, GEMDOS errno {last_load_errno})")
     return EXIT_OK
 
 
 def cmd_put(args: argparse.Namespace) -> int:
-    """PUT /api/v1/files/<remote>?overwrite=0|1 — stream LOCAL up.
+    """PUT /api/v1/gemdrive/files/<remote>?overwrite=0|1 — stream LOCAL up.
 
     Uses http.client.HTTPConnection so we can interleave a progress
     counter with each chunk send (urllib.request would buffer up the
@@ -930,7 +1042,7 @@ def cmd_put(args: argparse.Namespace) -> int:
 
     size = os.path.getsize(local)
     encoded = urllib.parse.quote(remote.lstrip("/"), safe="/")
-    path = "/api/v1/files/" + encoded
+    path = "/api/v1/gemdrive/files/" + encoded
     if args.force:
         path += "?overwrite=1"
 
@@ -1001,10 +1113,10 @@ def cmd_put(args: argparse.Namespace) -> int:
 
 
 def cmd_ls(args: argparse.Namespace) -> int:
-    """GET /api/v1/files?path=PATH → print entries."""
+    """GET /api/v1/gemdrive/files?path=PATH → print entries."""
     path = args.path or "/"
     encoded = urllib.parse.quote(path, safe="/")
-    url = base_url(args.host) + f"/api/v1/files?path={encoded}"
+    url = base_url(args.host) + f"/api/v1/gemdrive/files?path={encoded}"
     try:
         status, parsed, raw = request_json("GET", url)
     except urllib.error.URLError as exc:
@@ -1065,30 +1177,40 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("ping", help="Health check; show version and uptime.")
-    sub.add_parser("volume", help="Show SD card total / free space.")
-    ls = sub.add_parser("ls", help="List a folder on the SD card.")
+
+    # Epic 06 / S10 — file/folder management verbs grouped under
+    # `gemdrive` so they nest at the same depth as `runner` and
+    # `debug` instead of polluting the top level. The HTTP API
+    # (/api/v1/gemdrive/files/*, /api/v1/gemdrive/folders/*, /api/v1/gemdrive/volume) is
+    # unchanged — purely a CLI-surface reorganization.
+    gd = sub.add_parser(
+        "gemdrive",
+        help="Manage files / folders on the GEMDRIVE-emulated drive.")
+    gd_sub = gd.add_subparsers(dest="gemdrive_cmd", required=True)
+    gd_sub.add_parser("volume", help="Show SD card total / free space.")
+    ls = gd_sub.add_parser("ls", help="List a folder on the SD card.")
     ls.add_argument("path", nargs="?", default="/",
                     help="Folder path (default: /).")
-    mkdir = sub.add_parser("mkdir", help="Create a folder.")
+    mkdir = gd_sub.add_parser("mkdir", help="Create a folder.")
     mkdir.add_argument("remote", help="Folder path on the SD card.")
-    rmdir = sub.add_parser("rmdir", help="Delete an empty folder.")
+    rmdir = gd_sub.add_parser("rmdir", help="Delete an empty folder.")
     rmdir.add_argument("remote", help="Folder path on the SD card.")
-    mvdir = sub.add_parser("mvdir", help="Rename or move a folder.")
+    mvdir = gd_sub.add_parser("mvdir", help="Rename or move a folder.")
     mvdir.add_argument("from_", metavar="FROM",
                        help="Source folder path.")
     mvdir.add_argument("to", help="Destination folder path.")
-    rm = sub.add_parser("rm", help="Delete a file.")
+    rm = gd_sub.add_parser("rm", help="Delete a file.")
     rm.add_argument("remote", help="File path on the SD card.")
-    mv = sub.add_parser("mv", help="Rename or move a file.")
+    mv = gd_sub.add_parser("mv", help="Rename or move a file.")
     mv.add_argument("from_", metavar="FROM", help="Source file path.")
     mv.add_argument("to", help="Destination file path.")
-    get = sub.add_parser("get", help="Download a file.")
+    get = gd_sub.add_parser("get", help="Download a file.")
     get.add_argument("remote", help="File path on the SD card.")
     get.add_argument("local", nargs="?", default=None,
                      help="Local destination (default: basename of REMOTE).")
     get.add_argument("-r", "--resume", action="store_true",
                      help="Resume partial download via Range:.")
-    put = sub.add_parser("put", help="Upload a file.")
+    put = gd_sub.add_parser("put", help="Upload a file.")
     put.add_argument("local", help="Local file to upload.")
     put.add_argument("remote", nargs="?", default=None,
                      help="Remote destination (default: basename of LOCAL).")
@@ -1163,6 +1285,25 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Command-line arguments (joined with spaces, ≤127 chars). "
                             "Everything after REMOTE is captured verbatim, including "
                             "leading dashes — no need for --.")
+    load_p = runner_sub.add_parser(
+        "load",
+        help="Load a .TOS / .PRG into m68k RAM (Pexec mode 3) "
+             "without executing it. Pair with `runner exec`.")
+    load_p.add_argument("remote", help="Path to the program (relative to GEMDRIVE_FOLDER).")
+    load_p.add_argument("cmdline", nargs=argparse.REMAINDER,
+                        help="Command-line arguments stored in the basepage at load "
+                             "time. Same quoting rule as `runner run`.")
+    runner_sub.add_parser(
+        "exec",
+        help="Execute the program previously loaded via `runner load` "
+             "(Pexec mode 4). No arguments — the basepage is held "
+             "server-side as state. Re-exec is supported; use "
+             "`runner unload` to free the memory.")
+    runner_sub.add_parser(
+        "unload",
+        help="Free the basepage previously loaded via `runner load` "
+             "(GEMDOS Mfree). Pairs with `runner exec` to give "
+             "Pexec(0)-equivalent lifecycle without the auto-free.")
 
     debug = sub.add_parser(
         "debug",
@@ -1187,21 +1328,36 @@ def main(argv: list[str] | None = None) -> int:
 
     handlers = {
         "ping": cmd_ping,
-        "volume": cmd_volume,
-        "ls": cmd_ls,
-        "mkdir": cmd_mkdir,
-        "rmdir": cmd_rmdir,
-        "mvdir": cmd_mvdir,
-        "rm": cmd_rm,
-        "mv": cmd_mv,
-        "get": cmd_get,
-        "put": cmd_put,
     }
+    if args.cmd == "gemdrive":
+        # Epic 06 / S10 — file/folder verbs grouped under
+        # `gemdrive` so the CLI's nesting depth matches the
+        # other subcommand families (runner, debug). HTTP API
+        # endpoints are unchanged.
+        gd_handlers = {
+            "volume": cmd_volume,
+            "ls": cmd_ls,
+            "mkdir": cmd_mkdir,
+            "rmdir": cmd_rmdir,
+            "mvdir": cmd_mvdir,
+            "rm": cmd_rm,
+            "mv": cmd_mv,
+            "get": cmd_get,
+            "put": cmd_put,
+        }
+        handler = gd_handlers.get(args.gemdrive_cmd)
+        if handler is None:
+            parser.error(f"unknown gemdrive subcommand: {args.gemdrive_cmd}")
+            return EXIT_USAGE
+        return handler(args)
     if args.cmd == "runner":
         runner_handlers = {
             "status": cmd_runner_status,
             "reset": cmd_runner_reset,
             "run": cmd_runner_run,
+            "load": cmd_runner_load,
+            "exec": cmd_runner_exec,
+            "unload": cmd_runner_unload,
             "cd": cmd_runner_cd,
             "res": cmd_runner_res,
             "meminfo": cmd_runner_meminfo,

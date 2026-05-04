@@ -23,21 +23,21 @@ curl http://sidecart.local/api/v1/ping
 python3 cli/sidecart.py ping
 
 # List the GEMDRIVE folder.
-curl 'http://sidecart.local/api/v1/files?path=/'
-python3 cli/sidecart.py ls /
+curl 'http://sidecart.local/api/v1/gemdrive/files?path=/'
+python3 cli/sidecart.py gemdrive ls /
 
 # Upload a file (overwriting if it exists).
 curl --upload-file ./SWITCHER.TOS \
-     'http://sidecart.local/api/v1/files/SWITCHER.TOS?overwrite=1'
-python3 cli/sidecart.py put SWITCHER.TOS -f
+     'http://sidecart.local/api/v1/gemdrive/files/SWITCHER.TOS?overwrite=1'
+python3 cli/sidecart.py gemdrive put SWITCHER.TOS -f
 
 # Download a file (resume-aware).
-curl -C - -o SWITCHER.TOS http://sidecart.local/api/v1/files/SWITCHER.TOS
-python3 cli/sidecart.py get SWITCHER.TOS -r
+curl -C - -o SWITCHER.TOS http://sidecart.local/api/v1/gemdrive/files/SWITCHER.TOS
+python3 cli/sidecart.py gemdrive get SWITCHER.TOS -r
 
 # Delete a file.
-curl -X DELETE http://sidecart.local/api/v1/files/SWITCHER.TOS
-python3 cli/sidecart.py rm SWITCHER.TOS
+curl -X DELETE http://sidecart.local/api/v1/gemdrive/files/SWITCHER.TOS
+python3 cli/sidecart.py gemdrive rm SWITCHER.TOS
 ```
 
 ## Conventions
@@ -90,7 +90,7 @@ python3 cli/sidecart.py rm SWITCHER.TOS
 | `422 Unprocessable Entity` | Malformed JSON body, missing required field, listing-on-file, rename-into-own-descendant. |
 | `500 Internal Server Error` | FatFs disk error. |
 | `503 Service Unavailable` | Body-stream lock held, SD not mounted, or Runner busy with another command. Always carries `Retry-After: 1`. |
-| `504 Gateway Timeout` | Runner endpoint waited > 1 s for the m68k to reply (`gateway_timeout`). |
+| `504 Gateway Timeout` | Synchronous Runner endpoint exceeded its server-side spin-wait deadline (`gateway_timeout`). Per-endpoint deadlines: `runner load` 10 s; `runner unload` 5 s; `runner meminfo`, `runner adv/meminfo`, and each `runner adv/load` chunk 1 s. |
 
 ## Error code vocabulary
 
@@ -101,15 +101,20 @@ Clients can switch on `code` reliably. All defined symbols:
 `payload_too_large`, `range_invalid`, `bad_json`, `unprocessable`,
 `unsupported_media`, `method_not_allowed`, `busy`, `disk_error`,
 `internal_error`, `runner_inactive`, `gateway_timeout`, `no_snapshot`,
-`wrong_hook`, `ram_overflow`.
+`wrong_hook`, `ram_overflow`, `pexec_failed`, `mfree_failed`,
+`program_already_loaded`, `no_program_loaded`.
 
 Runner-specific codes (see *Runner mode* below):
 - `runner_inactive` — the user didn't pick `[U]` at boot.
-- `busy` — another foreground Runner command is in flight (only
-  `run`/`cd`/`res`/`meminfo` gate on this; `reset` and the Advanced
-  surface intentionally don't, because escaping wedged state is the
-  whole point).
-- `gateway_timeout` — the Atari ST didn't reply within 1 s.
+- `busy` — another foreground Runner command is in flight. Every
+  m68k-bound foreground verb gates on this lock: `run`, `cd`,
+  `res`, `meminfo`, `load`, `exec`, and `unload`. `reset` and the
+  entire Advanced surface (`adv/*`) intentionally skip the gate
+  because escaping wedged state is the whole point.
+- `gateway_timeout` — the Atari ST didn't reply within the
+  endpoint's spin-wait deadline (10 s for `runner load`, 5 s for
+  `runner unload`, 1 s for `runner meminfo` / `runner adv/meminfo`
+  / per-chunk `runner adv/load`).
 - `no_snapshot` — the m68k handshake completed but no snapshot was
   recorded (should not happen in practice).
 - `wrong_hook` — Advanced Runner command requires the VBL hook (`$70`)
@@ -144,30 +149,32 @@ python3 cli/sidecart.py ping
 
 ---
 
-### `GET /api/v1/volume` — SD card capacity
+### `GET /api/v1/gemdrive/volume` — SD card capacity
 
 **Success** (`200`):
 ```json
 { "ok": true, "total_b": 8589934592, "free_b": 1073741824, "fs_type": "FAT32" }
 ```
 
-`fs_type` is one of `FAT12`, `FAT16`, `FAT32`, `EXFAT`.
+`fs_type` is one of `FAT12`, `FAT16`, `FAT32`, `EXFAT`, or
+`UNKNOWN` (the SD card mounted but FatFs reported a filesystem
+type the firmware doesn't have a string for).
 
 **Errors:** `503 busy` if the SD card is not mounted.
 
 **`curl`**:
 ```sh
-curl http://sidecart.local/api/v1/volume
+curl http://sidecart.local/api/v1/gemdrive/volume
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py volume
+python3 cli/sidecart.py gemdrive volume
 ```
 
 ---
 
-### `GET /api/v1/files?path=<rel>` — list folder
+### `GET /api/v1/gemdrive/files?path=<rel>` — list folder
 
 `path` defaults to `/`. Trailing slash optional. Listing the root is
 `?path=/`, `?path=`, or omitting `path=` entirely.
@@ -199,17 +206,17 @@ download form below).
 
 **`curl`**:
 ```sh
-curl 'http://sidecart.local/api/v1/files?path=/games'
+curl 'http://sidecart.local/api/v1/gemdrive/files?path=/games'
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py ls /games
+python3 cli/sidecart.py gemdrive ls /games
 ```
 
 ---
 
-### `GET /api/v1/files/<rel>` — download file
+### `GET /api/v1/gemdrive/files/<rel>` — download file
 
 Optional `Range:` header for resume / partial. Three forms:
 `bytes=N-M`, `bytes=N-`, `bytes=-N` (last N bytes). Multi-range
@@ -234,21 +241,21 @@ in flight).
 
 **`curl`**:
 ```sh
-curl -o SWITV310.TOS http://sidecart.local/api/v1/files/SWITV310.TOS
+curl -o SWITV310.TOS http://sidecart.local/api/v1/gemdrive/files/SWITV310.TOS
 # Resume from a partial download:
-curl -C - -o SWITV310.TOS http://sidecart.local/api/v1/files/SWITV310.TOS
+curl -C - -o SWITV310.TOS http://sidecart.local/api/v1/gemdrive/files/SWITV310.TOS
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py get SWITV310.TOS
-python3 cli/sidecart.py get SWITV310.TOS -r          # resume
-python3 cli/sidecart.py get SWITV310.TOS local.tos   # custom local name
+python3 cli/sidecart.py gemdrive get SWITV310.TOS
+python3 cli/sidecart.py gemdrive get SWITV310.TOS -r          # resume
+python3 cli/sidecart.py gemdrive get SWITV310.TOS local.tos   # custom local name
 ```
 
 ---
 
-### `PUT /api/v1/files/<rel>?overwrite=0|1` — upload file
+### `PUT /api/v1/gemdrive/files/<rel>?overwrite=0|1` — upload file
 
 Body is the raw file bytes. `Content-Length` is required.
 `Content-Length: 0` is legal (creates an empty file or truncates an
@@ -259,7 +266,7 @@ Body cap: **4 MB** (`HTTP_MAX_UPLOAD_BYTES`). Larger → `413`.
 
 **Success:**
 - `201 Created` on a new file (carries
-  `Location: /api/v1/files/<rel>`).
+  `Location: /api/v1/gemdrive/files/<rel>`).
 - `200 OK` on overwrite.
 
 ```json
@@ -268,9 +275,9 @@ Body cap: **4 MB** (`HTTP_MAX_UPLOAD_BYTES`). Larger → `413`.
 
 **Errors:** `400 bad_path` / `name_too_long` / `bad_query`,
 `404 not_found` (parent folder missing), `409 conflict` (file
-exists and `overwrite=0`), `409 is_directory` (target path is a
-directory), `411 length_required`, `413 payload_too_large`,
-`503 busy`.
+exists and `overwrite=0`, or the target path is the drive
+root), `409 is_directory` (target path is a directory),
+`411 length_required`, `413 payload_too_large`, `503 busy`.
 
 If the client closes the connection before `Content-Length` bytes
 arrive — or FatFs returns an error mid-write — the partially-written
@@ -279,39 +286,39 @@ file is deleted before the response is sent.
 **`curl`**:
 ```sh
 curl --upload-file ./SWITV310.TOS \
-     'http://sidecart.local/api/v1/files/SWITV310.TOS?overwrite=1'
+     'http://sidecart.local/api/v1/gemdrive/files/SWITV310.TOS?overwrite=1'
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py put SWITV310.TOS              # default REMOTE = basename
-python3 cli/sidecart.py put SWITV310.TOS -f           # overwrite
-python3 cli/sidecart.py put local.tos REMOTE.TOS -f
+python3 cli/sidecart.py gemdrive put SWITV310.TOS              # default REMOTE = basename
+python3 cli/sidecart.py gemdrive put SWITV310.TOS -f           # overwrite
+python3 cli/sidecart.py gemdrive put local.tos REMOTE.TOS -f
 ```
 
 ---
 
-### `DELETE /api/v1/files/<rel>` — delete file
+### `DELETE /api/v1/gemdrive/files/<rel>` — delete file
 
 **Success** (`204 No Content`, no body).
 
 **Errors:** `400 bad_path`, `404 not_found`, `404 is_directory`
-(path is a folder — use `DELETE /api/v1/folders/<rel>`),
+(path is a folder — use `DELETE /api/v1/gemdrive/folders/<rel>`),
 `409 conflict` (file is open elsewhere or marked read-only).
 
 **`curl`**:
 ```sh
-curl -X DELETE http://sidecart.local/api/v1/files/STALE.TXT
+curl -X DELETE http://sidecart.local/api/v1/gemdrive/files/STALE.TXT
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py rm STALE.TXT
+python3 cli/sidecart.py gemdrive rm STALE.TXT
 ```
 
 ---
 
-### `POST /api/v1/files/<rel>/rename` — rename / move file
+### `POST /api/v1/gemdrive/files/<rel>/rename` — rename / move file
 
 `Content-Type: application/json`. Body: `{"to":"<rel>"}`.
 
@@ -332,19 +339,19 @@ python3 cli/sidecart.py rm STALE.TXT
 ```sh
 curl -X POST -H 'Content-Type: application/json' \
      -d '{"to":"/NEW.TXT"}' \
-     http://sidecart.local/api/v1/files/OLD.TXT/rename
+     http://sidecart.local/api/v1/gemdrive/files/OLD.TXT/rename
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py mv OLD.TXT NEW.TXT
+python3 cli/sidecart.py gemdrive mv OLD.TXT NEW.TXT
 ```
 
 ---
 
-### `POST /api/v1/folders/<rel>` — create folder
+### `POST /api/v1/gemdrive/folders/<rel>` — create folder
 
-**Success** (`201 Created`, carries `Location: /api/v1/folders/<rel>`):
+**Success** (`201 Created`, carries `Location: /api/v1/gemdrive/folders/<rel>`):
 ```json
 { "ok": true, "path": "/SUB" }
 ```
@@ -355,38 +362,38 @@ root).
 
 **`curl`**:
 ```sh
-curl -X POST http://sidecart.local/api/v1/folders/SUB
+curl -X POST http://sidecart.local/api/v1/gemdrive/folders/SUB
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py mkdir SUB
+python3 cli/sidecart.py gemdrive mkdir SUB
 ```
 
 ---
 
-### `DELETE /api/v1/folders/<rel>` — delete folder
+### `DELETE /api/v1/gemdrive/folders/<rel>` — delete folder
 
 **Success** (`204 No Content`).
 
 **Errors:** `400 bad_path`, `404 not_found`, `404 is_file` (path is
-a regular file — use `DELETE /api/v1/files/<rel>`),
+a regular file — use `DELETE /api/v1/gemdrive/files/<rel>`),
 `409 conflict` (folder is non-empty, locked open, read-only, or is
 root).
 
 **`curl`**:
 ```sh
-curl -X DELETE http://sidecart.local/api/v1/folders/SUB
+curl -X DELETE http://sidecart.local/api/v1/gemdrive/folders/SUB
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py rmdir SUB
+python3 cli/sidecart.py gemdrive rmdir SUB
 ```
 
 ---
 
-### `POST /api/v1/folders/<rel>/rename` — rename / move folder
+### `POST /api/v1/gemdrive/folders/<rel>/rename` — rename / move folder
 
 Mirrors the file rename. Body: `{"to":"<rel>"}`. Cycle detection:
 renaming a folder into its own descendant returns `422 unprocessable`.
@@ -395,12 +402,12 @@ renaming a folder into its own descendant returns `422 unprocessable`.
 ```sh
 curl -X POST -H 'Content-Type: application/json' \
      -d '{"to":"/NEWNAME"}' \
-     http://sidecart.local/api/v1/folders/OLDNAME/rename
+     http://sidecart.local/api/v1/gemdrive/folders/OLDNAME/rename
 ```
 
 **`sidecart`**:
 ```sh
-python3 cli/sidecart.py mvdir OLDNAME NEWNAME
+python3 cli/sidecart.py gemdrive mvdir OLDNAME NEWNAME
 ```
 
 ---
@@ -414,16 +421,34 @@ loop reading commands from the cartridge sentinel, while GEMDRIVE
 keeps servicing TOS file I/O so programs you launch can use the
 emulated drive normally.
 
-All Runner endpoints live under `/api/v1/runner/`. The foreground
-mutators (`run`, `cd`, `res`) are fire-and-forget (`202 Accepted`)
-and the m68k reports completion later via the cartridge protocol,
-surfaced via `runner status`. `meminfo` is synchronous. Every
-Runner endpoint returns `409 runner_inactive` when the user did
-not pick `[U]` at boot. The four foreground gating endpoints
-(`run`, `cd`, `res`, `meminfo`) also return `503 busy` (with
-`Retry-After: 1`) when another Runner command is already in flight;
-`reset` and the entire Advanced surface (see below) intentionally
-skip the busy gate because escaping wedged state is their job.
+All Runner endpoints live under `/api/v1/runner/`. The endpoints
+fall into three behavioural buckets:
+
+- **Status reads** — `GET /api/v1/runner` and
+  `GET /api/v1/runner/adv` are pure RP-side state: they always
+  return `200 OK` with the current `active` flag (and, for
+  `/runner/adv`, `installed` + `hook_vector`). They never block
+  and never return `runner_inactive` — when Runner mode is off
+  they just report `active: false`.
+
+- **Foreground commands via the m68k Runner poll loop** — `run`,
+  `cd`, `res`, `meminfo`, and the Pexec lifecycle verbs `load` /
+  `exec` / `unload`. `run` / `cd` / `res` / `exec` are
+  fire-and-forget (`202 Accepted`); `meminfo` / `load` / `unload`
+  are synchronous. Every one of these gates on `409
+  runner_inactive` when `[U]` wasn't picked, and on `503 busy`
+  (with `Retry-After: 1`) when another foreground command is
+  already in flight.
+
+- **VBL-ISR-driven commands** — `reset` plus the entire
+  `/api/v1/runner/adv/*` surface. These ride the m68k's VBL
+  ISR (`$70`, or `$400` if `ADV_HOOK_VECTOR = etv_timer` in the
+  setup menu). They return `409 runner_inactive` when `[U]`
+  wasn't picked, but **do not** gate on the busy lock —
+  escaping wedged state is their job. `adv jump` and `adv load`
+  additionally require the VBL hook specifically (`409
+  wrong_hook` otherwise); `reset` and `adv meminfo` work on
+  either vector.
 
 In addition to the foreground surface, Epic 04 adds an **Advanced
 Runner** layer at `/api/v1/runner/adv/...` whose handlers run from
@@ -465,16 +490,25 @@ curl http://sidecart.local/api/v1/runner
   "last_exit_code": 0,
   "last_cd_errno": null,
   "last_res_errno": null,
+  "loaded_basepage": null,
+  "last_load_errno": null,
   "last_started_at_ms": 12345,
   "last_finished_at_ms": 13002
 }
 ```
 
 `last_command` is one of `null`, `RESET`, `EXECUTE`, `CD`, `RES`,
-`MEMINFO`, `JUMP`, or `LOAD`. The `last_cd_errno` / `last_res_errno`
-fields are `null` unless the most-recent command was a CD or RES
-respectively. `JUMP` / `LOAD` reflect the Advanced commands of the
-same name (see *Advanced Runner* below).
+`MEMINFO`, `JUMP`, `LOAD`, `PEXEC_LOAD`, `PEXEC_EXEC`, or
+`PEXEC_UNLOAD`. The `last_cd_errno` / `last_res_errno` fields
+are `null` unless the most-recent command was a `CD` or `RES`
+respectively. `JUMP` / `LOAD` reflect the Advanced commands of
+the same name (see *Advanced Runner* below); `PEXEC_LOAD` /
+`PEXEC_EXEC` / `PEXEC_UNLOAD` are the load / exec / unload
+lifecycle verbs (see [Pexec lifecycle](#pexec-lifecycle-load--exec--unload)).
+`loaded_basepage` is the cached basepage pointer when a program
+is currently loaded (via `runner load`), `null` otherwise.
+`last_load_errno` carries the GEMDOS errno of the most-recent
+failed `load` or `unload` (`null` on success).
 
 **`sidecart`**:
 ```sh
@@ -486,12 +520,28 @@ python3 cli/sidecart.py runner status --json # raw envelope
 
 ### `POST /api/v1/runner/reset` — cold-reset the ST
 
-Fires `RUNNER_CMD_RESET` at the m68k, which invalidates TOS' memory
-cookies and jumps through `$4.w`. The Runner re-launches itself
-automatically once the m68k cold-boot reaches `gemdrive_init`'s
-HELLO handshake — no operator action needed. Stale state on the
-RP side (busy lock, cwd mirror, last-cd / last-res errno) is
-cleared by the m68k's HELLO message at re-entry.
+Fires `RUNNER_ADV_CMD_RESET` at the cartridge sentinel; the m68k
+Runner's VBL hook (installed at `$70` or `$400` per the
+`ADV_HOOK_VECTOR` aconfig setting) sees it from inside the ISR
+and jumps through the reset vector at `$4.w`. Riding the VBL ISR
+(rather than the foreground poll loop, which earlier revisions
+used) lets `reset` escape wedged programs that have hung the
+Runner foreground — infinite loops, bombs already painted, traps
+disabled.
+
+The firmware-mode commit lives on the Pico, not the ST, so the
+Runner re-launches itself on the next `gemdrive_init` HELLO
+handshake — no operator action needed, no detour through the
+setup menu. Stale RP-side state (busy lock, cwd mirror, last-cd
+/ last-res errno, any `loaded_basepage` from a prior `runner
+load`) is cleared by the HELLO message at re-entry.
+
+Returning to the setup menu requires power-cycling the ST **and**
+hard-resetting the Pico (or re-flashing it).
+
+Intentionally skips the busy gate — busy state is exactly what
+this verb exists to escape. Returns `409 runner_inactive` only
+when `[U]` was never picked.
 
 **`curl`**:
 ```sh
@@ -530,13 +580,141 @@ curl -X POST -H 'Content-Type: application/json' \
 **`sidecart`**:
 ```sh
 python3 cli/sidecart.py runner run /GAMES/ARKANOID/RUNME.TOS
-python3 cli/sidecart.py runner run RUNME.TOS                    # if cwd is /GAMES/ARKANOID
-python3 cli/sidecart.py runner run PROG.TOS -- -v --file foo    # cmdline = "-v --file foo"
+python3 cli/sidecart.py runner run RUNME.TOS                 # if cwd is /GAMES/ARKANOID
+python3 cli/sidecart.py runner run PROG.TOS -v --file foo    # cmdline = "-v --file foo"
 ```
+
+Everything after `REMOTE` is captured verbatim into `cmdline`,
+including leading dashes — no `--` separator is needed. (If you
+do pass `--`, it lands in `cmdline` literally.)
 
 Common error codes: `404 not_found` (program file doesn't exist),
 `400 bad_path` (rejected name), `400 bad_request` (cmdline too
 long), `409 runner_inactive`, `503 busy`.
+
+---
+
+### Pexec lifecycle: `load` / `exec` / `unload`
+
+Three verbs that split GEMDOS Pexec mode 0 ("load and go") into
+separate steps so a workstation can drive ST programs the way an
+interactive debugger would: load once, exec many times, unload
+when done. The corresponding Pexec mode for each verb is:
+
+| Verb | GEMDOS mode | Effect |
+| --- | --- | --- |
+| `load` | `Pexec(3)` | Load file → relocate → return basepage. Program is in m68k RAM but has not run. |
+| `exec` | `Pexec(4)` | "Just go" — execute the program at the previously-loaded basepage. Does **not** free the basepage on exit, so re-exec on the same loaded program is valid. |
+| `unload` | `Mfree(basepage)` | Release the basepage back to GEMDOS. Required before another `load` (strict-refuse — see below). |
+
+**RP-side state**: a single basepage slot is held server-side
+between `load` and `unload`. Surfaced in `GET /api/v1/runner` as:
+- `loaded_basepage` — the cached basepage pointer, or `null` if
+  no program is loaded.
+- `last_load_errno` — `null` on success, the negative GEMDOS
+  errno if the most recent `load` (or `unload`) returned an
+  error.
+
+**Strict-refuse semantics**: `load` while a program is already
+loaded returns `409 program_already_loaded` — the caller must
+`unload` (or restart Runner mode) before submitting a new load.
+This keeps the m68k from holding orphan basepages the RP forgot
+about.
+
+#### `POST /api/v1/runner/load` — `Pexec(3)` load only
+
+Body: `{"path":"<rel>", "cmdline":"<≤127 chars>"}` — same shape
+as `/runner/run`. **Synchronous** — the response includes the
+basepage on success; failure returns the GEMDOS errno
+synchronously instead of via a follow-up `runner status`.
+
+**`curl`**:
+```sh
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"path":"/HELLODBG.TOS","cmdline":""}' \
+     http://sidecart.local/api/v1/runner/load
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py runner load /HELLODBG.TOS
+python3 cli/sidecart.py runner load PROG.TOS -v --file foo
+```
+
+Response 200:
+```json
+{ "ok": true, "loaded": true, "basepage": 65566 }
+```
+
+Common error codes: `200 OK` (success — basepage in body), `422
+pexec_failed` (GEMDOS errno in `gemdos_errno` field — file too
+big, out of memory, etc.), `404 not_found`, `409
+runner_inactive`, `409 program_already_loaded`, `503 busy`,
+`504 gateway_timeout` (m68k didn't respond within 10 s).
+
+#### `POST /api/v1/runner/exec` — `Pexec(4)` just-go
+
+Empty body. Executes the program previously loaded via
+`/runner/load`. **Fire-and-forget** like `/runner/run` — the
+exit code arrives asynchronously and surfaces on the next
+`/runner/status` as `last_exit_code`. The basepage stays loaded
+after exit, so calling `exec` again re-runs the same program.
+
+**`curl`**:
+```sh
+curl -X POST http://sidecart.local/api/v1/runner/exec
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py runner exec
+```
+
+Response 202:
+```json
+{ "ok": true, "accepted": true }
+```
+
+Common error codes: `202 Accepted`, `409 no_program_loaded` (no
+prior `load`), `409 runner_inactive`, `503 busy`.
+
+#### `POST /api/v1/runner/unload` — release the basepage
+
+Empty body. Issues GEMDOS `Mfree` on the loaded basepage and
+clears the RP-side state. **Synchronous** — the response
+confirms the freed basepage on success.
+
+**`curl`**:
+```sh
+curl -X POST http://sidecart.local/api/v1/runner/unload
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py runner unload
+```
+
+Response 200:
+```json
+{ "ok": true, "unloaded": true, "basepage": 65566 }
+```
+
+Common error codes: `200 OK`, `422 mfree_failed` (GEMDOS errno
+in `gemdos_errno` — rare, typically means the basepage was
+already freed), `409 no_program_loaded`, `409 runner_inactive`,
+`503 busy`, `504 gateway_timeout`.
+
+#### Full lifecycle example
+
+```sh
+python3 cli/sidecart.py runner load /HELLODBG.TOS    # → basepage 0x...
+python3 cli/sidecart.py runner status                # loaded_basepage shows the pointer
+python3 cli/sidecart.py runner exec                  # runs, "Hello, world!" output
+python3 cli/sidecart.py runner exec                  # runs AGAIN — re-exec is supported
+python3 cli/sidecart.py runner unload                # frees the basepage
+python3 cli/sidecart.py runner status                # loaded_basepage: null
+python3 cli/sidecart.py runner exec                  # → 409 no_program_loaded
+```
 
 ---
 
@@ -931,7 +1109,7 @@ upload, run, and watch one of the consumers:
 ```sh
 # Build, upload, run.
 target/atarist/test/hello-debug/build.sh
-python3 cli/sidecart.py put target/atarist/test/hello-debug/dist/HELLODBG.TOS /
+python3 cli/sidecart.py gemdrive put target/atarist/test/hello-debug/dist/HELLODBG.TOS /
 python3 cli/sidecart.py runner run /HELLODBG.TOS
 
 # In another shell, watch the bytes via either transport:
