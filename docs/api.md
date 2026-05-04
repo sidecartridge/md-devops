@@ -101,7 +101,8 @@ Clients can switch on `code` reliably. All defined symbols:
 `payload_too_large`, `range_invalid`, `bad_json`, `unprocessable`,
 `unsupported_media`, `method_not_allowed`, `busy`, `disk_error`,
 `internal_error`, `runner_inactive`, `gateway_timeout`, `no_snapshot`,
-`wrong_hook`, `ram_overflow`.
+`wrong_hook`, `ram_overflow`, `pexec_failed`, `mfree_failed`,
+`program_already_loaded`, `no_program_loaded`.
 
 Runner-specific codes (see *Runner mode* below):
 - `runner_inactive` — the user didn't pick `[U]` at boot.
@@ -155,7 +156,9 @@ python3 cli/sidecart.py ping
 { "ok": true, "total_b": 8589934592, "free_b": 1073741824, "fs_type": "FAT32" }
 ```
 
-`fs_type` is one of `FAT12`, `FAT16`, `FAT32`, `EXFAT`.
+`fs_type` is one of `FAT12`, `FAT16`, `FAT32`, `EXFAT`, or
+`UNKNOWN` (the SD card mounted but FatFs reported a filesystem
+type the firmware doesn't have a string for).
 
 **Errors:** `503 busy` if the SD card is not mounted.
 
@@ -272,9 +275,9 @@ Body cap: **4 MB** (`HTTP_MAX_UPLOAD_BYTES`). Larger → `413`.
 
 **Errors:** `400 bad_path` / `name_too_long` / `bad_query`,
 `404 not_found` (parent folder missing), `409 conflict` (file
-exists and `overwrite=0`), `409 is_directory` (target path is a
-directory), `411 length_required`, `413 payload_too_large`,
-`503 busy`.
+exists and `overwrite=0`, or the target path is the drive
+root), `409 is_directory` (target path is a directory),
+`411 length_required`, `413 payload_too_large`, `503 busy`.
 
 If the client closes the connection before `Content-Length` bytes
 arrive — or FatFs returns an error mid-write — the partially-written

@@ -390,9 +390,11 @@ $ python3 cli/sidecart.py gemdrive mv OLD.TXT NEW.TXT
 $ python3 cli/sidecart.py gemdrive mv /TMP/A.PRG /GAMES/A.PRG    # cross-folder
 ```
 
-Both endpoints must stay in the same drive (the API can't move
-across drives). The destination must not exist (no implicit
-overwrite — `gemdrive rm` first if you need to replace).
+Both source and destination paths are jailed under
+`GEMDRIVE_FOLDER` like every other API path — the API has no
+notion of multiple drives, only the one emulated GEMDRIVE root.
+The destination must not exist (no implicit overwrite —
+`gemdrive rm` first if you need to replace).
 
 ### `gemdrive mkdir REMOTE` — create a folder
 
