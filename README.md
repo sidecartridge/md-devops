@@ -453,18 +453,33 @@ switching screen resolutions, and reading a live system-memory
 snapshot. See [`docs/api.md`](docs/api.md) for the full reference
 (curl + sidecart examples for every endpoint).
 
-The surface splits in two:
+The surface splits into three behavioural buckets:
 
-- **Foreground** — `runner status` / `reset` / `cd` / `res` /
-  `meminfo` / `run` / `load` / `exec` / `unload`. These speak
-  to the m68k Runner poll loop, so they unblock cleanly when
-  the user-program returns but cannot reach a wedged ST.
-- **Advanced** — `runner adv status` / `meminfo` / `jump` /
-  `load`. These speak to a VBL-installed ISR (`$70`, or `$400`
-  if you switched `ADV_HOOK_VECTOR` to `etv_timer`) so they
-  keep working even when the foreground poll loop is wedged
-  (infinite loops, bombs already painted, traps disabled).
-  None of them gate on the foreground busy lock.
+- **Status reads** — `runner status` and `runner adv status`.
+  Pure RP-side state: they always succeed (200 OK) with the
+  current `active` flag. They never block, never need the m68k
+  to reply, and never error on inactive Runner — they just
+  report `active : no`.
+- **Foreground commands** — `runner cd` / `res` / `meminfo` /
+  `run` / `load` / `exec` / `unload`. These speak to the m68k
+  Runner poll loop. They return `409 runner_inactive` if `[U]`
+  wasn't picked, and `503 busy` if another foreground command
+  is already in flight. Cannot reach a wedged ST.
+- **VBL-driven commands** — `runner reset` plus the entire
+  `runner adv` family (`jump` / `load` / `meminfo`). These
+  ride the m68k's VBL ISR (`$70`, or `$400` if you switched
+  `ADV_HOOK_VECTOR` to `etv_timer`), so they keep working even
+  when the foreground poll loop is wedged (infinite loops,
+  bombs already painted, traps disabled). **None gate on the
+  busy lock.** `runner adv jump` and `runner adv load`
+  additionally require the VBL hook specifically (`409
+  wrong_hook` otherwise); `reset` and `adv meminfo` work on
+  either vector.
+
+Note that `runner reset` lives at `/api/v1/runner/reset` (no
+`/adv/`) for historical reasons but mechanically belongs in the
+VBL bucket — Epic 04 rewired it from the foreground poll loop
+to the VBL ISR exactly so it could escape wedged programs.
 
 ### `runner status` — show Runner state
 
@@ -490,11 +505,17 @@ $ python3 cli/sidecart.py runner reset
 ok  RESET sent
 ```
 
-Fire-and-forget (HTTP `202`). The ST reboots into Runner mode
-again — the firmware-mode commit lives on the Pico, not on
-the ST, so a soft reset re-enters whatever mode was active.
-You only get back to the setup menu by power-cycling the ST
-**and** hard-resetting the Pico (or re-flashing it).
+Fire-and-forget (HTTP `202`). Rides the VBL ISR — fires
+`RUNNER_ADV_CMD_RESET`, the m68k's hook sees it from inside the
+ISR and jumps through the reset vector at `$4.w`. That's why it
+works against wedged programs the foreground commands can't
+reach, and why it doesn't gate on the busy lock.
+
+The ST reboots into Runner mode again — the firmware-mode
+commit lives on the Pico, not on the ST, so a soft reset
+re-enters whatever mode was active. You only get back to the
+setup menu by power-cycling the ST **and** hard-resetting the
+Pico (or re-flashing it).
 
 ### `runner cd PATH` — change the Runner's cwd
 

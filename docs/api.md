@@ -90,7 +90,7 @@ python3 cli/sidecart.py gemdrive rm SWITCHER.TOS
 | `422 Unprocessable Entity` | Malformed JSON body, missing required field, listing-on-file, rename-into-own-descendant. |
 | `500 Internal Server Error` | FatFs disk error. |
 | `503 Service Unavailable` | Body-stream lock held, SD not mounted, or Runner busy with another command. Always carries `Retry-After: 1`. |
-| `504 Gateway Timeout` | Runner endpoint waited > 1 s for the m68k to reply (`gateway_timeout`). |
+| `504 Gateway Timeout` | Synchronous Runner endpoint exceeded its server-side spin-wait deadline (`gateway_timeout`). Per-endpoint deadlines: `runner load` 10 s; `runner unload` 5 s; `runner meminfo`, `runner adv/meminfo`, and each `runner adv/load` chunk 1 s. |
 
 ## Error code vocabulary
 
@@ -105,11 +105,15 @@ Clients can switch on `code` reliably. All defined symbols:
 
 Runner-specific codes (see *Runner mode* below):
 - `runner_inactive` — the user didn't pick `[U]` at boot.
-- `busy` — another foreground Runner command is in flight (only
-  `run`/`cd`/`res`/`meminfo` gate on this; `reset` and the Advanced
-  surface intentionally don't, because escaping wedged state is the
-  whole point).
-- `gateway_timeout` — the Atari ST didn't reply within 1 s.
+- `busy` — another foreground Runner command is in flight. Every
+  m68k-bound foreground verb gates on this lock: `run`, `cd`,
+  `res`, `meminfo`, `load`, `exec`, and `unload`. `reset` and the
+  entire Advanced surface (`adv/*`) intentionally skip the gate
+  because escaping wedged state is the whole point.
+- `gateway_timeout` — the Atari ST didn't reply within the
+  endpoint's spin-wait deadline (10 s for `runner load`, 5 s for
+  `runner unload`, 1 s for `runner meminfo` / `runner adv/meminfo`
+  / per-chunk `runner adv/load`).
 - `no_snapshot` — the m68k handshake completed but no snapshot was
   recorded (should not happen in practice).
 - `wrong_hook` — Advanced Runner command requires the VBL hook (`$70`)
@@ -414,16 +418,34 @@ loop reading commands from the cartridge sentinel, while GEMDRIVE
 keeps servicing TOS file I/O so programs you launch can use the
 emulated drive normally.
 
-All Runner endpoints live under `/api/v1/runner/`. The foreground
-mutators (`run`, `cd`, `res`) are fire-and-forget (`202 Accepted`)
-and the m68k reports completion later via the cartridge protocol,
-surfaced via `runner status`. `meminfo` is synchronous. Every
-Runner endpoint returns `409 runner_inactive` when the user did
-not pick `[U]` at boot. The four foreground gating endpoints
-(`run`, `cd`, `res`, `meminfo`) also return `503 busy` (with
-`Retry-After: 1`) when another Runner command is already in flight;
-`reset` and the entire Advanced surface (see below) intentionally
-skip the busy gate because escaping wedged state is their job.
+All Runner endpoints live under `/api/v1/runner/`. The endpoints
+fall into three behavioural buckets:
+
+- **Status reads** — `GET /api/v1/runner` and
+  `GET /api/v1/runner/adv` are pure RP-side state: they always
+  return `200 OK` with the current `active` flag (and, for
+  `/runner/adv`, `installed` + `hook_vector`). They never block
+  and never return `runner_inactive` — when Runner mode is off
+  they just report `active: false`.
+
+- **Foreground commands via the m68k Runner poll loop** — `run`,
+  `cd`, `res`, `meminfo`, and the Pexec lifecycle verbs `load` /
+  `exec` / `unload`. `run` / `cd` / `res` / `exec` are
+  fire-and-forget (`202 Accepted`); `meminfo` / `load` / `unload`
+  are synchronous. Every one of these gates on `409
+  runner_inactive` when `[U]` wasn't picked, and on `503 busy`
+  (with `Retry-After: 1`) when another foreground command is
+  already in flight.
+
+- **VBL-ISR-driven commands** — `reset` plus the entire
+  `/api/v1/runner/adv/*` surface. These ride the m68k's VBL
+  ISR (`$70`, or `$400` if `ADV_HOOK_VECTOR = etv_timer` in the
+  setup menu). They return `409 runner_inactive` when `[U]`
+  wasn't picked, but **do not** gate on the busy lock —
+  escaping wedged state is their job. `adv jump` and `adv load`
+  additionally require the VBL hook specifically (`409
+  wrong_hook` otherwise); `reset` and `adv meminfo` work on
+  either vector.
 
 In addition to the foreground surface, Epic 04 adds an **Advanced
 Runner** layer at `/api/v1/runner/adv/...` whose handlers run from
@@ -495,12 +517,28 @@ python3 cli/sidecart.py runner status --json # raw envelope
 
 ### `POST /api/v1/runner/reset` — cold-reset the ST
 
-Fires `RUNNER_CMD_RESET` at the m68k, which invalidates TOS' memory
-cookies and jumps through `$4.w`. The Runner re-launches itself
-automatically once the m68k cold-boot reaches `gemdrive_init`'s
-HELLO handshake — no operator action needed. Stale state on the
-RP side (busy lock, cwd mirror, last-cd / last-res errno) is
-cleared by the m68k's HELLO message at re-entry.
+Fires `RUNNER_ADV_CMD_RESET` at the cartridge sentinel; the m68k
+Runner's VBL hook (installed at `$70` or `$400` per the
+`ADV_HOOK_VECTOR` aconfig setting) sees it from inside the ISR
+and jumps through the reset vector at `$4.w`. Riding the VBL ISR
+(rather than the foreground poll loop, which earlier revisions
+used) lets `reset` escape wedged programs that have hung the
+Runner foreground — infinite loops, bombs already painted, traps
+disabled.
+
+The firmware-mode commit lives on the Pico, not the ST, so the
+Runner re-launches itself on the next `gemdrive_init` HELLO
+handshake — no operator action needed, no detour through the
+setup menu. Stale RP-side state (busy lock, cwd mirror, last-cd
+/ last-res errno, any `loaded_basepage` from a prior `runner
+load`) is cleared by the HELLO message at re-entry.
+
+Returning to the setup menu requires power-cycling the ST **and**
+hard-resetting the Pico (or re-flashing it).
+
+Intentionally skips the busy gate — busy state is exactly what
+this verb exists to escape. Returns `409 runner_inactive` only
+when `[U]` was never picked.
 
 **`curl`**:
 ```sh
@@ -539,9 +577,13 @@ curl -X POST -H 'Content-Type: application/json' \
 **`sidecart`**:
 ```sh
 python3 cli/sidecart.py runner run /GAMES/ARKANOID/RUNME.TOS
-python3 cli/sidecart.py runner run RUNME.TOS                    # if cwd is /GAMES/ARKANOID
-python3 cli/sidecart.py runner run PROG.TOS -- -v --file foo    # cmdline = "-v --file foo"
+python3 cli/sidecart.py runner run RUNME.TOS                 # if cwd is /GAMES/ARKANOID
+python3 cli/sidecart.py runner run PROG.TOS -v --file foo    # cmdline = "-v --file foo"
 ```
+
+Everything after `REMOTE` is captured verbatim into `cmdline`,
+including leading dashes — no `--` separator is needed. (If you
+do pass `--`, it lands in `cmdline` literally.)
 
 Common error codes: `404 not_found` (program file doesn't exist),
 `400 bad_path` (rejected name), `400 bad_request` (cmdline too
@@ -593,7 +635,7 @@ curl -X POST -H 'Content-Type: application/json' \
 **`sidecart`**:
 ```sh
 python3 cli/sidecart.py runner load /HELLODBG.TOS
-python3 cli/sidecart.py runner load PROG.TOS -- -v --file foo
+python3 cli/sidecart.py runner load PROG.TOS -v --file foo
 ```
 
 Response 200:
