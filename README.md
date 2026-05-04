@@ -490,9 +490,11 @@ $ python3 cli/sidecart.py runner reset
 ok  RESET sent
 ```
 
-Fire-and-forget (HTTP `202`). The ST reboots and the setup
-menu runs again — Runner mode is **not** auto-re-entered, so
-press `[U]` again or wait for the countdown.
+Fire-and-forget (HTTP `202`). The ST reboots into Runner mode
+again — the firmware-mode commit lives on the Pico, not on
+the ST, so a soft reset re-enters whatever mode was active.
+You only get back to the setup menu by power-cycling the ST
+**and** hard-resetting the Pico (or re-flashing it).
 
 ### `runner cd PATH` — change the Runner's cwd
 
