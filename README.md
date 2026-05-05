@@ -89,6 +89,21 @@ If you don't press anything within ~20 s, the firmware **auto-fires
 [U]Runner** — Runner is the more useful default for unattended
 boots.
 
+### SELECT button — Pico-side reset / factory-reset
+
+The cartridge's physical **SELECT** button is wired so a press
+on the Pico itself can recover the device without needing the
+ST's keyboard:
+
+| Press | Action |
+| --- | --- |
+| Short tap (< 10 s) | **Soft reset** of the Pico. The cartridge boots back into the setup menu. The ST's TOS state is unaffected, but on the next ST cold reset the firmware re-handshakes from scratch. |
+| Long press (≥ 10 s, hold steady) | **Factory reset.** The Pico erases its flash-stored aconfig (drive letter, reloc address, hook vector, etc.) and reboots. Use this if a setting got the device into a state where the menu won't come up — power-cycle the ST afterwards so it sees the cleared cartridge. |
+
+The button is the canonical recovery path for any banner the
+firmware shows on the ST screen (e.g. the `Reloc/stack
+overlap` warning described below).
+
 ## ⚙️ Setup menu screen
 
 The menu paints into the cartridge framebuffer at `$FAE0C0` so
@@ -177,6 +192,38 @@ vector (they don't need to patch a return address — they just
 need the ISR to fire periodically). `runner adv jump` and
 `runner adv load` need `vbl ($70)` specifically, which is why
 that's the default.
+
+### Stability banners
+
+The cartridge runs two safety checks before relocating its
+on-ST resident code into RAM. Both fail loudly on the ST
+screen rather than corrupting silently, and both recover via
+the SELECT button or a power-cycle.
+
+- **`Reloc/stack overlap.`** — fired by the m68k-side blob
+  installer when the chosen reloc destination would land on
+  or near the live supervisor stack. The blobs occupy the
+  16 KB region `[screen_base − 16 KB, screen_base)`; if the
+  TOS supervisor stack is currently inside that range, the
+  installer halts in place with the message:
+  ```
+  Reloc/stack overlap.
+  Raise [R] in setup menu, reset.
+  ```
+  Recovery: hit SELECT (Pico reboots into the menu),
+  bump `[R]` to a higher address, reboot. If you can't reach
+  the menu — long-press SELECT for ≥ 10 s to factory-reset.
+
+- **`Phystop : 0xXXXXXX (!)`** in the setup menu's GEMDRIVE
+  block — fired when TOS' `_phystop` (`$42E`) disagrees with
+  the silicon's MMU bank-config nibble at `$FFFF8001`. This
+  almost always means a reset-resistant program lowered
+  `_phystop` and survived the last warm reset; only a full
+  ST power-cycle restores the correct value. The cartridge
+  doesn't try to "fix" `_phystop` itself (post-boot mutation
+  doesn't actually resize hardware RAM, it confuses TOS'
+  Malloc accounting); the marker just makes the situation
+  visible so you know to reach for the power switch.
 
 ## 🌐 Remote HTTP Management API + the `sidecart.py` CLI
 
