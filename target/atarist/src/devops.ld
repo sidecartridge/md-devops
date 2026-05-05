@@ -8,13 +8,15 @@
  *   $0000..$07FF  main.s     2 KB   boot, dispatch, terminal
  *   $0800..$1BFF  gemdrive.s 5 KB   GEMDOS hooks + protocol blob
  *                                   (relocated to RAM at boot)
- *   $1C00..$27FF  runner.s   3 KB   Runner foreground loop (Epic 03)
+ *   $1C00..$27FF  runner.s   3 KB   Runner foreground loop
+ *                                   (self-relocates to RAM at runner_entry)
  *
  * The gemdrive blob is copied at boot to a configurable RAM address
- * (default screen_base - 8 KB) by main.s's gemdrive_init; the Runner
- * blob currently runs in place from cartridge ROM. Both .s files
- * must be position-independent — see the warnings at the top of
- * gemdrive.s and runner.s.
+ * (default screen_base - 16 KB) by main.s's gemdrive_init. The Runner
+ * blob self-relocates at runner_entry to gemdrive_reloc +
+ * RUNNER_ABOVE_GEMDRIVE_OFFSET (above gemdrive in the same 16 KB
+ * protected region). Both .s files must be position-independent —
+ * see the warnings at the top of gemdrive.s and runner.s.
  *
  * Adding a new module: add a ".text_<name> 0x????? : { <name>.o(.text) }"
  * section here, mirror the offset with `equ (ROM4_ADDR + $????)` in

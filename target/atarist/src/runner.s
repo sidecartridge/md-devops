@@ -147,15 +147,16 @@ ADV_LOAD_LEN_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_ADV_LOAD_LEN*4)
 RUNNER_ADV_LOAD_BUF_OFFSET	equ $4000
 RUNNER_ADV_LOAD_BUF		equ (APP_FREE_ADDR + RUNNER_ADV_LOAD_BUF_OFFSET)
 
-; Epic 04 — Advanced Runner. The runner blob now relocates itself
-; to RAM at runner_entry so its VBL handler can run from a stable
-; RAM address (cartridge ROM is fine for instructions but the VBL
-; ISR fires every frame — RAM is safer). Target address is
-; gemdrive_reloc - RUNNER_RELOC_OFFSET, leaving $400 of slack
-; between the two relocated blobs.
+; The runner blob relocates itself to RAM at runner_entry so its VBL
+; handler can run from a stable RAM address (cartridge ROM is fine
+; for instructions but the VBL ISR fires every frame — RAM is
+; safer). Target address is gemdrive_reloc + RUNNER_ABOVE_GEMDRIVE_OFFSET,
+; placing RUNNER_BLOB above the GEMDRIVE blob inside the consolidated
+; 16 KB protected region [screen_base - 16 KB, screen_base). The offset
+; is GEMDRIVE_BLOB_SIZE ($1400) + $400 slack between the blobs.
 RUNNER_BLOB_CART_ADDR		equ (ROM4_ADDR + $1C00)		; cartridge source
 RUNNER_BLOB_SIZE_BYTES		equ $C00			; matches devops.ld slot
-RUNNER_RELOC_OFFSET		equ $1000			; runner sits 4 KB below gemdrive
+RUNNER_ABOVE_GEMDRIVE_OFFSET	equ $1800			; gemdrive_blob_size ($1400) + $400 slack
 _memtop				equ $436
 
 ; Advanced Runner command range. Reuses the existing sentinel; the
@@ -218,16 +219,19 @@ ADV_HOOK_VECTOR			equ ADV_HOOK_VECTOR_ETV_TIMER
 
 runner_entry:
 	; --- Stage 0: relocation harness — runs ONCE from cartridge
-	; ROM at $FA1C00. Copies the entire runner blob to RAM
-	; (gemdrive_reloc - RUNNER_RELOC_OFFSET), lowers _memtop to
-	; protect both blobs, then jmps into the relocated copy at
-	; runner_post_reloc. The cartridge-ROM source is unused after
-	; the copy; the RAM copy is what actually executes for the
-	; lifetime of this Runner session. The whole module is
-	; PC-relative so labels resolve correctly post-relocation. ---
+	; ROM at $FA1C00. Copies the entire runner blob to RAM at
+	; gemdrive_reloc + RUNNER_ABOVE_GEMDRIVE_OFFSET (i.e. above the
+	; GEMDRIVE blob, inside the same 16 KB protected region the
+	; RP-side already lowered _memtop to cover), then jmps into the
+	; relocated copy at runner_post_reloc. No need to re-patch
+	; _memtop here: gemdrive_init already set it to gemdrive_reloc
+	; (= screen_base − 16 KB) which protects RUNNER_BLOB too. The
+	; cartridge-ROM source is unused after the copy; the RAM copy
+	; is what actually executes for the lifetime of this Runner
+	; session. The whole module is PC-relative so labels resolve
+	; correctly post-relocation. ---
 	move.l	GEMDRIVE_RELOC_ADDR_VAR, d0
-	sub.l	#RUNNER_RELOC_OFFSET, d0	; d0 = runner_reloc
-	move.l	d0, _memtop.w			; lower _memtop to protect us
+	add.l	#RUNNER_ABOVE_GEMDRIVE_OFFSET, d0	; d0 = runner_reloc
 
 	move.l	d0, a1				; dest
 	move.l	#RUNNER_BLOB_CART_ADDR, a0	; source

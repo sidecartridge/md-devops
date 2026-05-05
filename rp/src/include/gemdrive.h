@@ -139,9 +139,20 @@
 #define GEMDRIVE_MAX_DTAS 16
 
 // The default reloc / memtop = screen_base - GEMDRIVE_DEFAULT_OFFSET_BYTES.
-// Mirrors GEMDRIVE_BLOB_SIZE on the m68k side and matches the user's
-// stated requirement ("8 KB below the screen memory address").
-#define GEMDRIVE_DEFAULT_OFFSET_BYTES 0x2000
+// Sized so that BOTH relocated blobs fit inside the protected region
+// [screen_base - 16 KB, screen_base): GEMDRIVE_BLOB ($1400 = 5 KB) is
+// pinned at the bottom of this region, and RUNNER_BLOB ($C00 = 3 KB)
+// is placed above it via runner.s' RUNNER_ABOVE_GEMDRIVE_OFFSET. With
+// 16 KB total the layout is:
+//
+//   screen_base − 16 KB ($4000)  GEMDRIVE_BLOB  (5 KB)
+//   screen_base − 11 KB ($2C00)  end of GEMDRIVE_BLOB
+//   screen_base − 10 KB ($2800)  RUNNER_BLOB    (3 KB) — $400 slack above
+//   screen_base −  7 KB ($1C00)  end of RUNNER_BLOB
+//   screen_base −  7 KB .. screen_base — 7 KB safety buffer to framebuffer
+//
+// User-facing label in the setup menu is "auto (screen-16KB)".
+#define GEMDRIVE_DEFAULT_OFFSET_BYTES 0x4000
 
 // Initialize GEMDRIVE module: register the command callback. Must be
 // called after chandler_init() and before the m68k cartridge issues

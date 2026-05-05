@@ -100,7 +100,7 @@ DevOps Microfirmware - vX.Y.Z              ← title bar (inverted)
 GEMDRIVE                                   💾
   F[o]lder    : /devops
   [D]rive     : C:
-  [R]eloc addr: auto (screen-8KB)
+  [R]eloc addr: auto (screen-16KB)
   Mem[t]op    : auto (matches reloc)
 
 Adv [V]ector                               ⚙

@@ -53,10 +53,11 @@ TRANSTABLE		equ APP_BUFFERS_ADDR				; high-res translation table
 ;   $1C00..$27FF  runner.s   3 KB   Epic 03 Runner foreground loop
 ; At boot, gemdrive_init copies GEMDRIVE_BLOB_SIZE bytes from
 ; GEMDRIVE_BLOB into a configurable RAM address (default
-; screen_base - 8 KB) so the resident GEMDRIVE code can survive past
+; screen_base - 16 KB) so the resident GEMDRIVE code can survive past
 ; cartridge teardown and be reached after _memtop has been lowered to
-; protect the region. The Runner currently runs in place from
-; cartridge ROM (no relocation in v1).
+; protect the region. RUNNER_BLOB self-relocates at runner_entry into
+; the same protected 16 KB region, just above GEMDRIVE_BLOB — see
+; runner.s' RUNNER_ABOVE_GEMDRIVE_OFFSET.
 GEMDRIVE_BLOB		equ (ROM4_ADDR + $800)			; $FA0800
 GEMDRIVE_BLOB_SIZE	equ $1400				; 5 KB allocated by devops.ld
 RUNNER_BLOB		equ (ROM4_ADDR + $1C00)			; $FA1C00
@@ -409,7 +410,7 @@ end_rom_code:
 ;   2. Send CMD_GEMDRIVE_HELLO with d3 = screen_base. The RP-side
 ;      gemdrive_command_cb reads it, applies aconfig overrides
 ;      (GEMDRIVE_RELOC_ADDR / GEMDRIVE_MEMTOP) or falls back to the
-;      default screen_base - 8 KB, and writes the effective values into
+;      default screen_base - 16 KB, and writes the effective values into
 ;      shared variable slots SHARED_VAR_GEMDRIVE_RELOC_ADDR and
 ;      SHARED_VAR_GEMDRIVE_MEMTOP. send_sync round-trips through the
 ;      random-token ack, so by the time the macro returns the shared

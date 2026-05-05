@@ -1032,14 +1032,14 @@ static void __not_in_flash_func(menu)(void) {
   term_printString(driveValue);
   term_printString(":");
 
-  // Reloc / memtop overrides — 0 means "auto" (default = screen_base - 8 KB).
+  // Reloc / memtop overrides — 0 means "auto" (default = screen_base - 16 KB).
   SettingsConfigEntry *relocEntry = settings_find_entry(
       aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR);
   int relocAddr = (relocEntry != NULL) ? atoi(relocEntry->value) : 0;
   char relocLine[48];
   if (relocAddr == 0) {
     snprintf(relocLine, sizeof(relocLine),
-             "\n  [R]eloc addr: auto (screen-8KB)");
+             "\n  [R]eloc addr: auto (screen-16KB)");
   } else {
     snprintf(relocLine, sizeof(relocLine), "\n  [R]eloc addr: 0x%06X",
              (unsigned)relocAddr);
@@ -1310,7 +1310,7 @@ void cmdGemdriveRelocAddr(const char *arg) {
     showTitle();
     term_printString("\n\n");
     term_printString("Enter the relocation address (hex 0x...):\n");
-    term_printString("Use 0 or empty for auto (screen-8KB).\n\n> ");
+    term_printString("Use 0 or empty for auto (screen-16KB).\n\n> ");
     term_setCommandLevel(TERM_COMMAND_LEVEL_DATA_INPUT);
     return;
   }
@@ -1620,7 +1620,7 @@ void emul_start() {
   // CMD_GEMDRIVE_HELLO from CA_INIT (bit 27, after GEMDOS init), which
   // happens once the ST is powered on. The callback computes the
   // effective relocation address / _memtop value from aconfig overrides
-  // (or screen_base - 8 KB by default) and publishes them via shared
+  // (or screen_base - 16 KB by default) and publishes them via shared
   // variables before send_sync's random-token ack returns to the m68k.
   gemdrive_init();
 

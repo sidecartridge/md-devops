@@ -16,12 +16,12 @@
 #define ACONFIG_PARAM_FOLDER "FOLDER"
 #define ACONFIG_PARAM_MODE "MODE"
 
-// GEMDRIVE — Epic 01. GEMDRIVE_RELOC_ADDR is the address where the
-// GEMDRIVE blob gets copied; DEVOPS_MEMTOP is the global _memtop ($436)
-// the cartridge will install — it is a microfirmware-wide setting, not
+// GEMDRIVE_RELOC_ADDR is the address where the GEMDRIVE blob gets
+// copied; DEVOPS_MEMTOP is the global _memtop ($436) the cartridge
+// will install — it is a microfirmware-wide setting, not
 // GEMDRIVE-specific (any future app feature that wants to reserve
 // resident RAM will share it). Both default to "0" meaning auto: at
-// boot the RP computes screen_base - 8 KB (using the screen_base the
+// boot the RP computes screen_base - 16 KB (using the screen_base the
 // m68k publishes via CMD_GEMDRIVE_HELLO). Non-zero overrides the auto
 // value. Must be even (longword-aligned).
 #define ACONFIG_PARAM_GEMDRIVE_ENABLED "GEMDRIVE_ENABLED"
