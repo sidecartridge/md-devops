@@ -42,10 +42,8 @@
 #endif
 
 // Holds up to one line of user input (between '\n' or '\r')
-#define TERM_PRINT_SETTINGS_BUFFER_SIZE 2048
 #define TERM_INPUT_BUFFER_SIZE 256
 #define TERM_ESC_BUFFLINE_SIZE 16
-#define TERM_BOOL_INPUT_BUFF 8
 
 #define TERM_ESC_CHAR 0x1B  // Escape character
 #define TERM_POS_X 0x20     // Position X
@@ -190,15 +188,6 @@ char *term_getInputBuffer(void);
 bool term_consumeAnyKeyPressed(void);
 
 // Generic commands to be used in the terminal
-// Manage application setttings
-void term_cmdSettings(const char *arg);
-void term_cmdPrint(const char *arg);
-void term_cmdSave(const char *arg);
-void term_cmdErase(const char *arg);
-void term_cmdGet(const char *arg);
-void term_cmdPutInt(const char *arg);
-void term_cmdPutBool(const char *arg);
-void term_cmdPutString(const char *arg);
 void term_printNetworkInfo(void);
 void term_markMenuPromptCursor(void);
 void term_refreshMenuLiveInfo(void);
