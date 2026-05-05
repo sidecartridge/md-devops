@@ -3,8 +3,8 @@
 static SettingsConfigEntry defaultEntries[] = {
     {ACONFIG_PARAM_FOLDER, SETTINGS_TYPE_STRING, "/test"},
     {ACONFIG_PARAM_MODE, SETTINGS_TYPE_INT, "255"},  // 255: Menu mode
-    // GEMDRIVE — Epic 01. RELOC_ADDR / DEVOPS_MEMTOP "0" = auto
-    // (screen_base - 8 KB, computed from the screen_base the m68k
+    // GEMDRIVE — RELOC_ADDR / DEVOPS_MEMTOP "0" = auto
+    // (screen_base - 16 KB, computed from the screen_base the m68k
     // publishes at boot). DEVOPS_MEMTOP is a microfirmware-global
     // setting (any future app feature reserving resident RAM shares
     // it); RELOC_ADDR is GEMDRIVE-specific.

@@ -116,7 +116,6 @@ static void term_getConfiguredDns(char *dns1, size_t dns1Size, char *dns2,
 
 // Command handlers
 static void cmdClear(const char *arg);
-static void cmdExit(const char *arg);
 static void cmdHelp(const char *arg);
 static void cmdUnknown(const char *arg);
 
@@ -1085,218 +1084,18 @@ void term_refreshMenuLiveInfo(void) {
   term_printString(updateBuffer);
 }
 
-static bool term_parseKeyAndTail(const char *arg, char *key, size_t keySize,
-                                 const char **tail) {
-  if ((arg == NULL) || (key == NULL) || (keySize == 0)) {
-    return false;
-  }
-
-  while (isspace((unsigned char)*arg)) {
-    arg++;
-  }
-  if (*arg == '\0') {
-    return false;
-  }
-
-  const char *end = arg;
-  while ((*end != '\0') && !isspace((unsigned char)*end)) {
-    end++;
-  }
-
-  size_t keyLen = (size_t)(end - arg);
-  if ((keyLen == 0) || (keyLen >= keySize)) {
-    return false;
-  }
-
-  memcpy(key, arg, keyLen);
-  key[keyLen] = '\0';
-
-  while (isspace((unsigned char)*end)) {
-    end++;
-  }
-
-  if (tail != NULL) {
-    *tail = end;
-  }
-  return true;
-}
-
-static bool term_parseBoolToken(const char *valueToken, bool *value) {
-  if ((valueToken == NULL) || (value == NULL)) {
-    return false;
-  }
-
-  char valueStr[TERM_BOOL_INPUT_BUFF] = {0};
-  size_t valueLen = strcspn(valueToken, " \t\r\n");
-  if ((valueLen == 0) || (valueLen >= sizeof(valueStr))) {
-    return false;
-  }
-  memcpy(valueStr, valueToken, valueLen);
-  valueStr[valueLen] = '\0';
-
-  for (size_t i = 0; valueStr[i] != '\0'; i++) {
-    valueStr[i] = (char)tolower((unsigned char)valueStr[i]);
-  }
-
-  if ((strcmp(valueStr, "true") == 0) || (strcmp(valueStr, "t") == 0) ||
-      (strcmp(valueStr, "1") == 0)) {
-    *value = true;
-    return true;
-  }
-  if ((strcmp(valueStr, "false") == 0) || (strcmp(valueStr, "f") == 0) ||
-      (strcmp(valueStr, "0") == 0)) {
-    *value = false;
-    return true;
-  }
-
-  return false;
-}
-
-// Command handlers
-void term_cmdSettings(const char *arg) {
-  term_printString(
-      "\x1B"
-      "E"
-      "Available settings commands:\n");
-  term_printString("  print   - Show settings\n");
-  term_printString("  save    - Save settings\n");
-  term_printString("  erase   - Erase settings\n");
-  term_printString("  get     - Get setting (requires key)\n");
-  term_printString("  put_int - Set integer (key and value)\n");
-  term_printString("  put_bool- Set boolean (key and value)\n");
-  term_printString("  put_str - Set string (key and value)\n");
-  term_printString("\nEnter 'm' to return to the main menu.\n\n");
-}
-
-void term_cmdPrint(const char *arg) {
-  char *buffer = (char *)malloc(TERM_PRINT_SETTINGS_BUFFER_SIZE);
-  if (buffer == NULL) {
-    term_printString("Error: Out of memory.\n");
-    return;
-  }
-  settings_print(aconfig_getContext(), buffer);
-  term_printString(buffer);
-  free(buffer);
-}
+// (Retired the entire raw-settings-poke surface that used to live
+// here: term_cmdSettings (help printer), term_cmdPrint, term_cmdSave,
+// term_cmdErase, term_cmdGet, term_cmdPutInt, term_cmdPutBool,
+// term_cmdPutString, plus their static helpers term_parseKeyAndTail
+// and term_parseBoolToken. They were exclusively reachable via the
+// emul.c hidden command table that was also dropped — pure dead code
+// now. term_cmdClear and term_cmdUnknown are still here further up
+// because they're part of generic terminal infrastructure, not the
+// settings-poke surface, even though they're not currently called.)
 
 void term_cmdClear(const char *arg) { term_clearScreen(); }
 
-void term_cmdExit(const char *arg) {
-  term_printString("Exiting terminal...\n");
-  // Send continue to desktop command
-  SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_CONTINUE);
-}
-
 void term_cmdUnknown(const char *arg) {
   TPRINTF("Unknown command. Type 'help' for a list of commands.\n");
-}
-
-void term_cmdSave(const char *arg) {
-  settings_save(aconfig_getContext(), true);
-  term_printString("Settings saved.\n");
-}
-
-void term_cmdErase(const char *arg) {
-  settings_erase(aconfig_getContext());
-  term_printString("Settings erased.\n");
-}
-
-void term_cmdGet(const char *arg) {
-  if (arg && strlen(arg) > 0) {
-    SettingsConfigEntry *entry =
-        settings_find_entry(aconfig_getContext(), &arg[0]);
-    if (entry != NULL) {
-      TPRINTF("Key: %s\n", entry->key);
-      TPRINTF("Type: ");
-      switch (entry->dataType) {
-        case SETTINGS_TYPE_INT:
-          TPRINTF("INT");
-          break;
-        case SETTINGS_TYPE_STRING:
-          TPRINTF("STRING");
-          break;
-        case SETTINGS_TYPE_BOOL:
-          TPRINTF("BOOL");
-          break;
-        default:
-          TPRINTF("UNKNOWN");
-          break;
-      }
-      TPRINTF("\n");
-      TPRINTF("Value: %s\n", entry->value);
-    } else {
-      TPRINTF("Key not found.\n");
-    }
-  } else {
-    TPRINTF("No key provided for 'get' command.\n");
-  }
-}
-
-void term_cmdPutInt(const char *arg) {
-  char key[SETTINGS_MAX_KEY_LENGTH] = {0};
-  const char *valueStr = NULL;
-  if (term_parseKeyAndTail(arg, key, sizeof(key), &valueStr) &&
-      (valueStr != NULL) && (valueStr[0] != '\0')) {
-    char *endPtr = NULL;
-    long parsedValue = strtol(valueStr, &endPtr, DEC_BASE);
-    while ((endPtr != NULL) && isspace((unsigned char)*endPtr)) {
-      endPtr++;
-    }
-    if ((endPtr == valueStr) || ((endPtr != NULL) && (*endPtr != '\0')) ||
-        (parsedValue < INT_MIN) || (parsedValue > INT_MAX)) {
-      TPRINTF("Invalid arguments for 'put_int' command.\n");
-      return;
-    }
-
-    int value = (int)parsedValue;
-    int err = settings_put_integer(aconfig_getContext(), key, value);
-    if (err == 0) {
-      TPRINTF("Key: %s\n", key);
-      TPRINTF("Value: %d\n", value);
-    } else {
-      TPRINTF("Error setting integer value for key: %s\n", key);
-    }
-  } else {
-    TPRINTF("Invalid arguments for 'put_int' command.\n");
-  }
-}
-
-void term_cmdPutBool(const char *arg) {
-  char key[SETTINGS_MAX_KEY_LENGTH] = {0};
-  const char *valueToken = NULL;
-  bool value = false;
-
-  if (term_parseKeyAndTail(arg, key, sizeof(key), &valueToken) &&
-      (valueToken != NULL) && term_parseBoolToken(valueToken, &value)) {
-    // Store the boolean value
-    int err = settings_put_bool(aconfig_getContext(), key, value);
-    if (err == 0) {
-      TPRINTF("Key: %s\n", key);
-      TPRINTF("Value: %s\n", value ? "true" : "false");
-    } else {
-      TPRINTF("Error setting boolean value for key: %s\n", key);
-    }
-  } else {
-    TPRINTF(
-        "Invalid arguments for 'put_bool' command. Usage: put_bool <key> "
-        "<true/false>\n");
-  }
-}
-
-void term_cmdPutString(const char *arg) {
-  char key[SETTINGS_MAX_KEY_LENGTH] = {0};
-  const char *value = NULL;
-
-  if (term_parseKeyAndTail(arg, key, sizeof(key), &value)) {
-    const char *safeValue = (value != NULL) ? value : "";
-    int err = settings_put_string(aconfig_getContext(), key, safeValue);
-    if (err == 0) {
-      TPRINTF("Key: %s\n", key);
-      TPRINTF("Value: %s\n", (safeValue[0] != '\0') ? safeValue : "<EMPTY>");
-    } else {
-      TPRINTF("Error setting string value for key: %s\n", key);
-    }
-  } else {
-    TPRINTF("Invalid arguments for 'put_string' command.\n");
-  }
 }

@@ -5,10 +5,10 @@
 ; Cartridge image places this module at offset $0800 (GEMDRIVE_BLOB =
 ; $FA0800) via target/atarist/src/devops.ld; main.s reaches it through
 ; `rom_function: jmp GEMDRIVE_BLOB+4` for the diagnostic entry, and via
-; `jsr (relocated_addr)` from gemdrive_init for the install entry.
+; `jsr (relocated_addr)` from gemdrive_install for the install entry.
 ;
 ; This blob is copied byte-for-byte to a runtime-chosen RAM address by
-; main.s's gemdrive_init. Therefore: use only PC-relative addressing
+; main.s's gemdrive_install. Therefore: use only PC-relative addressing
 ; for any reference inside this file (lea label(pc), bra, bsr, etc.).
 ;
 ; The shared protocol functions (send_sync_command_to_sidecart and
@@ -136,7 +136,7 @@ GEMDRIVE_READ_BYTES		equ (APP_FREE_ADDR + $0A0)
 GEMDRIVE_READ_BUFFER		equ (APP_FREE_ADDR + $0A4)
 GEMDRIVE_DTA_F_FOUND		equ (APP_FREE_ADDR + $10A4)
 GEMDRIVE_DTA_TRANSFER		equ (APP_FREE_ADDR + $10A8)
-; --- S4 write-side state ---
+; --- Write-side state ---
 GEMDRIVE_DCREATE_STATUS		equ (APP_FREE_ADDR + $10D8)
 GEMDRIVE_DDELETE_STATUS		equ (APP_FREE_ADDR + $10DC)
 GEMDRIVE_FCREATE_HANDLE		equ (APP_FREE_ADDR + $10E0)
@@ -254,8 +254,8 @@ detect_emulated_file_handler	macro
 
 ; ====================================================================
 ; ENTRY TABLE — first 8 bytes of the relocated blob.
-; offset 0: install_entry  (called from main.s gemdrive_init after copy)
-; offset 4: diagnostic_entry (called from rom_function on [F]irmware)
+; offset 0: install_entry  (called from main.s gemdrive_install after copy)
+; offset 4: diagnostic_entry (called from rom_function on [G]EMDRIVE)
 ; ====================================================================
 	bra.w	install_entry			; offset 0
 	bra.w	diagnostic_entry		; offset 4
@@ -308,7 +308,7 @@ install_entry:
 	rts
 
 ; ====================================================================
-; diagnostic_entry — reachable via [F]irmware terminal command
+; diagnostic_entry — reachable via [G]EMDRIVE terminal command
 ; ====================================================================
 diagnostic_entry:
 	movem.l	d0-d7/a0-a3, -(sp)
@@ -351,7 +351,7 @@ old_handler:
 ; the supervisor stack. Flow:
 ;   1. If reentry is locked (RP set the flag during a handler that
 ;      calls back into GEMDOS), just chain to old_handler — same
-;      behaviour as S2 pass-through.
+;      pass-through behaviour.
 ;   2. Otherwise compute a0 = address of the args frame (different
 ;      stack for user vs supervisor mode, +2 for long-frame CPUs).
 ;   3. save_regs (d1-d7/a2-a6 — preserves a0/a1/d0).

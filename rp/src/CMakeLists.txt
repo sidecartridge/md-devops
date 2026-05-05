@@ -251,7 +251,7 @@ add_definitions(-DDISPLAY_ATARIST)
 # We don't modify the flash in Core 1
 add_definitions(-DPICO_FLASH_ASSUME_CORE0_SAFE=1)
 
-# TinyUSB CDC TX FIFO sizing (Epic 05 v2 / S8). pico-sdk's
+# TinyUSB CDC TX FIFO sizing. pico-sdk's
 # tusb_config.h leaves the FS default at 64 bytes — far too tight
 # for HELLODBG-style debug bursts, which fill the FIFO faster than
 # tud_task can hand bytes to the USB core, causing the producer

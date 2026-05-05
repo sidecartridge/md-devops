@@ -1,18 +1,18 @@
 /* SPDX-License-Identifier: GPL-3.0-only
  *
- * Epic 05 v2 / S2 — HELLODBG.TOS
+ * — HELLODBG.TOS
  *
  * Test program for the SidecarTridge md-devops fast-debug-traces
  * public ABI. Writes "Hello, world!\n" through the ROM3
  * debug-capture window of the cartridge.
  *
- * ABI contract (Epic 05 v2): any read in $FBFF00..$FBFFFF latches
+ * ABI contract: any read in $FBFF00..$FBFFFF latches
  * the low byte (A7..A0 of the effective address) into the RP-side
  * debug ring. The 8-bit read result is undefined — debug
  * consumers MUST discard it.
  *
  * The window is only live in firmware mode (after the user has
- * committed [U]/[E]/[F] in the setup menu). Reads in menu mode
+ * committed [U] or [G] in the setup menu). Reads in menu mode
  * are captured by the same PIO state machine but discarded by the
  * RP-side filter, so they cause no harm.
  *

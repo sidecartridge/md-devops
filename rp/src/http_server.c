@@ -52,7 +52,7 @@ extern unsigned int __rom_in_ram_start__;
 #define HTTP_FAT_PATH_BUF_BYTES 192
 
 // Per-conn request body buffer. Tiny JSON bodies only (rename takes
-// {"to":"..."} which is well under 200 bytes). S6 uploads stream
+// {"to":"..."} which is well under 200 bytes). File uploads stream
 // straight into FatFs without buffering here.
 #define HTTP_REQUEST_BODY_BUF_BYTES 256
 
@@ -144,7 +144,7 @@ typedef struct http_conn {
   char upload_norm[HTTP_PATH_BUF_BYTES];      // for response Location: /api/v1/gemdrive/files<rel>
   char upload_abs[HTTP_FAT_PATH_BUF_BYTES];   // for cleanup f_unlink
 
-  // Streaming Advanced-Runner load state (Epic 04 / S8). Active while
+  // Streaming Advanced-Runner load state. Active while
   // state == HC_STREAM_LOAD. Bytes arrive from the HTTP body in pbuf
   // segments; we copy them byte-pair-swapped into APP_FREE at the
   // RUNNER_ADV_LOAD_BUF offset; once a chunk is full (or the body
@@ -156,7 +156,7 @@ typedef struct http_conn {
   uint32_t adv_load_start;         // original target — kept for the response envelope
   uint32_t adv_load_chunk_pos;     // bytes accumulated in the current chunk buffer
 
-  // Streaming debug-log state (Epic 05 v2 / S4). Active while
+  // Streaming debug-log state. Active while
   // state == HC_STREAM_DEBUG. The cursor is initialised at the
   // current producer position when the connection enters the
   // streaming state so the client sees only bytes emitted from
@@ -1207,7 +1207,7 @@ static const char *runner_last_command_str(runner_last_command_t cmd) {
   }
 }
 
-// GET /api/v1/runner — Epic 03 / S1+S2.
+// GET /api/v1/runner —
 //
 // Reports whether the user picked Runner mode at boot (the cmdRunner
 // menu handler flips emul_isRunnerActive() the moment it sends
@@ -1218,9 +1218,8 @@ static const char *runner_last_command_str(runner_last_command_t cmd) {
 // write to the cartridge address space (read-only ROM emulation),
 // so an m68k → RP handshake via the shared region is impossible.
 //
-// In S1+S2 the busy / cwd / exit-code fields are placeholders (always
-// false / empty / null); they get populated as RUNNER_EXECUTE / CD
-// land in S3/S4.
+// busy / cwd / exit-code fields are populated as RUNNER_EXECUTE / CD
+// commands land.
 static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
   bool active = emul_isRunnerActive();
   bool busy = emul_isRunnerBusy();
@@ -1274,7 +1273,7 @@ static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
     snprintf(last_res_errno_buf, sizeof(last_res_errno_buf), "null");
   }
 
-  // Epic 06 / S5+S6 — Pexec load+exec split state.
+  // Pexec load+exec split state.
   int32_t pending_basepage = emul_getRunnerPendingBasepage();
   int32_t load_errno = 0;
   bool has_load_errno = emul_getRunnerLastLoadErrno(&load_errno);
@@ -1328,7 +1327,7 @@ static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
 // (with the file-mutation handlers from S3-S4).
 static void write_path_error(http_conn_t *c, norm_status_t s);
 // Defined further down with the other byte-pair-swapped APP_FREE
-// writers; forward-decl'd here so handle_runner_exec (Epic 06 / S6)
+// writers; forward-decl'd here so handle_runner_exec
 // can stage the cached basepage before the runner_write_rez block.
 static void runner_write_u32(uint32_t offset, uint32_t value);
 static norm_status_t resolve_pair(const char *url_rel, char *norm,
@@ -1337,7 +1336,7 @@ static norm_status_t resolve_pair(const char *url_rel, char *norm,
 static bool finfo_is_dir(const FILINFO *info);
 
 // If `input` doesn't start with '/' it's interpreted as relative to
-// the Runner's current cwd (Epic 03 / S4). Compose "<cwd>/<input>"
+// the Runner's current cwd. Compose "<cwd>/<input>"
 // into `out`. Absolute paths and paths with no cwd in effect are
 // copied verbatim. Returns true on success, false if the resolved
 // string would overflow `out_cap`.
@@ -1419,7 +1418,7 @@ static void __not_in_flash_func(runner_write_cmdline)(const char *cmdline) {
   }
 }
 
-// POST /api/v1/runner/run — Epic 03 / S3.
+// POST /api/v1/runner/run —
 //
 // JSON body: {"path": "<rel>", "cmdline": "<≤127>"}.
 // Validates active + not busy + path jailed under GEMDRIVE_FOLDER +
@@ -1556,7 +1555,7 @@ static void __not_in_flash_func(handle_runner_run)(http_conn_t *c) {
   write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
 }
 
-// POST /api/v1/runner/load — Epic 06 / S5.
+// POST /api/v1/runner/load —
 //
 // JSON body: { "remote": "<rel>", "cmdline": "<args>" } — same
 // shape as /runner/run. Loads the program into m68k RAM via
@@ -1727,7 +1726,7 @@ static void __not_in_flash_func(handle_runner_load)(http_conn_t *c) {
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
-// POST /api/v1/runner/exec — Epic 06 / S6.
+// POST /api/v1/runner/exec —
 //
 // Empty body. Executes the program previously loaded via
 // /runner/load (GEMDOS Pexec mode 4 — just go). The basepage
@@ -1779,7 +1778,7 @@ static void __not_in_flash_func(handle_runner_exec)(http_conn_t *c) {
   write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
 }
 
-// POST /api/v1/runner/unload — Epic 06 / S7.
+// POST /api/v1/runner/unload —
 //
 // Empty body. Frees the basepage previously loaded via
 // /runner/load via GEMDOS Mfree. Synchronous like /load —
@@ -1853,7 +1852,7 @@ static void __not_in_flash_func(handle_runner_unload)(http_conn_t *c) {
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
-// POST /api/v1/runner/cd — Epic 03 / S4.
+// POST /api/v1/runner/cd —
 //
 // JSON body: {"path": "<rel>"}.
 // Validates active + not busy + path jailed under GEMDRIVE_FOLDER +
@@ -1972,7 +1971,7 @@ static void __not_in_flash_func(handle_runner_cd)(http_conn_t *c) {
 
 // Stage the requested rez (low | med) into the RUNNER_REZ slot of
 // Write a 32-bit value (e.g. the Pexec(3) basepage pointer cached
-// for a future RUNNER_CMD_EXEC, Epic 06 / S5+S6) into the
+// for a future RUNNER_CMD_EXEC,) into the
 // m68k-readable cartridge slot. Byte-pair-swapped so the m68k's
 // `move.l RUNNER_BASEPAGE, ...` lands the right value, same
 // cartridge-bus quirk as runner_write_path.
@@ -2003,7 +2002,7 @@ static void __not_in_flash_func(runner_write_rez)(uint16_t rez) {
   dst[3 ^ 1u] = 0;
 }
 
-// POST /api/v1/runner/res — Epic 03 / S5.
+// POST /api/v1/runner/res —
 //
 // JSON body: {"rez": "low"|"med"}. Stateless — caller passes the
 // target. The m68k Runner reads RUNNER_REZ, calls XBIOS Getrez to
@@ -2080,7 +2079,7 @@ static void __not_in_flash_func(handle_runner_res)(http_conn_t *c) {
 #define RUNNER_MEMINFO_TIMEOUT_US 1000000
 #endif
 
-// POST /api/v1/runner/adv/jump — Epic 04 / S7.
+// POST /api/v1/runner/adv/jump —
 //
 // Body: {"address": "<int>"} where the value is a JSON string in
 // either decimal or 0x-hex form. The CLI normalises any user input
@@ -2174,7 +2173,7 @@ static void __not_in_flash_func(handle_runner_adv_jump)(http_conn_t *c) {
   write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
 }
 
-// POST /api/v1/runner/adv/load — Epic 04 / S8.
+// POST /api/v1/runner/adv/load —
 //
 // Streams an arbitrary blob from the workstation into m68k RAM
 // through the VBL ISR. Query params:
@@ -2441,7 +2440,7 @@ static bool __not_in_flash_func(handle_runner_adv_load_init)(
   return true;
 }
 
-// POST /api/v1/runner/adv/meminfo — Epic 04 / S6.
+// POST /api/v1/runner/adv/meminfo —
 //
 // Same wire-format / chandler path as the foreground meminfo (the
 // m68k ships RUNNER_CMD_DONE_MEMINFO with the 24-byte struct, the
@@ -2502,7 +2501,7 @@ static void __not_in_flash_func(handle_runner_adv_meminfo)(http_conn_t *c) {
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
-// GET /api/v1/runner/adv — Epic 04 / S1+S4.
+// GET /api/v1/runner/adv —
 //
 // Reports whether the m68k Runner has installed its Advanced Runner
 // hook, and which vector it landed on ("vbl" at $70 or "etv_timer"
@@ -2531,7 +2530,7 @@ static void __not_in_flash_func(handle_runner_adv_status)(http_conn_t *c) {
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
-// GET /api/v1/debug — Epic 05 v2 / S3.
+// GET /api/v1/debug —
 //
 // Diagnostics envelope for the fast-debug-traces feature:
 //   {
@@ -2539,15 +2538,15 @@ static void __not_in_flash_func(handle_runner_adv_status)(http_conn_t *c) {
 //     "firmware_mode": <bool>,        // emul_isFirmwareMode()
 //     "ring_used": <bytes pending drain>,
 //     "ring_capacity": <ring size>,
-//     "bytes_dropped": <producer-side drops; always 0 in v2 — the
+//     "bytes_dropped": <producer-side drops; always 0 — the
 //                      producer overwrites and per-cursor drops are
 //                      surfaced on each consumer instead>,
 //     "usbcdc_attached": <true iff a USB CDC host has the port open
-//                        with DTR asserted (Epic 05 v2 / S5)>,
+//                        with DTR asserted>,
 //     "usbcdc_dropped": <bytes lost on the USB CDC sink's cursor
 //                       — sum of (a) bytes emitted while no host
-//                       was attached (S7 folds the unread lag
-//                       into `dropped` on every (re)attach) and
+//                       was attached (the unread lag is folded into
+//                       `dropped` on every (re)attach), and
 //                       (b) in-session drops where the producer
 //                       wrapped past the cursor while the host's
 //                       TX FIFO stalled. Cumulative since boot.>
@@ -2578,7 +2577,7 @@ static void __not_in_flash_func(handle_debug_status)(http_conn_t *c) {
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
-// GET /api/v1/debug/log — Epic 05 v2 / S4.
+// GET /api/v1/debug/log —
 //
 // Streaming endpoint that pours debug bytes captured by the
 // chandler ingest filter into the response body using HTTP/1.1
@@ -2658,7 +2657,7 @@ static void __not_in_flash_func(handle_debug_log)(http_conn_t *c) {
   stream_debug_drive(c);
 }
 
-// GET /api/v1/runner/meminfo — Epic 03 / S6.
+// GET /api/v1/runner/meminfo —
 //
 // Synchronous: writes RUNNER_CMD_MEMINFO to the cartridge sentinel,
 // then spins on chandler_loop until the m68k Runner replies with
@@ -2728,7 +2727,7 @@ static void __not_in_flash_func(handle_runner_meminfo)(http_conn_t *c) {
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
-// POST /api/v1/runner/reset — Epic 03 / S2, rewired in Epic 04 / S5.
+// POST /api/v1/runner/reset —, rewired in
 //
 // Fire-and-forget. Writes RUNNER_ADV_CMD_RESET into the cartridge
 // sentinel; the m68k Runner's VBL hook (installed at $70 or $400
@@ -3078,7 +3077,7 @@ static void __not_in_flash_func(handle_files_list)(http_conn_t *c) {
   }
 }
 
-// --- Folder mutation handlers (S3) ---
+// --- Folder mutation handlers ---
 //
 // `rel` is the URL path component AFTER /api/v1/gemdrive/folders/, possibly
 // still containing percent-encoded bytes. The handlers URL-decode,
@@ -3367,7 +3366,7 @@ static void __not_in_flash_func(handle_folder_rename)(http_conn_t *c, const char
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
-// --- Streaming file download (S5) ---
+// --- Streaming file download ---
 //
 // Body bytes are sent via tcp_write in chunks of up to ~1 KB driven
 // by tcp_sent acks. Content-Length is known up-front (file size or
@@ -3627,7 +3626,7 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
   stream_download_drive(c);
 }
 
-// --- Streaming file upload (S6) ---
+// --- Streaming file upload ---
 //
 // PUT /api/v1/gemdrive/files/<rel>?overwrite=0|1 streams the body straight
 // into FatFs as bytes arrive. The init step is invoked from
@@ -3835,7 +3834,7 @@ static bool __not_in_flash_func(handle_file_upload_init)(
   return true;
 }
 
-// --- File mutation handlers (S4) ---
+// --- File mutation handlers ---
 //
 // Mirror the folder routes but enforce that the resolved path is a
 // regular file. Cross-namespace responses (e.g. DELETE /files/<dir>)
@@ -4167,12 +4166,11 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
       handle_file_delete(c, rel);
       return;
     }
-    // S6 will add PUT (upload) here.
     write_405(c, "GET, HEAD, DELETE");
     return;
   }
 
-  // Prefix routes: /api/v1/runner/<action> (Epic 03). The exact-match
+  // Prefix routes: /api/v1/runner/<action>. The exact-match
   // /api/v1/runner endpoint (status query) is in g_routes above; only
   // the slash-prefixed action paths fall through here.
   static const char runner_prefix[] = "/api/v1/runner/";

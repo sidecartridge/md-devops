@@ -1,4 +1,4 @@
-; SidecarTridge Multi-device DevOps — Runner module (Epic 03)
+; SidecarTridge Multi-device DevOps — Runner module
 ; (C) 2026 by Diego Parrilla
 ; License: GPL v3
 ;
@@ -9,12 +9,12 @@
 ; arrives at the sentinel — i.e. the user pressed [U] in the setup
 ; terminal.
 ;
-; In v1 (Epic 03 / S1) the Runner runs **directly from cartridge ROM**
+; In v1 the Runner runs **directly from cartridge ROM**
 ; — no relocation. PC-relative addressing is used everywhere so the
 ; same `runner.s` will be drop-in compatible with the future
 ; relocate-to-RAM install pattern (mirroring gemdrive.s) when needed.
 ;
-; Responsibilities (S1 skeleton):
+; Responsibilities:
 ;   1. Clear the screen.
 ;   2. Paint a banner.
 ;   3. Publish the RUNNER_HELLO magic + protocol version into the
@@ -52,7 +52,7 @@ RUNNER_CWD			equ (RUNNER_BASE + $108)	; 128 B
 RUNNER_HELLO			equ (RUNNER_BASE + $188)	; 4 B  ('RNV1')
 RUNNER_PROTO_VER		equ (RUNNER_BASE + $18C)	; 4 B  (u16 min | u16 max)
 RUNNER_REZ			equ (RUNNER_BASE + $190)	; 4 B (u16 target rez for RUNNER_CMD_RES)
-RUNNER_BASEPAGE			equ (RUNNER_BASE + $194)	; 4 B (i32 basepage ptr for Pexec(4); Epic 06 / S5+S6)
+RUNNER_BASEPAGE			equ (RUNNER_BASE + $194)	; 4 B (i32 basepage ptr for Pexec(4);)
 
 RUNNER_HELLO_MAGIC		equ $524E5631	; 'RNV1' big-endian
 RUNNER_PROTO_VERSION		equ $00010001	; min=1, max=1
@@ -67,9 +67,9 @@ RUNNER_CMD_EXECUTE		equ ($02 + APP_RUNNER)	; Pexec mode 0
 RUNNER_CMD_CD			equ ($03 + APP_RUNNER)	; Dsetpath
 RUNNER_CMD_RES			equ ($04 + APP_RUNNER)	; XBIOS Setscreen — rez at RUNNER_REZ
 RUNNER_CMD_MEMINFO		equ ($05 + APP_RUNNER)	; system memory snapshot (synchronous)
-RUNNER_CMD_LOAD			equ ($06 + APP_RUNNER)	; Pexec mode 3 (load only); Epic 06 / S5
-RUNNER_CMD_EXEC			equ ($07 + APP_RUNNER)	; Pexec mode 4 (just go); Epic 06 / S6
-RUNNER_CMD_UNLOAD		equ ($08 + APP_RUNNER)	; Mfree(basepage); Epic 06 / S7
+RUNNER_CMD_LOAD			equ ($06 + APP_RUNNER)	; Pexec mode 3 (load only);
+RUNNER_CMD_EXEC			equ ($07 + APP_RUNNER)	; Pexec mode 4 (just go);
+RUNNER_CMD_UNLOAD		equ ($08 + APP_RUNNER)	; Mfree(basepage);
 ; m68k -> RP report commands (sent via send_sync from the Runner).
 RUNNER_CMD_DONE_EXECUTE		equ ($82 + APP_RUNNER)	; payload: i32 exit code
 RUNNER_CMD_DONE_CD		equ ($83 + APP_RUNNER)	; payload: i32 GEMDOS errno
@@ -108,8 +108,8 @@ XBIOS_Setscreen			equ 5
 XBIOS_Setpalette		equ 6
 XBIOS_Vsync			equ 37
 PE_LOAD_GO			equ 0	; Pexec mode 0: load + go, returns
-PE_LOAD				equ 3	; Pexec mode 3: load only, returns basepage ptr (Epic 06 / S5)
-PE_GO				equ 4	; Pexec mode 4: just go, takes basepage ptr in fname slot (Epic 06 / S6)
+PE_LOAD				equ 3	; Pexec mode 3: load only, returns basepage ptr
+PE_GO				equ 4	; Pexec mode 4: just go, takes basepage ptr in fname slot
 
 ; RUNNER_RES errno codes (i32 in RUNNER_CMD_DONE_RES payload).
 RUNNER_RES_OK			equ 0
@@ -117,7 +117,8 @@ RUNNER_RES_ERR_MONO		equ -1	; current rez is high (mono); request ignored
 RUNNER_RES_ERR_BAD		equ -2	; requested rez out of range
 
 ; Shared-variable slot 12 (drive number) is published by the RP-side
-; handleGemdriveHello during gemdrive_init. The m68k's TOS process was
+; handleGemdriveHello during the boot-time gemdrive_handshake. The
+; m68k's TOS process was
 ; created at GEMDOS init time — *before* install_entry ran — so its
 ; current drive was inherited from the boot ROM's _bootdev (typically
 ; A:), not from the value install_entry later wrote. The Runner forces
@@ -139,7 +140,7 @@ ADV_JUMP_ADDR_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_ADV_JUMP_ADDR*4)
 ADV_LOAD_TARGET_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_ADV_LOAD_TARGET*4)
 ADV_LOAD_LEN_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_ADV_LOAD_LEN*4)
 
-; Epic 04 / S8 — Advanced load chunk staging buffer inside APP_FREE.
+; Advanced load chunk staging buffer inside APP_FREE.
 ; Carved out at offset $4000 (8 KB), well past the GEMDRIVE / runner
 ; sub-regions and well below the framebuffer ceiling. RP writes each
 ; chunk byte-pair-swapped here so the m68k's word/long reads return
@@ -147,15 +148,16 @@ ADV_LOAD_LEN_VAR		equ (SHARED_VARIABLES_ADDR + SHARED_VAR_ADV_LOAD_LEN*4)
 RUNNER_ADV_LOAD_BUF_OFFSET	equ $4000
 RUNNER_ADV_LOAD_BUF		equ (APP_FREE_ADDR + RUNNER_ADV_LOAD_BUF_OFFSET)
 
-; Epic 04 — Advanced Runner. The runner blob now relocates itself
-; to RAM at runner_entry so its VBL handler can run from a stable
-; RAM address (cartridge ROM is fine for instructions but the VBL
-; ISR fires every frame — RAM is safer). Target address is
-; gemdrive_reloc - RUNNER_RELOC_OFFSET, leaving $400 of slack
-; between the two relocated blobs.
+; The runner blob relocates itself to RAM at runner_entry so its VBL
+; handler can run from a stable RAM address (cartridge ROM is fine
+; for instructions but the VBL ISR fires every frame — RAM is
+; safer). Target address is gemdrive_reloc + RUNNER_ABOVE_GEMDRIVE_OFFSET,
+; placing RUNNER_BLOB above the GEMDRIVE blob inside the consolidated
+; 16 KB protected region [screen_base - 16 KB, screen_base). The offset
+; is GEMDRIVE_BLOB_SIZE ($1400) + $400 slack between the blobs.
 RUNNER_BLOB_CART_ADDR		equ (ROM4_ADDR + $1C00)		; cartridge source
 RUNNER_BLOB_SIZE_BYTES		equ $C00			; matches devops.ld slot
-RUNNER_RELOC_OFFSET		equ $1000			; runner sits 4 KB below gemdrive
+RUNNER_ABOVE_GEMDRIVE_OFFSET	equ $1800			; gemdrive_blob_size ($1400) + $400 slack
 _memtop				equ $436
 
 ; Advanced Runner command range. Reuses the existing sentinel; the
@@ -174,7 +176,7 @@ RUNNER_ADV_CMD_DONE_JUMP	equ ($00 + APP_RUNNER_VBL_DONE)	; no payload — RP cle
 RUNNER_ADV_CMD_DONE_LOAD_CHUNK	equ ($01 + APP_RUNNER_VBL_DONE)	; no payload — RP clears + advances
 RUNNER_VBL_RANGE_MASK		equ $FF00
 
-; --- Hook-vector selector (Epic 04 / S3) ---
+; --- Hook-vector selector ---
 ; The Advanced handler can be installed at one of two vectors.
 ; Both are simple long pointers and accept the same chain pattern
 ; (`move.l old(pc), -(sp); rts`), so the handler body is identical;
@@ -218,16 +220,28 @@ ADV_HOOK_VECTOR			equ ADV_HOOK_VECTOR_ETV_TIMER
 
 runner_entry:
 	; --- Stage 0: relocation harness — runs ONCE from cartridge
-	; ROM at $FA1C00. Copies the entire runner blob to RAM
-	; (gemdrive_reloc - RUNNER_RELOC_OFFSET), lowers _memtop to
-	; protect both blobs, then jmps into the relocated copy at
-	; runner_post_reloc. The cartridge-ROM source is unused after
-	; the copy; the RAM copy is what actually executes for the
-	; lifetime of this Runner session. The whole module is
-	; PC-relative so labels resolve correctly post-relocation. ---
+	; ROM at $FA1C00. Copies the entire runner blob to RAM at
+	; gemdrive_reloc + RUNNER_ABOVE_GEMDRIVE_OFFSET (i.e. above the
+	; GEMDRIVE blob, inside the same 16 KB protected region the
+	; RP-side already lowered _memtop to cover), then jmps into the
+	; relocated copy at runner_post_reloc. No need to re-patch
+	; _memtop here: gemdrive_install already set it to gemdrive_reloc
+	; (= screen_base − 16 KB) which protects RUNNER_BLOB too. The
+	; cartridge-ROM source is unused after the copy; the RAM copy
+	; is what actually executes for the lifetime of this Runner
+	; session. The whole module is PC-relative so labels resolve
+	; correctly post-relocation. ---
+	; The stack-overlap safety check is performed once, in main.s'
+	; gemdrive_install (which runs immediately before us — see
+	; runner_function). That check verifies SP does NOT sit
+	; anywhere inside [gemdrive_reloc, gemdrive_reloc + 16 KB),
+	; which already covers our destination (RUNNER_BLOB lives at
+	; gemdrive_reloc + $1800..$2400 — fully inside that span).
+	; The jsr+rts between gemdrive_install and us is stack-
+	; balanced, so SP is essentially unchanged when we get here;
+	; if the check passed there, our copy is safe by construction.
 	move.l	GEMDRIVE_RELOC_ADDR_VAR, d0
-	sub.l	#RUNNER_RELOC_OFFSET, d0	; d0 = runner_reloc
-	move.l	d0, _memtop.w			; lower _memtop to protect us
+	add.l	#RUNNER_ABOVE_GEMDRIVE_OFFSET, d0	; d0 = runner_reloc
 
 	move.l	d0, a1				; dest
 	move.l	#RUNNER_BLOB_CART_ADDR, a0	; source
@@ -271,7 +285,7 @@ runner_post_reloc:
 	trap	#1
 	addq.l	#6, sp
 
-	; --- Step 0.5 (Epic 04 / S1+S3+S4): install the Advanced Runner
+	; --- Step 0.5: install the Advanced Runner
 	; hook at the vector chosen by the RP-side aconfig setting. The
 	; resolved vector address ($70 for VBL or $400 for etv_timer) is
 	; published to shared-var slot 16 by gemdrive_command_cb's HELLO
@@ -340,7 +354,7 @@ runner_poll_loop:
 	; Cold reset is handled by the Advanced Runner VBL hook
 	; (RUNNER_ADV_CMD_RESET in the $06xx range — see adv_hook_handler
 	; below). The foreground RUNNER_CMD_RESET dispatch was retired
-	; in Epic 04 / S5 because the VBL path also escapes wedged
+	; in because the VBL path also escapes wedged
 	; programs that the foreground poll can't reach.
 	move.l	CMD_MAGIC_SENTINEL_ADDR, d6
 	cmp.l	#RUNNER_CMD_EXECUTE, d6
@@ -439,7 +453,7 @@ runner_execute:
 	send_sync RUNNER_CMD_DONE_EXECUTE, 4
 	bra	runner_poll_loop
 
-; RUNNER_CMD_LOAD handler (Epic 06 / S5). Reads RUNNER_PATH +
+; RUNNER_CMD_LOAD handler. Reads RUNNER_PATH +
 ; RUNNER_CMDLINE from APP_FREE, calls GEMDOS Pexec mode 3 (load
 ; only), and ships d0.l back to the RP via RUNNER_CMD_DONE_LOAD.
 ; Wire-protocol contract: d0 > 0 → basepage pointer (program is
@@ -516,7 +530,7 @@ runner_load:
 	beq.s	.wait_clear_load
 	bra	runner_poll_loop
 
-; RUNNER_CMD_EXEC handler (Epic 06 / S6). Reads the basepage ptr
+; RUNNER_CMD_EXEC handler. Reads the basepage ptr
 ; from RUNNER_BASEPAGE (cached by a prior RUNNER_CMD_LOAD), calls
 ; GEMDOS Pexec mode 4 (just go), and ships d0.l (program exit
 ; code) back to the RP via RUNNER_CMD_DONE_EXEC. The RP-side
@@ -591,7 +605,7 @@ runner_exec:
 	beq.s	.wait_clear_exec
 	bra	runner_poll_loop
 
-; RUNNER_CMD_UNLOAD handler (Epic 06 / S7). Releases the basepage
+; RUNNER_CMD_UNLOAD handler. Releases the basepage
 ; cached in RUNNER_BASEPAGE via GEMDOS Mfree, so the operator can
 ; reclaim the memory after they're done re-exec'ing the loaded
 ; program. Companion to runner_load (Pexec(3)) and runner_exec
@@ -873,7 +887,7 @@ runner_meminfo:
 	bra	runner_poll_loop
 
 ; ---------------------------------------------------------------
-; Advanced Runner hook (Epic 04 / S1+S2+S3).
+; Advanced Runner hook.
 ;
 ; Installed at ADV_HOOK_VECTOR ($70 VBL or $400 etv_timer) by
 ; runner_post_reloc. Same handler body services both — the chain
@@ -917,7 +931,7 @@ adv_chain_to_old:
 	move.l	old_adv_hook(pc), -(sp)
 	rts					; chain → previous handler
 
-; --- Forced cold reset (Epic 04 / S2). Mirrors the foreground
+; --- Forced cold reset. Mirrors the foreground
 ; runner_reset's memvalid clear + jmp through the reset vector at
 ; $4.w, but driven from inside the VBL ISR so it works even when
 ; the foreground poll loop is wedged (program in an infinite loop,
@@ -933,7 +947,7 @@ adv_force_reset:
 	jmp	(a0)
 	; unreachable
 
-; --- Advanced meminfo (Epic 04 / S6). Same RP-visible payload as
+; --- Advanced meminfo. Same RP-visible payload as
 ; the foreground RUNNER_CMD_MEMINFO (24-byte struct shipped via
 ; RUNNER_CMD_DONE_MEMINFO), but the read happens from inside the
 ; VBL ISR so it works even when the foreground poll loop is wedged.
@@ -1010,7 +1024,7 @@ adv_meminfo_isr:
 	movem.l	(sp)+, d2-d7/a1-a4		; restore extra registers
 	bra	adv_chain_to_old		; chain → previous handler runs + rte
 
-; --- adv_jump_isr (Epic 04 / S7) — patch the ISR's saved PC so the
+; --- adv_jump_isr — patch the ISR's saved PC so the
 ; eventual rte resumes at the user-supplied address (read from
 ; shared-var slot 17 = ADV_JUMP_ADDR_VAR). Fire-and-forget: no
 ; payload back to the RP, just a no-payload RUNNER_ADV_CMD_DONE_JUMP
@@ -1057,7 +1071,7 @@ adv_jump_isr:
 	movem.l	(sp)+, d0-d1/a0			; restore ISR prologue
 	rte					; jump to patched PC
 
-; --- adv_load_chunk_isr (Epic 04 / S8) — copy a single chunk from
+; --- adv_load_chunk_isr — copy a single chunk from
 ; the APP_FREE staging buffer (at RUNNER_ADV_LOAD_BUF, byte-pair-
 ; swapped by the RP writer) into the m68k RAM target read from
 ; shared-var slot 18 (current chunk start). Length in slot 19.

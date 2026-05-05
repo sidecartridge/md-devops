@@ -1,7 +1,6 @@
 /**
  * File: gemdrive.h
- * Description: GEMDRIVE — Epic 01. S1 surface: relocation handshake only;
- * GEMDOS hooks land in S2+.
+ * Description: GEMDRIVE — relocation handshake + GEMDOS hooks.
  */
 
 #ifndef GEMDRIVE_H
@@ -14,8 +13,8 @@
 // m68k↔RP protocol matches once full GEMDOS hooks land.
 #define GEMDRIVE_APP 0x0400  // APP_GEMDRVEMUL — MSB of the 16-bit cmd id
 
-// CMD_GEMDRIVE_HELLO is new in this app (S1 bootstrap). $50 is unused
-// in the source's allocation table.
+// CMD_GEMDRIVE_HELLO is new in this app. $50 is unused in the
+// source's allocation table.
 #define GEMDRIVE_CMD_HELLO (0x50 + GEMDRIVE_APP)
 
 // Diagnostic: m68k sends what it observes at $436 immediately after
@@ -24,15 +23,14 @@
 #define GEMDRIVE_CMD_VERIFY_MEMTOP (0x52 + GEMDRIVE_APP)
 
 // Wire-format identical to md-drives-emulator. RESET_GEM clears any
-// per-session state held by the RP (none in S2 — placeholder for S3+).
-// SAVE_VECTORS records the previous GEMDOS handler address and the
-// blob's old_handler cell address; the RP uses both to verify the
-// install ran and (in later stories) to chain back to the original
-// handler when the RP itself simulates a GEMDOS call.
+// per-session state held by the RP. SAVE_VECTORS records the previous
+// GEMDOS handler address and the blob's old_handler cell address; the
+// RP uses both to verify the install ran and to chain back to the
+// original handler when the RP itself simulates a GEMDOS call.
 #define GEMDRIVE_CMD_RESET_GEM (0x00 + GEMDRIVE_APP)
 #define GEMDRIVE_CMD_SAVE_VECTORS (0x01 + GEMDRIVE_APP)
 
-// S3 wire format (kept identical to md-drives-emulator).
+// Wire format kept identical to md-drives-emulator.
 #define GEMDRIVE_CMD_REENTRY_LOCK (0x03 + GEMDRIVE_APP)
 #define GEMDRIVE_CMD_REENTRY_UNLOCK (0x04 + GEMDRIVE_APP)
 #define GEMDRIVE_CMD_DFREE_CALL (0x36 + GEMDRIVE_APP)
@@ -91,7 +89,7 @@
 #define GEMDRIVE_DTA_TRANSFER_OFFSET 0x10A8    // 44 bytes (DTA_SIZE)
 #define GEMDRIVE_DTA_TRANSFER_SIZE 44
 
-// S4 write-side state. All status words are signed GEMDOS error codes
+// Write-side state. All status words are signed GEMDOS error codes
 // (0 = ok, negative = error). FCREATE_HANDLE returns a new file handle
 // in the GEMDRIVE range or a negative error.
 #define GEMDRIVE_DCREATE_STATUS_OFFSET 0x10D8   // 4 bytes
@@ -104,7 +102,7 @@
 #define GEMDRIVE_WRITE_BUFFER_OFFSET 0x10F4     // 1024 bytes
 #define GEMDRIVE_WRITE_BUFFER_SIZE 1024
 
-// S5 Pexec / DTA state.
+// Pexec / DTA state.
 #define GEMDRIVE_PEXEC_MODE_OFFSET 0x14F4       // 4 bytes (mode word at +2)
 #define GEMDRIVE_PEXEC_STACK_ADDR_OFFSET 0x14F8 // 4 bytes
 #define GEMDRIVE_PEXEC_FNAME_OFFSET 0x14FC      // 4 bytes
@@ -139,9 +137,20 @@
 #define GEMDRIVE_MAX_DTAS 16
 
 // The default reloc / memtop = screen_base - GEMDRIVE_DEFAULT_OFFSET_BYTES.
-// Mirrors GEMDRIVE_BLOB_SIZE on the m68k side and matches the user's
-// stated requirement ("8 KB below the screen memory address").
-#define GEMDRIVE_DEFAULT_OFFSET_BYTES 0x2000
+// Sized so that BOTH relocated blobs fit inside the protected region
+// [screen_base - 16 KB, screen_base): GEMDRIVE_BLOB ($1400 = 5 KB) is
+// pinned at the bottom of this region, and RUNNER_BLOB ($C00 = 3 KB)
+// is placed above it via runner.s' RUNNER_ABOVE_GEMDRIVE_OFFSET. With
+// 16 KB total the layout is:
+//
+//   screen_base − 16 KB ($4000)  GEMDRIVE_BLOB  (5 KB)
+//   screen_base − 11 KB ($2C00)  end of GEMDRIVE_BLOB
+//   screen_base − 10 KB ($2800)  RUNNER_BLOB    (3 KB) — $400 slack above
+//   screen_base −  7 KB ($1C00)  end of RUNNER_BLOB
+//   screen_base −  7 KB .. screen_base — 7 KB safety buffer to framebuffer
+//
+// User-facing label in the setup menu is "auto (screen-16KB)".
+#define GEMDRIVE_DEFAULT_OFFSET_BYTES 0x4000
 
 // Initialize GEMDRIVE module: register the command callback. Must be
 // called after chandler_init() and before the m68k cartridge issues
@@ -150,5 +159,22 @@ void gemdrive_init(void);
 
 // chandler callback. Public so emul.c can register it via chandler_addCB.
 void gemdrive_command_cb(TransmissionProtocol *protocol, uint16_t *payload);
+
+// Read the cached phystop value from the most recent GEMDRIVE_CMD_HELLO.
+// Returns false if no HELLO has landed yet (handshake hasn't completed —
+// happens for a sub-millisecond window at boot). When true, *out_phystop
+// holds the TOS-reported _phystop ($42E) value and *out_mismatch is true
+// iff TOS' phystop disagrees with the silicon's MMU bank-config reading
+// (a sign that a reset-resistant program lowered phystop and survived
+// warm reset; the user must power-cycle to recover).
+//
+// out_phystop / out_mismatch may be NULL if the caller is interested
+// only in whether HELLO has landed.
+bool gemdrive_getPhystop(uint32_t *out_phystop, bool *out_mismatch);
+
+// Read the cached screenmem (logical screen base) value from the most
+// recent CMD_GEMDRIVE_HELLO. Same as XBIOS Logbase / _v_bas_ad ($44E)
+// at HELLO time. Returns false if no HELLO has landed yet.
+bool gemdrive_getScreenmem(uint32_t *out_screenmem);
 
 #endif  // GEMDRIVE_H

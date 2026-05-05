@@ -5,7 +5,7 @@
  * Copyright: 2026 - GOODDATA LABS SL
  * Description: Runner app shared region offsets + protocol
  *              constants. Mirrored on the m68k side in
- *              target/atarist/src/runner.s and main.s. Epic 03.
+ *              target/atarist/src/runner.s and main.s.
  */
 
 #ifndef RUNNER_H
@@ -31,7 +31,7 @@
 // Stateless target rez for RUNNER_CMD_RES (u16 in low half;
 // 0=low, 1=med). Stored as 4 B for word-aligned access.
 #define RUNNER_REZ_OFFSET (RUNNER_BASE_OFFSET + 0x190)          // 4 B
-// Pexec-load basepage cache (Epic 06 / S5+S6). The m68k stashes
+// Pexec-load basepage cache. The m68k stashes
 // the Pexec(3) basepage pointer here on RUNNER_CMD_LOAD, then
 // reads it back on RUNNER_CMD_EXEC for the Pexec(4) call. The
 // RP also tracks the basepage in its own state (mirrored from
@@ -40,8 +40,8 @@
 
 // Magic the m68k Runner publishes at boot so the RP can detect that
 // Runner mode is active. ASCII 'RNV1' big-endian. Reserved for
-// future protocol-version handshake; S1 detects active state RP-side
-// (cmdRunner flips emul_isRunnerActive()).
+// future protocol-version handshake; active state is currently
+// detected RP-side (cmdRunner flips emul_isRunnerActive()).
 #define RUNNER_HELLO_MAGIC 0x524E5631u
 
 // Protocol version: high u16 = min, low u16 = max. v1.
@@ -55,17 +55,17 @@
 // poll loop reads and acts on it.
 #define APP_RUNNER 0x0500
 // Note: APP_RUNNER + 0x01 was the foreground RUNNER_CMD_RESET; retired
-// in Epic 04 / S5 in favour of RUNNER_ADV_CMD_RESET (VBL-driven). Slot
-// kept reserved so future stories don't reuse it accidentally.
+// in favour of RUNNER_ADV_CMD_RESET (VBL-driven). Slot kept reserved
+// so future commands don't reuse it accidentally.
 #define RUNNER_CMD_EXECUTE (APP_RUNNER + 0x02)  // Pexec mode 0
 #define RUNNER_CMD_CD (APP_RUNNER + 0x03)       // Dsetpath
 #define RUNNER_CMD_RES (APP_RUNNER + 0x04)      // XBIOS Setscreen
 #define RUNNER_CMD_MEMINFO (APP_RUNNER + 0x05)  // system memory snapshot
-#define RUNNER_CMD_LOAD (APP_RUNNER + 0x06)     // Pexec mode 3 (Epic 06 / S5)
-#define RUNNER_CMD_EXEC (APP_RUNNER + 0x07)     // Pexec mode 4 (Epic 06 / S6)
-#define RUNNER_CMD_UNLOAD (APP_RUNNER + 0x08)   // Mfree(basepage) (Epic 06 / S7)
+#define RUNNER_CMD_LOAD (APP_RUNNER + 0x06)     // Pexec mode 3
+#define RUNNER_CMD_EXEC (APP_RUNNER + 0x07)     // Pexec mode 4
+#define RUNNER_CMD_UNLOAD (APP_RUNNER + 0x08)   // Mfree(basepage)
 
-// Epic 04 — Advanced Runner. Commands in this range are dispatched
+// Advanced Runner. Commands in this range are dispatched
 // by the m68k's VBL ISR (installed at $70 by runner_post_reloc) so
 // they keep working when the foreground poll loop is wedged. The
 // existing $05xx foreground range is unaffected — the poll loop's
@@ -129,10 +129,10 @@ typedef enum {
   RUNNER_LAST_RES = 4,
   RUNNER_LAST_MEMINFO = 5,
   RUNNER_LAST_JUMP = 6,
-  RUNNER_LAST_LOAD = 7,         // adv-load (raw RAM upload, Epic 04 / S8)
-  RUNNER_LAST_PEXEC_LOAD = 8,    // runner load (Pexec(3), Epic 06 / S5)
-  RUNNER_LAST_PEXEC_EXEC = 9,    // runner exec (Pexec(4), Epic 06 / S6)
-  RUNNER_LAST_PEXEC_UNLOAD = 10, // runner unload (Mfree, Epic 06 / S7)
+  RUNNER_LAST_LOAD = 7,         // adv-load (raw RAM upload,)
+  RUNNER_LAST_PEXEC_LOAD = 8,    // runner load (Pexec(3),)
+  RUNNER_LAST_PEXEC_EXEC = 9,    // runner exec (Pexec(4),)
+  RUNNER_LAST_PEXEC_UNLOAD = 10, // runner unload (Mfree,)
 } runner_last_command_t;
 
 // Snapshot returned by RUNNER_CMD_MEMINFO. Mirrors the 24-byte

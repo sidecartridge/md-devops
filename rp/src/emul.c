@@ -39,7 +39,7 @@
 #include "term.h"
 #include "usbcdc.h"
 
-// Main-loop tick (Epic 05 v2 / S9). Drives chandler_loop +
+// Main-loop tick. Drives chandler_loop +
 // usbcdc_drain at ~100 Hz so chandler can drain the 4096-sample
 // commemul ring (~4 ms wrap at full m68k emit rate) with 10×
 // headroom, and so CDC bytes appear on the workstation with
@@ -47,7 +47,7 @@
 // territory; higher and we re-introduce the visibility / drop
 // problems that motivated the optimization stories. The full
 // Core 1 worker plan (chandler + tud_task + usbcdc_drain on a
-// dedicated core) is parked in the Epic 05 backlog — escalate
+// dedicated core) is parked in the backlog — escalate
 // there only if 100 Hz proves insufficient.
 #define SLEEP_LOOP_MS 10
 
@@ -56,9 +56,7 @@ enum {
 };
 
 // Command handlers
-static void cmdMenu(const char *arg);
-static void cmdExit(const char *arg);
-static void cmdFirmware(const char *arg);
+static void cmdGemdrive(const char *arg);
 static void cmdBooster(const char *arg);
 static void cmdGemdriveFolder(const char *arg);
 static void cmdGemdriveDrive(const char *arg);
@@ -66,21 +64,13 @@ static void cmdGemdriveRelocAddr(const char *arg);
 static void cmdGemdriveMemtop(const char *arg);
 static void cmdAdvHookVector(const char *arg);
 static void cmdRunner(const char *arg);
-static void cmdHiddenSettings(const char *arg);
-static void cmdPrint(const char *arg);
-static void cmdSave(const char *arg);
-static void cmdErase(const char *arg);
-static void cmdGet(const char *arg);
-static void cmdPutInt(const char *arg);
-static void cmdPutBool(const char *arg);
-static void cmdPutString(const char *arg);
 
-// Command table. Single-letter keys mirror md-drives-emulator. The hidden
-// "?" entry exposes the raw settings commands (print/save/get/...).
+// Command table. Every key here corresponds to a label on the on-screen
+// setup menu — keys that aren't advertised in the UI used to live here
+// too (m, ?, print, save, erase, get, put_*) but were retired to avoid
+// fat-finger / terminal-noise hazards.
 static const Command commands[] = {
-    {"m", cmdMenu},
-    {"e", cmdExit},
-    {"f", cmdFirmware},
+    {"g", cmdGemdrive},
     {"x", cmdBooster},
     {"o", cmdGemdriveFolder},
     {"d", cmdGemdriveDrive},
@@ -88,14 +78,6 @@ static const Command commands[] = {
     {"t", cmdGemdriveMemtop},
     {"v", cmdAdvHookVector},
     {"u", cmdRunner},
-    {"?", cmdHiddenSettings},
-    {"print", cmdPrint},
-    {"save", cmdSave},
-    {"erase", cmdErase},
-    {"get", cmdGet},
-    {"put_int", cmdPutInt},
-    {"put_bool", cmdPutBool},
-    {"put_str", cmdPutString},
 };
 
 // Number of commands in the table
@@ -105,14 +87,28 @@ static const size_t numCommands = sizeof(commands) / sizeof(commands[0]);
 static bool keepActive = true;
 static bool menuScreenActive = false;
 
-// Epic 06 / S4: cached "USB CDC attached" state from the last
+// cached "USB CDC attached" state from the last
 // menu paint. -1 means "not yet rendered this menu session";
 // any 0/1 transition triggers refreshUsbCdcLine() to overdraw
 // the status line in place. Lives at module scope because both
 // menu() (initial paint) and the main loop (live refresh) touch
 // it. Fixed cursor row so the overdraw doesn't have to walk the
 // terminal state.
-#define MENU_USBCDC_ROW 15
+#define MENU_USBCDC_ROW 17
+// Phystop and Screenmem value rows (inside the GEMDRIVE block,
+// under Mem[t]op). menu() always paints placeholders at these rows
+// so the layout below stays fixed even before the m68k HELLO has
+// landed; refreshPhystopLine() / refreshScreenmemLine() overdraw
+// once HELLO arrives.
+#define MENU_PHYSTOP_ROW   7
+#define MENU_SCREENMEM_ROW 8
+
+// Forward decls — both refresh helpers are defined further down
+// (next to refreshUsbCdcLine), but emul_onGemdriveHello (above the
+// definition) needs to call them as the m68k HELLO arrives so the
+// menu's "(waiting...)" placeholders update immediately.
+static void refreshPhystopLine(void);
+static void refreshScreenmemLine(void);
 static int g_menuLastUsbCdcAttached = -1;
 
 // Runner state owned RP-side (the m68k can't write to the cartridge
@@ -151,7 +147,7 @@ static int32_t runnerLastResErrno = 0;
 static runner_meminfo_t runnerMeminfo = {0};
 static bool runnerMeminfoHasSnapshot = false;
 static bool runnerMeminfoPending = false;
-// Epic 06 / S5+S6 — Pexec(3)/(4) load+exec split state. The
+// Pexec(3)/(4) load+exec split state. The
 // m68k Runner's RUNNER_CMD_LOAD handler (Pexec mode 3) returns a
 // basepage pointer in the DONE_LOAD payload; we cache it here so
 // a subsequent RUNNER_CMD_EXEC fires Pexec(4) on the right
@@ -164,13 +160,13 @@ static bool runnerMeminfoPending = false;
 static int32_t runnerPendingBasepage = 0;
 static bool runnerLoadHasErrno = false;
 static int32_t runnerLoadErrno = 0;
-// Epic 04 — Advanced Runner installation flag, set by the m68k's
+// Advanced Runner installation flag, set by the m68k's
 // HELLO payload byte after runner_post_reloc installs its VBL hook.
 static bool runnerAdvancedInstalled = false;
-// S4 — active hook vector ID reported by the m68k in the HELLO
+// active hook vector ID reported by the m68k in the HELLO
 // payload. Default UNKNOWN until HELLO arrives.
 static uint8_t runnerAdvHookVector = RUNNER_HOOK_VECTOR_UNKNOWN;
-// S8 — Advanced load chunk-ack flag. Set by the chandler when a
+// Advanced load chunk-ack flag. Set by the chandler when a
 // RUNNER_ADV_CMD_DONE_LOAD_CHUNK arrives, cleared by the streamer
 // before firing each chunk.
 static bool runnerAdvLoadAcked = false;
@@ -240,7 +236,7 @@ void emul_recordRunnerExecuteDone(int32_t exit_code, uint32_t now_ms) {
   runnerBusy = false;
 }
 
-// Epic 06 / S5+S6 — Pexec(3) load + Pexec(4) exec.
+// Pexec(3) load + Pexec(4) exec.
 void emul_recordRunnerLoadSubmit(const char *path, uint32_t now_ms) {
   runnerLastCommand = RUNNER_LAST_PEXEC_LOAD;
   runnerLastStartedMs = now_ms;
@@ -293,11 +289,11 @@ void emul_recordRunnerExecDone(int32_t exit_code, uint32_t now_ms) {
   runnerBusy = false;
   // Pexec(4) (PE_GO) does NOT free the basepage — it stays
   // allocated in m68k RAM and re-exec on the same basepage is
-  // valid. The runner unload command (Epic 06 / S7) is what
+  // valid. The runner unload command is what
   // explicitly Mfrees the memory and clears pendingBasepage.
 }
 
-// Epic 06 / S7 — runner unload (GEMDOS Mfree).
+// runner unload (GEMDOS Mfree).
 void emul_recordRunnerUnloadSubmit(uint32_t now_ms) {
   runnerLastCommand = RUNNER_LAST_PEXEC_UNLOAD;
   runnerLastStartedMs = now_ms;
@@ -471,6 +467,14 @@ void emul_recordRunnerAdvLoadAck(void) { runnerAdvLoadAcked = true; }
 void emul_clearRunnerAdvLoadAck(void) { runnerAdvLoadAcked = false; }
 
 void emul_onGemdriveHello(void) {
+  // The m68k just published its HELLO payload (screen_base, phystop,
+  // total_ram_kb). Trigger the Phystop / Screenmem row overdraws so
+  // the live menu updates from "(waiting...)" to the real values.
+  // These run whether we're on the menu screen or already past it;
+  // each refresh helper gates on menuScreenActive internally.
+  refreshPhystopLine();
+  refreshScreenmemLine();
+
   if (!runnerActive) return;
   // The m68k just cold-booted (HELLO is sent from gemdrive_init,
   // which only runs at CA_INIT). If we were in Runner mode before,
@@ -498,7 +502,7 @@ void emul_scheduleRunnerRelaunch(uint32_t at_ms) {
   runnerRelaunchAtMs = at_ms;
 }
 
-// Epic 05 v2 — firmware-mode flag.
+// firmware-mode flag.
 //
 // One-way: only a hardware reset clears it. Used by the chandler
 // ingest filter (chandler.c) to gate debug-byte capture: pre-menu
@@ -521,8 +525,7 @@ bool emul_isFirmwareMode(void) {
 }
 
 // Boot countdown — auto-launches Runner mode on the Atari ST when it hits 0
-// (Epic 06 / S2: switched from GEMDRIVE-only to Runner; the GEMDRIVE blob is
-// still installed because Runner runs on top of it).
+// (the GEMDRIVE blob is still installed because Runner runs on top of it).
 // Mirrors md-drives-emulator's behavior. Any key press halts it.
 #define BOOT_COUNTDOWN_SECONDS 20
 static int countdown = BOOT_COUNTDOWN_SECONDS;
@@ -609,30 +612,31 @@ static void drawSetupInfoLine(const char *message) {
 
 static void refreshSetupInfoLine(void) {
   if (haltCountdown) {
-    drawSetupInfoLine("Countdown stopped. Press [E], [U] or [X] to continue.");
+    drawSetupInfoLine("Countdown stopped. Press [G], [U] or [X] to continue.");
   } else {
     showCounter(countdown);
   }
 }
 
-// Epic 06 / S8 — u8g2 menu polish (Tier 1). Thin horizontal
-// dividers between the menu's config groups. Drawn in the gap
-// row above each section header (term row 7 = y=56, row 10 =
-// y=80, row 14 = y=112) so they don't overlap any character
-// cell. One pixel tall, full-width edge-to-edge.
+// Thin horizontal dividers between the menu's config groups.
+// Drawn in the gap row above each section header so they don't
+// overlap any character cell. One pixel tall, full-width edge-
+// to-edge. Positions shifted +16 px from the original layout
+// because two new GEMDRIVE rows (Phystop + Screenmem) bump every
+// section below them down by two rows (16 px).
 static void drawMenuDividers(void) {
   u8g2_t *ref = display_getU8g2Ref();
   u8g2_SetDrawColor(ref, 1);
-  // Above Adv [V]ector (between row 6 GEMDRIVE last and row 8
+  // Above Adv [V]ector (between row 8 GEMDRIVE last and row 10
   // Adv header).
-  u8g2_DrawHLine(ref, 0, 60, DISPLAY_WIDTH);
-  // Above API Endpoint (between row 9 and row 11).
-  u8g2_DrawHLine(ref, 0, 84, DISPLAY_WIDTH);
-  // Above USB CDC (between row 13 and row 15).
-  u8g2_DrawHLine(ref, 0, 116, DISPLAY_WIDTH);
+  u8g2_DrawHLine(ref, 0, 76, DISPLAY_WIDTH);
+  // Above API Endpoint (between row 11 and row 13).
+  u8g2_DrawHLine(ref, 0, 100, DISPLAY_WIDTH);
+  // Above USB CDC (between row 15 and row 17).
+  u8g2_DrawHLine(ref, 0, 132, DISPLAY_WIDTH);
 }
 
-// Epic 06 / S8 — status icons via u8g2_font_open_iconic_embedded_1x_t.
+// status icons via u8g2_font_open_iconic_embedded_1x_t.
 // Right-aligned at the section-header rows. Codepoints from the
 // 17-glyph open-iconic-embedded subset (verified via the u8g2
 // upstream BDF):
@@ -651,9 +655,9 @@ static void drawMenuDividers(void) {
 // glyph baseline is at y_top + 7 (font is 8 px tall).
 #define MENU_ICON_X              (DISPLAY_WIDTH - 12)
 #define MENU_ICON_GEMDRIVE_YTOP  16   // term row 2
-#define MENU_ICON_ADV_YTOP       64   // term row 8
-#define MENU_ICON_API_YTOP       88   // term row 11
-#define MENU_ICON_USB_YTOP       120  // term row 15
+#define MENU_ICON_ADV_YTOP       80   // term row 10 (Phystop + Screenmem add 2 rows)
+#define MENU_ICON_API_YTOP       104  // term row 13
+#define MENU_ICON_USB_YTOP       136  // term row 17
 #define MENU_ICON_GLYPH_COG          0x42
 #define MENU_ICON_GLYPH_LIGHTBULB    0x4D
 #define MENU_ICON_GLYPH_HARD_DRIVE   0x4C
@@ -669,7 +673,7 @@ static void drawIconCell(uint16_t x, uint16_t y_top, uint8_t glyph,
   // box would leave that row untouched and a hide→show
   // transition would expose a residual top edge of the prior
   // glyph. The four icon positions in this menu all have an
-  // unused pixel row directly above (the hrules at y=60/84/116
+  // unused pixel row directly above (the hrules at y=76/100/132
   // sit further up still), so the +1 row of erase margin is
   // safe.
   u8g2_SetDrawColor(ref, 0);
@@ -705,7 +709,7 @@ static void drawMenuStatusIcons(void) {
                MENU_ICON_GLYPH_LIGHTBULB, usb_attached);
 }
 
-// Epic 06 / S8 — animated countdown progress bar. Replaces the
+// animated countdown progress bar. Replaces the
 // "Boot will continue in N seconds..." text strip with a filled
 // box that shrinks from full-width to zero as the countdown
 // elapses. Text is rendered once over the filled (white) half
@@ -764,7 +768,7 @@ static void drawCountdownBar(int sec_left, int sec_total) {
   u8g2_SetFont(ref, u8g2_font_amstrad_cpc_extended_8f);
 }
 
-// Epic 06 / S4. Polled from the main loop while the menu screen
+// Polled from the main loop while the menu screen
 // is up; on a state transition (host plugged in / unplugged) it
 // overdraws just the USB CDC status line at MENU_USBCDC_ROW + 1
 // rather than rebuilding the whole menu. Both display strings
@@ -780,7 +784,7 @@ static void refreshUsbCdcLine(void) {
   vt52Cursor(MENU_USBCDC_ROW + 1, 0);
   term_printString("  Status      : ");
   term_printString(attached ? "connected   " : "disconnected");
-  // Epic 06 / S8 — flip the lightbulb ("active") icon at the
+  // flip the lightbulb ("active") icon at the
   // USB CDC header in lock-step with the status text.
   drawIconCell(MENU_ICON_X, MENU_ICON_USB_YTOP,
                MENU_ICON_GLYPH_LIGHTBULB, attached);
@@ -789,6 +793,74 @@ static void refreshUsbCdcLine(void) {
   // overdraw doesn't leave it stranded over the USB CDC line.
   // "Select an option: " is 18 chars, so col 18 is the spot
   // the user expects to type into.
+  vt52Cursor(TERM_SCREEN_SIZE_Y - 1, 18);
+  display_refresh();
+}
+
+// Live-refresh of the Phystop row inside the GEMDRIVE block. The menu
+// renders a "(waiting...)" placeholder at paint time because the m68k
+// HELLO usually hasn't landed yet (the Pico boots first, the ST is
+// still in TOS init). Once HELLO arrives this overdraws the line
+// with the real value + optional (!) marker. Caches the last shown
+// values so we only redraw on transition.
+static int g_menuLastPhystopReady = -1;     // -1 = not yet drawn
+static uint32_t g_menuLastPhystop = 0;
+static int g_menuLastPhystopMismatch = -1;
+static void refreshPhystopLine(void) {
+  if (!menuScreenActive) return;
+  uint32_t phystop = 0;
+  bool mismatch = false;
+  bool ready = gemdrive_getPhystop(&phystop, &mismatch);
+  if ((int)ready == g_menuLastPhystopReady &&
+      phystop == g_menuLastPhystop &&
+      (int)mismatch == g_menuLastPhystopMismatch) {
+    return;  // no change since last paint
+  }
+  g_menuLastPhystopReady = (int)ready;
+  g_menuLastPhystop = phystop;
+  g_menuLastPhystopMismatch = (int)mismatch;
+  vt52Cursor(MENU_PHYSTOP_ROW, 0);
+  char val[24];
+  if (ready) {
+    snprintf(val, sizeof(val), "0x%06X%s",
+             (unsigned)phystop, mismatch ? " (!)" : "");
+  } else {
+    snprintf(val, sizeof(val), "(waiting...)");
+  }
+  char buf[48];
+  snprintf(buf, sizeof(buf), "  Phystop     : %-16s", val);
+  term_printString(buf);
+  // Restore cursor to the prompt column on the bottom row, same as
+  // refreshUsbCdcLine, so we don't leave the cursor stranded.
+  vt52Cursor(TERM_SCREEN_SIZE_Y - 1, 18);
+  display_refresh();
+}
+
+// Live-refresh of the Screenmem row. Same shape as
+// refreshPhystopLine: cache the last shown value, only redraw on
+// transition. No mismatch marker — this value is purely informational.
+static int g_menuLastScreenmemReady = -1;
+static uint32_t g_menuLastScreenmem = 0;
+static void refreshScreenmemLine(void) {
+  if (!menuScreenActive) return;
+  uint32_t screenmem = 0;
+  bool ready = gemdrive_getScreenmem(&screenmem);
+  if ((int)ready == g_menuLastScreenmemReady &&
+      screenmem == g_menuLastScreenmem) {
+    return;
+  }
+  g_menuLastScreenmemReady = (int)ready;
+  g_menuLastScreenmem = screenmem;
+  vt52Cursor(MENU_SCREENMEM_ROW, 0);
+  char val[24];
+  if (ready) {
+    snprintf(val, sizeof(val), "0x%06X", (unsigned)screenmem);
+  } else {
+    snprintf(val, sizeof(val), "(waiting...)");
+  }
+  char buf[48];
+  snprintf(buf, sizeof(buf), "  Screenmem   : %-16s", val);
+  term_printString(buf);
   vt52Cursor(TERM_SCREEN_SIZE_Y - 1, 18);
   display_refresh();
 }
@@ -1000,7 +1072,7 @@ static enum navStatus __not_in_flash_func(navigate_directory)(
 
 // Builds the menu — single GEMDRIVE block + bottom navigation strip.
 // Layout follows the source's menu(): vt52Cursor positions, the F[o]lder/
-// [D]rive labels, and the bottom "[E]xit / [X] Return to Booster" line.
+// [D]rive labels, and the bottom "[G]EMDRIVE / [X] Return to Booster" line.
 static void __not_in_flash_func(menu)(void) {
   term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
   menuScreenActive = true;
@@ -1032,14 +1104,14 @@ static void __not_in_flash_func(menu)(void) {
   term_printString(driveValue);
   term_printString(":");
 
-  // Reloc / memtop overrides — 0 means "auto" (default = screen_base - 8 KB).
+  // Reloc / memtop overrides — 0 means "auto" (default = screen_base - 16 KB).
   SettingsConfigEntry *relocEntry = settings_find_entry(
       aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR);
   int relocAddr = (relocEntry != NULL) ? atoi(relocEntry->value) : 0;
   char relocLine[48];
   if (relocAddr == 0) {
     snprintf(relocLine, sizeof(relocLine),
-             "\n  [R]eloc addr: auto (screen-8KB)");
+             "\n  [R]eloc addr: auto (screen-16KB)");
   } else {
     snprintf(relocLine, sizeof(relocLine), "\n  [R]eloc addr: 0x%06X",
              (unsigned)relocAddr);
@@ -1059,10 +1131,54 @@ static void __not_in_flash_func(menu)(void) {
   }
   term_printString(memtopLine);
 
+  // Phystop row — read-only display of TOS' _phystop ($42E) value in
+  // hex, with a `(!)` marker when it disagrees with the silicon's MMU
+  // bank-config reading. The marker means a reset-resistant program
+  // lowered phystop and survived warm reset; only a power-cycle
+  // restores the correct value.
+  //
+  // ALWAYS print this row — even before the m68k HELLO has landed —
+  // so the row layout below stays stable (the icon Y coordinates and
+  // MENU_USBCDC_ROW assume Phystop is here). refreshPhystopLine()
+  // overdraws the value once HELLO arrives (called from the main loop
+  // and from emul_onGemdriveHello).
+  uint32_t phystop = 0;
+  bool phystopMismatch = false;
+  bool phystopReady = gemdrive_getPhystop(&phystop, &phystopMismatch);
+  char phystopVal[24];
+  if (phystopReady) {
+    snprintf(phystopVal, sizeof(phystopVal), "0x%06X%s",
+             (unsigned)phystop, phystopMismatch ? " (!)" : "");
+  } else {
+    snprintf(phystopVal, sizeof(phystopVal), "(waiting...)");
+  }
+  char phystopLine[48];
+  snprintf(phystopLine, sizeof(phystopLine),
+           "\n  Phystop     : %-16s", phystopVal);
+  term_printString(phystopLine);
+
+  // Screenmem row — read-only display of XBIOS Logbase / _v_bas_ad
+  // ($44E) at HELLO time. Same always-paint pattern as Phystop so
+  // the icon Y-tops + MENU_USBCDC_ROW below stay correct;
+  // refreshScreenmemLine() overdraws once HELLO arrives.
+  uint32_t screenmem = 0;
+  bool screenmemReady = gemdrive_getScreenmem(&screenmem);
+  char screenmemVal[24];
+  if (screenmemReady) {
+    snprintf(screenmemVal, sizeof(screenmemVal), "0x%06X",
+             (unsigned)screenmem);
+  } else {
+    snprintf(screenmemVal, sizeof(screenmemVal), "(waiting...)");
+  }
+  char screenmemLine[48];
+  snprintf(screenmemLine, sizeof(screenmemLine),
+           "\n  Screenmem   : %-16s", screenmemVal);
+  term_printString(screenmemLine);
+
   term_printString("\n\n");
 
-  // Advanced Runner hook vector — Epic 04 / S4. Toggleable via [V].
-  // Epic 06 / S3: lifted out of the GEMDRIVE block onto its own
+  // Advanced Runner hook vector — Toggleable via [V].
+  // lifted out of the GEMDRIVE block onto its own
   // top-level row so the menu reads as three distinct config groups
   // (GEMDRIVE / Adv Vector / API Endpoint) rather than a wall of
   // GEMDRIVE-prefixed sub-items.
@@ -1080,7 +1196,7 @@ static void __not_in_flash_func(menu)(void) {
   term_printString(advHookDisplay);
   term_printString("\n\n");
 
-  // Remote HTTP API endpoint (Epic 02). Show the leased IP and the
+  // Remote HTTP API endpoint. Show the leased IP and the
   // mDNS hostname so the user can hit it from a PC without guessing.
   ip_addr_t apiIp = network_getCurrentIp();
   SettingsConfigEntry *hostnameEntry =
@@ -1104,7 +1220,7 @@ static void __not_in_flash_func(menu)(void) {
   term_printString("\n");
   term_printString(ipLine);
 
-  // Epic 06 / S4: USB CDC connection status. Painted at a fixed
+  // USB CDC connection status. Painted at a fixed
   // row so refreshUsbCdcLine() (called from the main loop) can
   // overdraw the status text in place when the host attaches /
   // detaches without rebuilding the rest of the menu.
@@ -1118,12 +1234,12 @@ static void __not_in_flash_func(menu)(void) {
   term_printString(usbAttached ? "connected   " : "disconnected");
 
   vt52Cursor(TERM_SCREEN_SIZE_Y - 2, 0);
-  term_printString("[E]xit (launch)  r[U]nner  [X] Booster");
+  term_printString("[G]EMDRIVE  r[U]nner  [X] Booster");
 
   vt52Cursor(TERM_SCREEN_SIZE_Y - 1, 0);
   term_printString("Select an option: ");
 
-  // Epic 06 / S8 — overlay u8g2 dividers + icons AFTER all term
+  // overlay u8g2 dividers + icons AFTER all term
   // writes are done so the term renderer doesn't clobber them.
   // Frames around config groups are NOT drawn here because
   // vertical borders would slice through character columns and
@@ -1137,7 +1253,7 @@ static void __not_in_flash_func(menu)(void) {
 
 static void __not_in_flash_func(showCounter)(int cdown) {
   if (cdown > 0) {
-    // Epic 06 / S8 — animated progress bar on the bottom strip
+    // animated progress bar on the bottom strip
     // instead of plain text. Visual + textual at once.
     drawCountdownBar(cdown, BOOT_COUNTDOWN_SECONDS);
   } else {
@@ -1148,47 +1264,26 @@ static void __not_in_flash_func(showCounter)(int cdown) {
 
 // --- Command handlers (single-key dispatch) ----------------------------
 
-void cmdMenu(const char *arg) {
-  (void)arg;
-  haltCountdown = true;
-  menu();
-}
-
-// [E]xit doubles as the firmware-launch shortcut now: per the user's
-// directive, leaving the menu drops straight into GEMDRIVE on the Atari ST
-// (same path as [F]).
-void cmdExit(const char *arg) {
+// [G]EMDRIVE — drops straight into GEMDRIVE-only on the Atari ST
+// without activating the Runner control surface.
+void cmdGemdrive(const char *arg) {
   (void)arg;
   haltCountdown = true;
   menuScreenActive = false;
   showTitle();
   term_printString("\n\n");
   term_printString("Launching DevOps on the Atari ST...\n");
-  // Epic 05 v2 — commit firmware mode (debug-byte filter starts
+  // commit firmware mode (debug-byte filter starts
   // accepting captures from this point on).
   emul_enterFirmwareMode();
   SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START);
 }
 
-void cmdFirmware(const char *arg) {
-  (void)arg;
-  haltCountdown = true;
-  menuScreenActive = false;
-  term_printString("Launching DevOps on the Atari ST...\n");
-  // Epic 05 v2 — commit firmware mode. This site also covers the
-  // boot-countdown auto-launch path, which calls cmdFirmware when
-  // the timer hits zero.
-  emul_enterFirmwareMode();
-  // CMD_START is the cartridge sentinel that GEMDRIVE polls during
-  // pre_auto; receiving it makes the m68k jump into the GEMDRIVE blob.
-  SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START);
-}
-
-// [U] launches Runner mode (Epic 03). Same shape as cmdFirmware but
-// sends DISPLAY_COMMAND_START_RUNNER, which the m68k's check_commands
-// dispatch maps to runner_function (jmp RUNNER_BLOB). GEMDRIVE has
-// already been installed by pre_auto's gemdrive_init — the Runner
-// runs alongside it, in foreground.
+// [U] launches Runner mode. Same shape as cmdGemdrive but sends
+// DISPLAY_COMMAND_START_RUNNER, which the m68k's check_commands
+// dispatch maps to runner_function (jmp RUNNER_BLOB). GEMDRIVE
+// gets installed inline by gemdrive_install (deferred from boot)
+// — the Runner runs alongside it, in foreground.
 void cmdRunner(const char *arg) {
   (void)arg;
   haltCountdown = true;
@@ -1200,7 +1295,7 @@ void cmdRunner(const char *arg) {
   // "active": true even though the m68k Runner can't write a
   // handshake into the read-only cartridge area.
   runnerActive = true;
-  // Epic 05 v2 — commit firmware mode (enables the debug-byte
+  // commit firmware mode (enables the debug-byte
   // capture filter for the rest of the session).
   emul_enterFirmwareMode();
   SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START_RUNNER);
@@ -1310,7 +1405,7 @@ void cmdGemdriveRelocAddr(const char *arg) {
     showTitle();
     term_printString("\n\n");
     term_printString("Enter the relocation address (hex 0x...):\n");
-    term_printString("Use 0 or empty for auto (screen-8KB).\n\n> ");
+    term_printString("Use 0 or empty for auto (screen-16KB).\n\n> ");
     term_setCommandLevel(TERM_COMMAND_LEVEL_DATA_INPUT);
     return;
   }
@@ -1370,7 +1465,7 @@ void cmdGemdriveMemtop(const char *arg) {
   menu();
 }
 
-// Advanced Runner hook-vector toggle (Epic 04 / S4). Single keypress
+// Advanced Runner hook-vector toggle. Single keypress
 // cycles between "vbl" and "etv_timer" — no data-input flow because
 // only two values are valid. Effective on the next ST cold reset
 // (the m68k reads slot 16 once at runner_post_reloc); the menu
@@ -1392,76 +1487,11 @@ void cmdAdvHookVector(const char *arg) {
   menu();
 }
 
-// Hidden command list — switches the term to line-based COMMAND_INPUT so
-// the user can type 'print', 'save', 'get key', etc.
-void cmdHiddenSettings(const char *arg) {
-  (void)arg;
-  haltCountdown = true;
-  menuScreenActive = false;
-  showTitle();
-  term_printString(
-      "\n\n"
-      "Available settings commands:\n"
-      "  print   - Show settings\n"
-      "  save    - Save settings\n"
-      "  erase   - Erase settings\n"
-      "  get     - Get setting (requires key)\n"
-      "  put_int - Set integer (key and value)\n"
-      "  put_bool- Set boolean (key and value)\n"
-      "  put_str - Set string (key and value)\n\n"
-      "Enter command. Type 'm' to return > ");
-  term_setCommandLevel(TERM_COMMAND_LEVEL_COMMAND_INPUT);
-}
-
-void cmdPrint(const char *arg) {
-  haltCountdown = true;
-  menuScreenActive = false;
-  term_cmdPrint(arg);
-}
-
-void cmdSave(const char *arg) {
-  haltCountdown = true;
-  menuScreenActive = false;
-  term_cmdSave(arg);
-  // Cartridge-side state (GEMDRIVE relocation, _memtop patch, etc.) is
-  // applied by gemdrive_init at CA_INIT time, so a saved aconfig change
-  // is invisible until the m68k re-runs CA_INIT. Issue an automatic ST
-  // reset so the change takes effect immediately.
-  term_printString("Resetting Atari ST to apply changes...\n");
-  display_refresh();
-  sleep_ms(300);
-  SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_RESET);
-}
-
-void cmdErase(const char *arg) {
-  haltCountdown = true;
-  menuScreenActive = false;
-  term_cmdErase(arg);
-}
-
-void cmdGet(const char *arg) {
-  haltCountdown = true;
-  menuScreenActive = false;
-  term_cmdGet(arg);
-}
-
-void cmdPutInt(const char *arg) {
-  haltCountdown = true;
-  menuScreenActive = false;
-  term_cmdPutInt(arg);
-}
-
-void cmdPutBool(const char *arg) {
-  haltCountdown = true;
-  menuScreenActive = false;
-  term_cmdPutBool(arg);
-}
-
-void cmdPutString(const char *arg) {
-  haltCountdown = true;
-  menuScreenActive = false;
-  term_cmdPutString(arg);
-}
+// (Hidden settings sub-menu and raw aconfig poke verbs were retired
+// to avoid silent flash-mutation footguns from terminal-noise input.
+// The settings persistence path is still in place — it just isn't
+// reachable from the menu prompt anymore. Edit aconfig directly via
+// the Booster app if you need to override defaults.)
 
 // This section contains the functions that are called from the main loop
 
@@ -1536,7 +1566,7 @@ static void init(void) {
 }
 
 void emul_start() {
-  // Bring up the USB CDC sink for the debugcap ring (Epic 05 v2 / S5).
+  // Bring up the USB CDC sink for the debugcap ring.
   // Idempotent stdio_init_all + detaches stdio from CDC so DPRINTF
   // stays UART-only and the CDC interface is the dedicated raw-byte
   // channel for captured debug bytes.
@@ -1620,7 +1650,7 @@ void emul_start() {
   // CMD_GEMDRIVE_HELLO from CA_INIT (bit 27, after GEMDOS init), which
   // happens once the ST is powered on. The callback computes the
   // effective relocation address / _memtop value from aconfig overrides
-  // (or screen_base - 8 KB by default) and publishes them via shared
+  // (or screen_base - 16 KB by default) and publishes them via shared
   // variables before send_sync's random-token ack returns to the m68k.
   gemdrive_init();
 
@@ -1743,7 +1773,7 @@ void emul_start() {
         }
         network_setPollingCallback(NULL);
 
-        // Remote HTTP Management API (Epic 02). Started right after
+        // Remote HTTP Management API. Started right after
         // Wi-Fi association so it's reachable from the menu phase.
         // Earlier builds deferred this to firmware launch because of
         // an ST-side crash; that turned out to be RAM pressure (the
@@ -1759,8 +1789,16 @@ void emul_start() {
     }
   }
 
-  // 7. Configure the SELECT button so menu status can show it immediately.
+  // 7. Configure the SELECT button and register the reset callbacks.
+  //    Short press → reset_device. Long press (≥ SELECT_LONG_RESET ms)
+  //    → reset_deviceAndEraseFlash. Edge detection + debounce + long-
+  //    press timing run in the foreground via select_checkPushReset(),
+  //    polled from the main loop below — Core 1 stays idle here, since
+  //    launching it interferes with the cyw43_arch_wait_for_work_until
+  //    poll the main loop relies on for Wi-Fi service.
   select_configure();
+  select_setResetCallback(reset_device);
+  select_setLongResetCallback(reset_deviceAndEraseFlash);
 
   // 8. Now complete the terminal emulator initialization
   // The terminal emulator is used to interact with the user to configure the
@@ -1789,10 +1827,16 @@ void emul_start() {
     // Drain the ROM3 command ring → dispatch to registered callbacks.
     chandler_loop();
 
-    // Pump pending debug bytes out the USB CDC interface
-    // (Epic 05 v2 / S5). Cheap when no host is attached or the
-    // debugcap ring is empty.
+    // Pump pending debug bytes out the USB CDC interface.
+    // Cheap when no host is attached or the debugcap ring is empty.
     usbcdc_drain();
+
+    // Foreground SELECT-button poll. Edge-debounces in 30 ms windows
+    // only at press / release transitions; while the button is held or
+    // released-steady this returns immediately, so it doesn't impact
+    // the main-loop cadence. Short press fires reset_device; long
+    // press (≥ SELECT_LONG_RESET ms) fires reset_deviceAndEraseFlash.
+    select_checkPushReset();
 
     // Run the terminal foreground (consume the published command, render
     // output, etc.).
@@ -1834,7 +1878,7 @@ void emul_start() {
     // showCounter is only called inside the decrement branch below.
     static bool lastHaltState = false;
     if (haltCountdown && !lastHaltState) {
-      drawSetupInfoLine("Countdown stopped. Press [E], [U] or [X] to continue.");
+      drawSetupInfoLine("Countdown stopped. Press [G], [U] or [X] to continue.");
       display_refresh();
     }
     lastHaltState = haltCountdown;
@@ -1849,19 +1893,21 @@ void emul_start() {
         if (countdown <= 0) {
           haltCountdown = true;
           // Autoboot expired — launch DevOps Runner on the Atari ST. Same
-          // path as pressing [U] (Epic 06 / S2). Runner is the more useful
-          // default: it includes the [F]/[E] GEMDRIVE behaviour AND the
+          // path as pressing [U]. Runner is the more useful default:
+          // it includes the [G] GEMDRIVE behaviour AND the
           // workstation-driven Runner control surface.
           cmdRunner(NULL);
         }
       }
     }
 
-    // Epic 06 / S4: live-refresh the USB CDC status line on the
+    // live-refresh the USB CDC status line on the
     // menu (independent of countdown halt state — the user should
     // see the plug/unplug transition whether they've stopped the
     // counter or not).
     refreshUsbCdcLine();
+    refreshPhystopLine();
+    refreshScreenmemLine();
   }
 
   // 10. Send RESET computer command

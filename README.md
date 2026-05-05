@@ -81,13 +81,28 @@ seconds. From there you have four top-level commands:
 | Key | Action |
 | --- | --- |
 | `[U]` | **Runner mode** (recommended). GEMDRIVE comes up, plus the Runner control surface for `runner run` / `load` / `exec` / etc. |
-| `[E]` or `[F]` | Same as `[U]` for GEMDRIVE-only purposes — ST drops straight into the emulated drive — but does **not** activate the Runner. Use this if you only want file emulation and don't need the workstation to drive the ST. |
+| `[G]` | GEMDRIVE-only — ST drops straight into the emulated drive but does **not** activate the Runner. Use this if you only want file emulation and don't need the workstation to drive the ST. |
 | `[X]` | Return to the Booster menu (e.g. to install another app). |
 | any key | Halt the auto-launch countdown so the menu stays up indefinitely while you read it. |
 
 If you don't press anything within ~20 s, the firmware **auto-fires
 [U]Runner** — Runner is the more useful default for unattended
 boots.
+
+### SELECT button — Pico-side reset / factory-reset
+
+The cartridge's physical **SELECT** button is wired so a press
+on the Pico itself can recover the device without needing the
+ST's keyboard:
+
+| Press | Action |
+| --- | --- |
+| Short tap (< 10 s) | **Soft reset** of the Pico. The cartridge boots back into the setup menu. The ST's TOS state is unaffected, but on the next ST cold reset the firmware re-handshakes from scratch. |
+| Long press (≥ 10 s, hold steady) | **Factory reset.** The Pico erases its flash-stored aconfig (drive letter, reloc address, hook vector, etc.) and reboots. Use this if a setting got the device into a state where the menu won't come up — power-cycle the ST afterwards so it sees the cleared cartridge. |
+
+The button is the canonical recovery path for any banner the
+firmware shows on the ST screen (e.g. the `Reloc/stack
+overlap` warning described below).
 
 ## ⚙️ Setup menu screen
 
@@ -100,8 +115,10 @@ DevOps Microfirmware - vX.Y.Z              ← title bar (inverted)
 GEMDRIVE                                   💾
   F[o]lder    : /devops
   [D]rive     : C:
-  [R]eloc addr: auto (screen-8KB)
+  [R]eloc addr: auto (screen-16KB)
   Mem[t]op    : auto (matches reloc)
+  Phystop     : 0x100000
+  Screenmem   : 0x078000
 
 Adv [V]ector                               ⚙
   Hook        : vbl ($70)
@@ -113,19 +130,19 @@ API Endpoint                               📶
 USB CDC (Debug serial)                     💡
   Status      : connected
 
-[E]xit (launch)  r[U]nner  [X] Booster
+[G]EMDRIVE  r[U]nner  [X] Booster
 Select an option: ▌
 [████████░░░░░░░░░░] Booting in 12 s — any key halts
 ```
 
 | Section | What it shows | Keys |
 | --- | --- | --- |
-| **GEMDRIVE** | Which microSD folder is mounted as the emulated drive, the drive letter assigned to it, the GEMDRIVE relocation address (`auto` = `screen_base − 8 KB`), and the patched `_memtop` value. The hard-drive icon appears whenever the section is live. | `[o]` change folder, `[d]` change drive letter, `[r]` change reloc addr, `[t]` change `_memtop`. |
+| **GEMDRIVE** | Which microSD folder is mounted as the emulated drive, the drive letter assigned to it, the GEMDRIVE relocation address (`auto` = `screen_base − 16 KB`), the patched `_memtop` value, the read-only `_phystop` value (`$42E`) the ST reports, and the read-only screen-memory base (`_v_bas_ad`, `$44E`). A `(!)` marker on the Phystop line means TOS' phystop disagrees with the silicon's MMU bank-config — a reset-resistant program lowered phystop and survived warm reset; **only a power-cycle restores it**. The hard-drive icon appears whenever the section is live. | `[o]` change folder, `[d]` change drive letter, `[r]` change reloc addr, `[t]` change `_memtop`. (Phystop and Screenmem are read-only.) |
 | **Adv [V]ector** | Which interrupt vector the Advanced Runner installs its hook into — `vbl ($70)` or `etv_timer ($400)`. See *Picking a hook vector* below for the trade-off. The cog icon appears whenever the section is live. | `[V]` toggle between `vbl` / `etv_timer`. |
 | **API Endpoint** | mDNS hostname and the IP DHCP leased. The Wi-Fi icon appears once the network is up; if there's no IP yet (Wi-Fi still associating) the icon is hidden. | (read-only) |
 | **USB CDC (Debug serial)** | `connected` / `disconnected` — live-refreshed as you plug or unplug a USB cable into the Pico. The lightbulb icon flips in lock-step. | (read-only) |
-| **Bottom navigation strip** | Top-level command keys + a one-character prompt area for typing them. | `[E]` / `[U]` / `[X]` (and `[F]` does the same as `[E]`). |
-| **Animated countdown bar** | Shrinking white bar; the message "Booting in N s — any key halts" is overlaid in inverted colour so it stays readable both halves. Becomes "Countdown stopped. Press [E], [U] or [X] to continue." once any key has been pressed. | (passive — but pressing any key halts the countdown) |
+| **Bottom navigation strip** | Top-level command keys + a one-character prompt area for typing them. | `[G]` / `[U]` / `[X]`. |
+| **Animated countdown bar** | Shrinking white bar; the message "Booting in N s — any key halts" is overlaid in inverted colour so it stays readable both halves. Becomes "Countdown stopped. Press [G], [U] or [X] to continue." once any key has been pressed. | (passive — but pressing any key halts the countdown) |
 
 ### Picking a hook vector
 
@@ -175,6 +192,38 @@ vector (they don't need to patch a return address — they just
 need the ISR to fire periodically). `runner adv jump` and
 `runner adv load` need `vbl ($70)` specifically, which is why
 that's the default.
+
+### Stability banners
+
+The cartridge runs two safety checks before relocating its
+on-ST resident code into RAM. Both fail loudly on the ST
+screen rather than corrupting silently, and both recover via
+the SELECT button or a power-cycle.
+
+- **`Reloc/stack overlap.`** — fired by the m68k-side blob
+  installer when the chosen reloc destination would land on
+  or near the live supervisor stack. The blobs occupy the
+  16 KB region `[screen_base − 16 KB, screen_base)`; if the
+  TOS supervisor stack is currently inside that range, the
+  installer halts in place with the message:
+  ```
+  Reloc/stack overlap.
+  Raise [R] in setup menu, reset.
+  ```
+  Recovery: hit SELECT (Pico reboots into the menu),
+  bump `[R]` to a higher address, reboot. If you can't reach
+  the menu — long-press SELECT for ≥ 10 s to factory-reset.
+
+- **`Phystop : 0xXXXXXX (!)`** in the setup menu's GEMDRIVE
+  block — fired when TOS' `_phystop` (`$42E`) disagrees with
+  the silicon's MMU bank-config nibble at `$FFFF8001`. This
+  almost always means a reset-resistant program lowered
+  `_phystop` and survived the last warm reset; only a full
+  ST power-cycle restores the correct value. The cartridge
+  doesn't try to "fix" `_phystop` itself (post-boot mutation
+  doesn't actually resize hardware RAM, it confuses TOS'
+  Malloc accounting); the marker just makes the situation
+  visible so you know to reach for the power switch.
 
 ## 🌐 Remote HTTP Management API + the `sidecart.py` CLI
 
@@ -788,7 +837,7 @@ discarded.
 >    firmware auto-commits Runner mode. When you subsequently
 >    power the ST, it sees the cartridge already in Runner
 >    state and skips the menu — you never get a chance to
->    press `[U]` / `[E]` / `[F]`.
+>    press `[U]` / `[G]`.
 > 2. Any Runner state the Pico accumulated before the ST booted
 >    (a previously-loaded program, a stale cwd, etc.) survives
 >    into the new ST session — the Pico has no way to detect
@@ -880,7 +929,7 @@ usbcdc_dropped : 0
 ```
 
 `firmware_mode` flips to `yes` once the user has committed a
-mode at the menu (`[U]` / `[E]` / `[F]`) — the capture is
+mode at the menu (`[U]` / `[G]`) — the capture is
 gated on this so menu activity never pollutes the stream.
 `ring used / capacity` is the snapshot fill of the in-RAM
 debug ring at the moment of the request. `bytes_dropped` and

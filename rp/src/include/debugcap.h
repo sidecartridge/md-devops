@@ -3,7 +3,7 @@
  * Author: Diego Parrilla Santamaría
  * Date: May 2026
  * Copyright: 2026 - GOODDATA LABS SL
- * Description: Fast debug-byte capture (Epic 05 v2) — public API.
+ * Description: Fast debug-byte capture — public API.
  *
  * Debug-byte ABI (m68k side, public): any read in the 256-byte
  * window $FBFF00..$FBFFFF latches the byte (A7..A0 of the
@@ -22,7 +22,7 @@
  * Pre-firmware-mode emits are dropped at the handler so menu-mode
  * activity doesn't pollute the diagnostic stream.
  *
- * Multi-consumer model (Epic 05 v2 / S4): the producer always
+ * Multi-consumer model: the producer always
  * writes to the ring; consumers each keep their own
  * (read_pos, dropped) cursor and drain independently. A consumer
  * that lags by more than DEBUGCAP_RING_BYTES jumps its read_pos
@@ -111,7 +111,7 @@ void debugcap_cursor_skipToNow(debugcap_cursor_t *cur);
  *        (HTTP poll context + main-loop USB drain). No memory
  *        barriers are issued on producer/consumer hand-off. If
  *        a future change moves any consumer to Core 1 (see the
- *        "full Core 1 worker" backlog entry on Epic 05), the
+ *        "full Core 1 worker" backlog entry on), the
  *        store-then-increment in `debugcap_emit` and the
  *        `g_debugWritePos` reads in `debugcap_cursor_*` will
  *        need explicit barriers to preserve ordering.

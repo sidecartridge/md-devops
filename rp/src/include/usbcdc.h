@@ -3,7 +3,7 @@
  * Author: Diego Parrilla Santamaría
  * Date: May 2026
  * Copyright: 2026 - GOODDATA LABS SL
- * Description: Epic 05 — USB CDC sink for the debugcap ring.
+ * Description: USB CDC sink for the debugcap ring.
  *
  *              Reuses the pico-sdk's `pico_stdio_usb` plumbing to
  *              bring up TinyUSB + a single CDC interface (the
@@ -60,7 +60,7 @@ void usbcdc_drain(void);
  *        iff a host has the CDC port open with DTR asserted.
  *
  *        Cumulative since boot — includes disconnect-window
- *        loss (S7 folds the unread lag into `dropped` on every
+ *        loss (the unread lag is folded into `dropped` on every
  *        host (re)attach, so bursts that arrived while no one
  *        was listening are still counted) and any in-session
  *        drops where the host's TX FIFO stalled long enough
