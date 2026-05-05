@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Epic 05 / S4 — hello-debug.tos build wrapper.
+# — hello-debug.tos build wrapper.
 #
 # Mirrors target/atarist/build.sh's pattern: invoke `make` inside
 # stcmd's docker so vasm/vlink come from the same image the main

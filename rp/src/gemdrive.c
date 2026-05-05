@@ -1,6 +1,6 @@
 /**
  * File: gemdrive.c
- * Description: GEMDRIVE — Epic 01.
+ * Description: GEMDRIVE —
  *   S1: HELLO handshake.
  *   S2: SAVE_VECTORS / RESET_GEM.
  *   S3 Phase 1: drive bitmap publish, REENTRY_LOCK/UNLOCK, DFREE, DGETPATH.
@@ -624,7 +624,7 @@ static void handleSaveBasepage(uint16_t *payload) {
   DPRINTF("GEMDRIVE Pexec: basepage saved (256 bytes)\n");
 }
 
-// ---- S4 write-side handlers (direct ports of md-drives-emulator) ----
+// ---- Write-side handlers (direct ports of md-drives-emulator) ----
 
 static void handleDcreateCall(uint16_t *payload) {
   TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d3
@@ -908,7 +908,7 @@ static void handleFopenCall(uint16_t *payload) {
   char sdPath[384] = {0};
   getLocalFullPathname(atariPath, sdPath, sizeof(sdPath));
 
-  // S4: honour the GEMDOS open mode now that Fwrite is wired up.
+  // honour the GEMDOS open mode now that Fwrite is wired up.
   // 0 = read, 1 = write, 2 = read+write.
   BYTE faMode = FA_READ;
   switch (mode & 0xFFFF) {
@@ -1422,5 +1422,5 @@ void gemdrive_init(void) {
   for (int i = 0; i < GEMDRIVE_MAX_OPEN_FILES; i++) fileTable[i].inUse = false;
   for (int i = 0; i < GEMDRIVE_MAX_DTAS; i++) dtaTable[i].inUse = false;
   chandler_addCB(gemdrive_command_cb);
-  DPRINTF("GEMDRIVE callback registered (S3 phase 2).\n");
+  DPRINTF("GEMDRIVE callback registered.\n");
 }

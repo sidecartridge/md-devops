@@ -39,7 +39,7 @@
 #include "term.h"
 #include "usbcdc.h"
 
-// Main-loop tick (Epic 05 v2 / S9). Drives chandler_loop +
+// Main-loop tick. Drives chandler_loop +
 // usbcdc_drain at ~100 Hz so chandler can drain the 4096-sample
 // commemul ring (~4 ms wrap at full m68k emit rate) with 10×
 // headroom, and so CDC bytes appear on the workstation with
@@ -47,7 +47,7 @@
 // territory; higher and we re-introduce the visibility / drop
 // problems that motivated the optimization stories. The full
 // Core 1 worker plan (chandler + tud_task + usbcdc_drain on a
-// dedicated core) is parked in the Epic 05 backlog — escalate
+// dedicated core) is parked in the backlog — escalate
 // there only if 100 Hz proves insufficient.
 #define SLEEP_LOOP_MS 10
 
@@ -87,7 +87,7 @@ static const size_t numCommands = sizeof(commands) / sizeof(commands[0]);
 static bool keepActive = true;
 static bool menuScreenActive = false;
 
-// Epic 06 / S4: cached "USB CDC attached" state from the last
+// cached "USB CDC attached" state from the last
 // menu paint. -1 means "not yet rendered this menu session";
 // any 0/1 transition triggers refreshUsbCdcLine() to overdraw
 // the status line in place. Lives at module scope because both
@@ -133,7 +133,7 @@ static int32_t runnerLastResErrno = 0;
 static runner_meminfo_t runnerMeminfo = {0};
 static bool runnerMeminfoHasSnapshot = false;
 static bool runnerMeminfoPending = false;
-// Epic 06 / S5+S6 — Pexec(3)/(4) load+exec split state. The
+// Pexec(3)/(4) load+exec split state. The
 // m68k Runner's RUNNER_CMD_LOAD handler (Pexec mode 3) returns a
 // basepage pointer in the DONE_LOAD payload; we cache it here so
 // a subsequent RUNNER_CMD_EXEC fires Pexec(4) on the right
@@ -146,13 +146,13 @@ static bool runnerMeminfoPending = false;
 static int32_t runnerPendingBasepage = 0;
 static bool runnerLoadHasErrno = false;
 static int32_t runnerLoadErrno = 0;
-// Epic 04 — Advanced Runner installation flag, set by the m68k's
+// Advanced Runner installation flag, set by the m68k's
 // HELLO payload byte after runner_post_reloc installs its VBL hook.
 static bool runnerAdvancedInstalled = false;
-// S4 — active hook vector ID reported by the m68k in the HELLO
+// active hook vector ID reported by the m68k in the HELLO
 // payload. Default UNKNOWN until HELLO arrives.
 static uint8_t runnerAdvHookVector = RUNNER_HOOK_VECTOR_UNKNOWN;
-// S8 — Advanced load chunk-ack flag. Set by the chandler when a
+// Advanced load chunk-ack flag. Set by the chandler when a
 // RUNNER_ADV_CMD_DONE_LOAD_CHUNK arrives, cleared by the streamer
 // before firing each chunk.
 static bool runnerAdvLoadAcked = false;
@@ -222,7 +222,7 @@ void emul_recordRunnerExecuteDone(int32_t exit_code, uint32_t now_ms) {
   runnerBusy = false;
 }
 
-// Epic 06 / S5+S6 — Pexec(3) load + Pexec(4) exec.
+// Pexec(3) load + Pexec(4) exec.
 void emul_recordRunnerLoadSubmit(const char *path, uint32_t now_ms) {
   runnerLastCommand = RUNNER_LAST_PEXEC_LOAD;
   runnerLastStartedMs = now_ms;
@@ -275,11 +275,11 @@ void emul_recordRunnerExecDone(int32_t exit_code, uint32_t now_ms) {
   runnerBusy = false;
   // Pexec(4) (PE_GO) does NOT free the basepage — it stays
   // allocated in m68k RAM and re-exec on the same basepage is
-  // valid. The runner unload command (Epic 06 / S7) is what
+  // valid. The runner unload command is what
   // explicitly Mfrees the memory and clears pendingBasepage.
 }
 
-// Epic 06 / S7 — runner unload (GEMDOS Mfree).
+// runner unload (GEMDOS Mfree).
 void emul_recordRunnerUnloadSubmit(uint32_t now_ms) {
   runnerLastCommand = RUNNER_LAST_PEXEC_UNLOAD;
   runnerLastStartedMs = now_ms;
@@ -480,7 +480,7 @@ void emul_scheduleRunnerRelaunch(uint32_t at_ms) {
   runnerRelaunchAtMs = at_ms;
 }
 
-// Epic 05 v2 — firmware-mode flag.
+// firmware-mode flag.
 //
 // One-way: only a hardware reset clears it. Used by the chandler
 // ingest filter (chandler.c) to gate debug-byte capture: pre-menu
@@ -503,8 +503,7 @@ bool emul_isFirmwareMode(void) {
 }
 
 // Boot countdown — auto-launches Runner mode on the Atari ST when it hits 0
-// (Epic 06 / S2: switched from GEMDRIVE-only to Runner; the GEMDRIVE blob is
-// still installed because Runner runs on top of it).
+// (the GEMDRIVE blob is still installed because Runner runs on top of it).
 // Mirrors md-drives-emulator's behavior. Any key press halts it.
 #define BOOT_COUNTDOWN_SECONDS 20
 static int countdown = BOOT_COUNTDOWN_SECONDS;
@@ -597,7 +596,7 @@ static void refreshSetupInfoLine(void) {
   }
 }
 
-// Epic 06 / S8 — u8g2 menu polish (Tier 1). Thin horizontal
+// u8g2 menu polish (Tier 1). Thin horizontal
 // dividers between the menu's config groups. Drawn in the gap
 // row above each section header (term row 7 = y=56, row 10 =
 // y=80, row 14 = y=112) so they don't overlap any character
@@ -614,7 +613,7 @@ static void drawMenuDividers(void) {
   u8g2_DrawHLine(ref, 0, 116, DISPLAY_WIDTH);
 }
 
-// Epic 06 / S8 — status icons via u8g2_font_open_iconic_embedded_1x_t.
+// status icons via u8g2_font_open_iconic_embedded_1x_t.
 // Right-aligned at the section-header rows. Codepoints from the
 // 17-glyph open-iconic-embedded subset (verified via the u8g2
 // upstream BDF):
@@ -687,7 +686,7 @@ static void drawMenuStatusIcons(void) {
                MENU_ICON_GLYPH_LIGHTBULB, usb_attached);
 }
 
-// Epic 06 / S8 — animated countdown progress bar. Replaces the
+// animated countdown progress bar. Replaces the
 // "Boot will continue in N seconds..." text strip with a filled
 // box that shrinks from full-width to zero as the countdown
 // elapses. Text is rendered once over the filled (white) half
@@ -746,7 +745,7 @@ static void drawCountdownBar(int sec_left, int sec_total) {
   u8g2_SetFont(ref, u8g2_font_amstrad_cpc_extended_8f);
 }
 
-// Epic 06 / S4. Polled from the main loop while the menu screen
+// Polled from the main loop while the menu screen
 // is up; on a state transition (host plugged in / unplugged) it
 // overdraws just the USB CDC status line at MENU_USBCDC_ROW + 1
 // rather than rebuilding the whole menu. Both display strings
@@ -762,7 +761,7 @@ static void refreshUsbCdcLine(void) {
   vt52Cursor(MENU_USBCDC_ROW + 1, 0);
   term_printString("  Status      : ");
   term_printString(attached ? "connected   " : "disconnected");
-  // Epic 06 / S8 — flip the lightbulb ("active") icon at the
+  // flip the lightbulb ("active") icon at the
   // USB CDC header in lock-step with the status text.
   drawIconCell(MENU_ICON_X, MENU_ICON_USB_YTOP,
                MENU_ICON_GLYPH_LIGHTBULB, attached);
@@ -1043,8 +1042,8 @@ static void __not_in_flash_func(menu)(void) {
 
   term_printString("\n\n");
 
-  // Advanced Runner hook vector — Epic 04 / S4. Toggleable via [V].
-  // Epic 06 / S3: lifted out of the GEMDRIVE block onto its own
+  // Advanced Runner hook vector — Toggleable via [V].
+  // lifted out of the GEMDRIVE block onto its own
   // top-level row so the menu reads as three distinct config groups
   // (GEMDRIVE / Adv Vector / API Endpoint) rather than a wall of
   // GEMDRIVE-prefixed sub-items.
@@ -1062,7 +1061,7 @@ static void __not_in_flash_func(menu)(void) {
   term_printString(advHookDisplay);
   term_printString("\n\n");
 
-  // Remote HTTP API endpoint (Epic 02). Show the leased IP and the
+  // Remote HTTP API endpoint. Show the leased IP and the
   // mDNS hostname so the user can hit it from a PC without guessing.
   ip_addr_t apiIp = network_getCurrentIp();
   SettingsConfigEntry *hostnameEntry =
@@ -1086,7 +1085,7 @@ static void __not_in_flash_func(menu)(void) {
   term_printString("\n");
   term_printString(ipLine);
 
-  // Epic 06 / S4: USB CDC connection status. Painted at a fixed
+  // USB CDC connection status. Painted at a fixed
   // row so refreshUsbCdcLine() (called from the main loop) can
   // overdraw the status text in place when the host attaches /
   // detaches without rebuilding the rest of the menu.
@@ -1105,7 +1104,7 @@ static void __not_in_flash_func(menu)(void) {
   vt52Cursor(TERM_SCREEN_SIZE_Y - 1, 0);
   term_printString("Select an option: ");
 
-  // Epic 06 / S8 — overlay u8g2 dividers + icons AFTER all term
+  // overlay u8g2 dividers + icons AFTER all term
   // writes are done so the term renderer doesn't clobber them.
   // Frames around config groups are NOT drawn here because
   // vertical borders would slice through character columns and
@@ -1119,7 +1118,7 @@ static void __not_in_flash_func(menu)(void) {
 
 static void __not_in_flash_func(showCounter)(int cdown) {
   if (cdown > 0) {
-    // Epic 06 / S8 — animated progress bar on the bottom strip
+    // animated progress bar on the bottom strip
     // instead of plain text. Visual + textual at once.
     drawCountdownBar(cdown, BOOT_COUNTDOWN_SECONDS);
   } else {
@@ -1139,7 +1138,7 @@ void cmdGemdrive(const char *arg) {
   showTitle();
   term_printString("\n\n");
   term_printString("Launching DevOps on the Atari ST...\n");
-  // Epic 05 v2 — commit firmware mode (debug-byte filter starts
+  // commit firmware mode (debug-byte filter starts
   // accepting captures from this point on).
   emul_enterFirmwareMode();
   SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START);
@@ -1161,7 +1160,7 @@ void cmdRunner(const char *arg) {
   // "active": true even though the m68k Runner can't write a
   // handshake into the read-only cartridge area.
   runnerActive = true;
-  // Epic 05 v2 — commit firmware mode (enables the debug-byte
+  // commit firmware mode (enables the debug-byte
   // capture filter for the rest of the session).
   emul_enterFirmwareMode();
   SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START_RUNNER);
@@ -1331,7 +1330,7 @@ void cmdGemdriveMemtop(const char *arg) {
   menu();
 }
 
-// Advanced Runner hook-vector toggle (Epic 04 / S4). Single keypress
+// Advanced Runner hook-vector toggle. Single keypress
 // cycles between "vbl" and "etv_timer" — no data-input flow because
 // only two values are valid. Effective on the next ST cold reset
 // (the m68k reads slot 16 once at runner_post_reloc); the menu
@@ -1432,7 +1431,7 @@ static void init(void) {
 }
 
 void emul_start() {
-  // Bring up the USB CDC sink for the debugcap ring (Epic 05 v2 / S5).
+  // Bring up the USB CDC sink for the debugcap ring.
   // Idempotent stdio_init_all + detaches stdio from CDC so DPRINTF
   // stays UART-only and the CDC interface is the dedicated raw-byte
   // channel for captured debug bytes.
@@ -1639,7 +1638,7 @@ void emul_start() {
         }
         network_setPollingCallback(NULL);
 
-        // Remote HTTP Management API (Epic 02). Started right after
+        // Remote HTTP Management API. Started right after
         // Wi-Fi association so it's reachable from the menu phase.
         // Earlier builds deferred this to firmware launch because of
         // an ST-side crash; that turned out to be RAM pressure (the
@@ -1693,9 +1692,8 @@ void emul_start() {
     // Drain the ROM3 command ring → dispatch to registered callbacks.
     chandler_loop();
 
-    // Pump pending debug bytes out the USB CDC interface
-    // (Epic 05 v2 / S5). Cheap when no host is attached or the
-    // debugcap ring is empty.
+    // Pump pending debug bytes out the USB CDC interface.
+    // Cheap when no host is attached or the debugcap ring is empty.
     usbcdc_drain();
 
     // Foreground SELECT-button poll. Edge-debounces in 30 ms windows
@@ -1768,7 +1766,7 @@ void emul_start() {
       }
     }
 
-    // Epic 06 / S4: live-refresh the USB CDC status line on the
+    // live-refresh the USB CDC status line on the
     // menu (independent of countdown halt state — the user should
     // see the plug/unplug transition whether they've stopped the
     // counter or not).

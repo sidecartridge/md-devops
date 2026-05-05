@@ -1,7 +1,6 @@
 /**
  * File: gemdrive.h
- * Description: GEMDRIVE — Epic 01. S1 surface: relocation handshake only;
- * GEMDOS hooks land in S2+.
+ * Description: GEMDRIVE — relocation handshake + GEMDOS hooks.
  */
 
 #ifndef GEMDRIVE_H
@@ -14,8 +13,8 @@
 // m68k↔RP protocol matches once full GEMDOS hooks land.
 #define GEMDRIVE_APP 0x0400  // APP_GEMDRVEMUL — MSB of the 16-bit cmd id
 
-// CMD_GEMDRIVE_HELLO is new in this app (S1 bootstrap). $50 is unused
-// in the source's allocation table.
+// CMD_GEMDRIVE_HELLO is new in this app. $50 is unused in the
+// source's allocation table.
 #define GEMDRIVE_CMD_HELLO (0x50 + GEMDRIVE_APP)
 
 // Diagnostic: m68k sends what it observes at $436 immediately after
@@ -24,15 +23,14 @@
 #define GEMDRIVE_CMD_VERIFY_MEMTOP (0x52 + GEMDRIVE_APP)
 
 // Wire-format identical to md-drives-emulator. RESET_GEM clears any
-// per-session state held by the RP (none in S2 — placeholder for S3+).
-// SAVE_VECTORS records the previous GEMDOS handler address and the
-// blob's old_handler cell address; the RP uses both to verify the
-// install ran and (in later stories) to chain back to the original
-// handler when the RP itself simulates a GEMDOS call.
+// per-session state held by the RP. SAVE_VECTORS records the previous
+// GEMDOS handler address and the blob's old_handler cell address; the
+// RP uses both to verify the install ran and to chain back to the
+// original handler when the RP itself simulates a GEMDOS call.
 #define GEMDRIVE_CMD_RESET_GEM (0x00 + GEMDRIVE_APP)
 #define GEMDRIVE_CMD_SAVE_VECTORS (0x01 + GEMDRIVE_APP)
 
-// S3 wire format (kept identical to md-drives-emulator).
+// Wire format kept identical to md-drives-emulator.
 #define GEMDRIVE_CMD_REENTRY_LOCK (0x03 + GEMDRIVE_APP)
 #define GEMDRIVE_CMD_REENTRY_UNLOCK (0x04 + GEMDRIVE_APP)
 #define GEMDRIVE_CMD_DFREE_CALL (0x36 + GEMDRIVE_APP)
@@ -91,7 +89,7 @@
 #define GEMDRIVE_DTA_TRANSFER_OFFSET 0x10A8    // 44 bytes (DTA_SIZE)
 #define GEMDRIVE_DTA_TRANSFER_SIZE 44
 
-// S4 write-side state. All status words are signed GEMDOS error codes
+// Write-side state. All status words are signed GEMDOS error codes
 // (0 = ok, negative = error). FCREATE_HANDLE returns a new file handle
 // in the GEMDRIVE range or a negative error.
 #define GEMDRIVE_DCREATE_STATUS_OFFSET 0x10D8   // 4 bytes
@@ -104,7 +102,7 @@
 #define GEMDRIVE_WRITE_BUFFER_OFFSET 0x10F4     // 1024 bytes
 #define GEMDRIVE_WRITE_BUFFER_SIZE 1024
 
-// S5 Pexec / DTA state.
+// Pexec / DTA state.
 #define GEMDRIVE_PEXEC_MODE_OFFSET 0x14F4       // 4 bytes (mode word at +2)
 #define GEMDRIVE_PEXEC_STACK_ADDR_OFFSET 0x14F8 // 4 bytes
 #define GEMDRIVE_PEXEC_FNAME_OFFSET 0x14FC      // 4 bytes

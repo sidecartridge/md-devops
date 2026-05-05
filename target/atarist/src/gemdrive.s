@@ -136,7 +136,7 @@ GEMDRIVE_READ_BYTES		equ (APP_FREE_ADDR + $0A0)
 GEMDRIVE_READ_BUFFER		equ (APP_FREE_ADDR + $0A4)
 GEMDRIVE_DTA_F_FOUND		equ (APP_FREE_ADDR + $10A4)
 GEMDRIVE_DTA_TRANSFER		equ (APP_FREE_ADDR + $10A8)
-; --- S4 write-side state ---
+; --- Write-side state ---
 GEMDRIVE_DCREATE_STATUS		equ (APP_FREE_ADDR + $10D8)
 GEMDRIVE_DDELETE_STATUS		equ (APP_FREE_ADDR + $10DC)
 GEMDRIVE_FCREATE_HANDLE		equ (APP_FREE_ADDR + $10E0)
@@ -351,7 +351,7 @@ old_handler:
 ; the supervisor stack. Flow:
 ;   1. If reentry is locked (RP set the flag during a handler that
 ;      calls back into GEMDOS), just chain to old_handler — same
-;      behaviour as S2 pass-through.
+;      pass-through behaviour.
 ;   2. Otherwise compute a0 = address of the args frame (different
 ;      stack for user vs supervisor mode, +2 for long-frame CPUs).
 ;   3. save_regs (d1-d7/a2-a6 — preserves a0/a1/d0).

@@ -4,7 +4,7 @@
  * Date: April 2026
  * Copyright: 2026 - GOODDATA LABS SL
  * Description: Custom HTTP/1.1 server for the md-devops Remote
- *              Management API (Epic 02). Built on lwIP's raw TCP API
+ *              Management API. Built on lwIP's raw TCP API
  *              so it interleaves cleanly with the cartridge-bus poll
  *              loop on Core 0. The lwIP `httpd` app is intentionally
  *              not used — see docs/epics/02-http-api.md.

@@ -3,7 +3,7 @@
  * Author: Diego Parrilla Santamaría
  * Date: May 2026
  * Copyright: 2026 - GOODDATA LABS SL
- * Description: Fast debug-byte capture (Epic 05 v2) — small
+ * Description: Fast debug-byte capture — small
  *              multi-consumer ring + per-cursor pull API for
  *              HTTP / USB consumers.
  */

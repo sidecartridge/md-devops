@@ -32,7 +32,7 @@ static void __not_in_flash_func(runner_command_cb)(
       return;
     }
     case RUNNER_CMD_DONE_LOAD: {
-      // Epic 06 / S5. Payload is i32: >0 = basepage pointer
+      // Payload is i32: >0 = basepage pointer
       // (success), <0 = -GEMDOS errno (load failed), 0 =
       // unexpected (treat as error). The RP-side state setter
       // splits on sign and updates pendingBasepage / load errno
@@ -48,9 +48,9 @@ static void __not_in_flash_func(runner_command_cb)(
       return;
     }
     case RUNNER_CMD_DONE_EXEC: {
-      // Epic 06 / S6. Payload i32 = program exit code. The
+      // Payload i32 = program exit code. The
       // basepage stays loaded (Pexec(4) does NOT free it — that's
-      // S7's runner unload), so re-exec on the same basepage
+      // the runner unload), so re-exec on the same basepage
       // works without a fresh load.
       uint32_t raw = TPROTO_GET_PAYLOAD_PARAM32(payload);
       int32_t exit_code = (int32_t)raw;
@@ -62,7 +62,7 @@ static void __not_in_flash_func(runner_command_cb)(
       return;
     }
     case RUNNER_CMD_DONE_UNLOAD: {
-      // Epic 06 / S7. Payload i32 = GEMDOS Mfree result (0 on
+      // Payload i32 = GEMDOS Mfree result (0 on
       // success, negative GEMDOS errno on failure). The state
       // setter clears pendingBasepage on success and preserves
       // it on failure — so a follow-up `runner status` honestly
@@ -141,10 +141,10 @@ static void __not_in_flash_func(runner_command_cb)(
       return;
     }
     case RUNNER_CMD_DONE_HELLO: {
-      // d3 payload layout (Epic 04 / S1+S4):
+      // d3 payload layout:
       //   bit 0      : advanced installed
       //   bits 8..15 : hook_vector_id (0=vbl, 1=etv_timer, 0xFF=unknown)
-      // Older firmwares without S1 send HELLO with size 0; d3 reads
+      // Older firmwares without this payload send HELLO with size 0; d3 reads
       // as 0 → installed=false, hook_vector_id=0 (the default we
       // overwrite to UNKNOWN below if installed is false).
       // emul_resetRunnerSession() clears both fields, so the order

@@ -1,4 +1,4 @@
-# Epic 05 / S4 — HELLODBG.TOS test program build.
+# — HELLODBG.TOS test program build.
 #
 # Driven by the local build.sh, which wraps this Makefile inside
 # stcmd's docker so the m68k C toolchain (m68k-atari-mint-gcc +

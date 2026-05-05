@@ -106,7 +106,7 @@
 #define LWIP_SOCKET \
   0  //  Not needed. Sequential API, and therefore for platforms with OSes only.
 
-// We do not use the lwIP `httpd` app — Epic 02 ships a custom HTTP/1.1
+// We do not use the lwIP `httpd` app — ships a custom HTTP/1.1
 // server on lwIP's raw TCP API (see rp/src/http_server.c). The
 // LWIP_HTTPD_* knobs and HTTPD_FSDATA_FILE are intentionally not set.
 

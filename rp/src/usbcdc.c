@@ -3,7 +3,7 @@
  * Author: Diego Parrilla Santamaría
  * Date: May 2026
  * Copyright: 2026 - GOODDATA LABS SL
- * Description: Epic 05 v2 / S5 — USB CDC sink for the debugcap ring.
+ * Description: USB CDC sink for the debugcap ring.
  */
 
 #include "include/usbcdc.h"
@@ -76,7 +76,7 @@ void __not_in_flash_func(usbcdc_drain)(void) {
   if (avail == 0) {
     return;
   }
-  // 512 B drain batch (Epic 05 v2 / S8). Sized to absorb a single
+  // 512 B drain batch. Sized to absorb a single
   // HELLODBG-style chunk in one tud_cdc_write call; smaller than
   // CFG_TUD_CDC_TX_BUFSIZE (1024) so we don't try to push more
   // than the FIFO can hold and lose the tail.

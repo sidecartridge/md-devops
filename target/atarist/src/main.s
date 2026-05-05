@@ -98,9 +98,9 @@ CMD_START_RUNNER	equ 5		; Hand control to the Runner (runner_function)
 
 ; GEMDRIVE app namespace. Wire-format compatible with md-drives-emulator:
 ; APP_GEMDRVEMUL keeps the same value; CMD_GEMDRVEMUL_* values that exist
-; in the source (GEMDRVEMUL_RESET = 0, _SAVE_VECTORS = 1, etc.) will be
-; reused unchanged when S2 lands. CMD_GEMDRIVE_HELLO is a new S1-only
-; bootstrap command; $50 is unused in the source's allocation table.
+; in the source (GEMDRVEMUL_RESET = 0, _SAVE_VECTORS = 1, etc.) are
+; reused unchanged. CMD_GEMDRIVE_HELLO is a new bootstrap command;
+; $50 is unused in the source's allocation table.
 APP_GEMDRVEMUL			equ $0400
 CMD_GEMDRIVE_HELLO		equ ($50 + APP_GEMDRVEMUL)
 ; Diagnostic: m68k publishes the value it observes at $436 immediately
@@ -110,7 +110,7 @@ CMD_GEMDRIVE_VERIFY_MEMTOP	equ ($52 + APP_GEMDRVEMUL)
 ; Indexed shared variable slots used by GEMDRIVE. Slots 0..2 are framework
 ; (chandler.h: HARDWARE_TYPE / SVERSION / BUFFER_TYPE), 3..9 reserved for
 ; future framework use. GEMDRIVE owns 10..11; further GEMDRIVE state will
-; claim 12..15 in later stories.
+; claim 12..15.
 SHARED_VAR_GEMDRIVE_RELOC_ADDR	equ 10		; RP-published reloc address
 SHARED_VAR_GEMDRIVE_MEMTOP	equ 11		; RP-published memtop value
 

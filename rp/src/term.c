@@ -1084,14 +1084,14 @@ void term_refreshMenuLiveInfo(void) {
   term_printString(updateBuffer);
 }
 
-// (S6 retired the entire raw-settings-poke surface that used to live
+// (Retired the entire raw-settings-poke surface that used to live
 // here: term_cmdSettings (help printer), term_cmdPrint, term_cmdSave,
 // term_cmdErase, term_cmdGet, term_cmdPutInt, term_cmdPutBool,
 // term_cmdPutString, plus their static helpers term_parseKeyAndTail
 // and term_parseBoolToken. They were exclusively reachable via the
-// emul.c hidden command table that S6 dropped — pure dead code now.
-// term_cmdClear and term_cmdUnknown are still here further up because
-// they're part of generic terminal infrastructure, not the
+// emul.c hidden command table that was also dropped — pure dead code
+// now. term_cmdClear and term_cmdUnknown are still here further up
+// because they're part of generic terminal infrastructure, not the
 // settings-poke surface, even though they're not currently called.)
 
 void term_cmdClear(const char *arg) { term_clearScreen(); }

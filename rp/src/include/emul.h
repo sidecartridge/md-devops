@@ -90,7 +90,7 @@ void emul_recordRunnerExecuteSubmit(const char *path, uint32_t now_ms);
  */
 void emul_recordRunnerExecuteDone(int32_t exit_code, uint32_t now_ms);
 
-// Epic 06 / S5+S6 — Pexec(3) load + Pexec(4) exec split.
+// Pexec(3) load + Pexec(4) exec split.
 //
 // Strict-refuse semantics: a `runner load` while
 // emul_isRunnerLoadPending() is already true must return 409
@@ -117,7 +117,7 @@ void emul_recordRunnerExecSubmit(uint32_t now_ms);
 /** @brief Record an EXEC completion. Stores exit_code and
  *         clears busy. pendingBasepage is preserved — `Pexec(4)`
  *         does NOT free the basepage, so the program stays
- *         loaded for re-exec; explicit unload (S7) is what
+ *         loaded for re-exec; explicit unload is what
  *         releases the memory. */
 void emul_recordRunnerExecDone(int32_t exit_code, uint32_t now_ms);
 
@@ -239,7 +239,7 @@ void emul_resetRunnerSession(void);
 
 /**
  * @brief Whether the m68k Runner has confirmed its Advanced Runner
- *        VBL hook (Epic 04) is installed at $70. Set via the HELLO
+ *        VBL hook is installed at $70. Set via the HELLO
  *        message's payload byte every time runner_post_reloc runs;
  *        cleared on emul_resetRunnerSession() (which fires on the
  *        next HELLO too, so the value is effectively replaced
@@ -267,7 +267,7 @@ uint8_t emul_getRunnerAdvHookVector(void);
 void emul_recordRunnerAdvHookVector(uint8_t vector_id);
 
 /**
- * @brief Per-chunk ack flag for the Advanced load streamer (S8). The
+ * @brief Per-chunk ack flag for the Advanced load streamer. The
  *        chunk-done chandler sets it via emul_recordRunnerAdvLoadAck;
  *        the HTTP streamer spins on emul_isRunnerAdvLoadAcked +
  *        chandler_loop until the flag flips, then clears it via
@@ -299,7 +299,7 @@ void emul_onGemdriveHello(void);
 void emul_scheduleRunnerRelaunch(uint32_t at_ms);
 
 /**
- * @brief Commit the firmware-mode transition (Epic 05 v2). Called
+ * @brief Commit the firmware-mode transition. Called
  *        from the menu code paths right before they hand control
  *        off — the user picked [U] / [G]. Idempotent and
  *        one-way: subsequent calls are no-ops.

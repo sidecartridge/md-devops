@@ -144,7 +144,7 @@ static inline void __not_in_flash_func(handle_protocol_checksum_error)(
 
 static inline void __not_in_flash_func(chandler_consume_rom3_sample)(
     uint16_t sample) {
-  // Consumer 2: debug-byte filter (Epic 05 v2). External programs
+  // Consumer 2: debug-byte filter. External programs
   // emit one byte per cartridge cycle by reading at $FBFF00 + c
   // (where c is the byte). The captured value's high byte is then
   // 0xFF, low byte is c. Both consumers run on every captured
