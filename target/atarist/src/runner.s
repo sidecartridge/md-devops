@@ -231,6 +231,15 @@ runner_entry:
 	; is what actually executes for the lifetime of this Runner
 	; session. The whole module is PC-relative so labels resolve
 	; correctly post-relocation. ---
+	; The stack-overlap safety check is performed once, in main.s'
+	; gemdrive_install (which runs immediately before us — see
+	; runner_function). That check verifies SP does NOT sit
+	; anywhere inside [gemdrive_reloc, gemdrive_reloc + 16 KB),
+	; which already covers our destination (RUNNER_BLOB lives at
+	; gemdrive_reloc + $1800..$2400 — fully inside that span).
+	; The jsr+rts between gemdrive_install and us is stack-
+	; balanced, so SP is essentially unchanged when we get here;
+	; if the check passed there, our copy is safe by construction.
 	move.l	GEMDRIVE_RELOC_ADDR_VAR, d0
 	add.l	#RUNNER_ABOVE_GEMDRIVE_OFFSET, d0	; d0 = runner_reloc
 

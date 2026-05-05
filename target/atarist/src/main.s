@@ -64,6 +64,20 @@ GEMDRIVE_BLOB_SIZE	equ $1400				; 5 KB allocated by devops.ld
 RUNNER_BLOB		equ (ROM4_ADDR + $1C00)			; $FA1C00
 RUNNER_BLOB_SIZE	equ $C00				; 3 KB allocated by devops.ld
 
+; Size of the address range the relocated blobs occupy that the
+; supervisor stack must NOT sit inside. The full 16 KB protected
+; region — equal to GEMDRIVE_DEFAULT_OFFSET_BYTES on the RP side.
+; The danger zone is [gemdrive_reloc, gemdrive_reloc + RELOC_DANGER_ZONE_SIZE).
+;
+; Earlier revisions reserved the topmost 1 KB as tolerated slack,
+; back when the check was incorrectly framed as "SP must be above
+; the zone". With the corrected direction (SP below blob_start is
+; always safe — pushes only move SP further down, away from the
+; blobs), no slack is necessary; the full 16 KB is the actual
+; relocation footprint and any SP landing inside it is a real
+; collision.
+RELOC_DANGER_ZONE_SIZE	equ $4000			; 16 KB
+
 SCREEN_SIZE			equ (-4096)	; Use the memory before the screen memory to store the copied code
 COLS_HIGH			equ 20		; 16 bit columns in the ST
 ROWS_HIGH			equ 200		; 200 rows in the ST
@@ -472,6 +486,37 @@ gemdrive_install:
 	move.l SHARED_VARIABLES+(SHARED_VAR_GEMDRIVE_RELOC_ADDR*4), d0
 	move.l SHARED_VARIABLES+(SHARED_VAR_GEMDRIVE_MEMTOP*4), d1
 
+	; --- Stack-overlap safety check ---
+	; Abort iff SP currently sits *inside* the relocation danger
+	; zone [gemdrive_reloc, gemdrive_reloc + RELOC_DANGER_ZONE_SIZE).
+	;
+	; If SP < gemdrive_reloc, the stack is BELOW the blobs — pushes
+	; only lower SP further so it can never grow into the blobs.
+	; Safe regardless of how deep the call chain gets. This is the
+	; common TOS layout: supervisor stack lives in low memory
+	; (~0x1000–0x6000), blobs land just below screen_base.
+	;
+	; If SP >= gemdrive_reloc + RELOC_DANGER_ZONE_SIZE, the stack
+	; is above the zone — pushes lower SP but the zone size is the
+	; full 16 KB protected region, so SP entering the zone via
+	; pushes from above would require a single push of more than
+	; the entire zone, which doesn't happen in practice.
+	;
+	; Only the in-zone case is actually dangerous, so that's what
+	; we abort on.
+	;
+	; Single test covers runner_entry's later self-relocation too:
+	; runner_entry runs after this routine with an essentially-
+	; identical SP and lands inside this same zone.
+	move.l d0, d3				; d3 = blob_start
+	move.l sp, d4
+	cmp.l d3, d4
+	bcs.w .gd_stack_safe			; sp < blob_start → safe (below)
+	add.l #RELOC_DANGER_ZONE_SIZE, d3	; d3 = blob_start + 16 KB
+	cmp.l d3, d4
+	bcs.w .gd_stack_overlap			; blob_start ≤ sp < zone_end → ABORT
+.gd_stack_safe:
+
 	; Copy GEMDRIVE_BLOB from cartridge ROM to the user-chosen RAM dst.
 	move.l d0, a1
 	move.l #GEMDRIVE_BLOB, a0
@@ -499,6 +544,21 @@ gemdrive_install:
 
 	movem.l (sp)+, d0-d7/a0-a3
 	rts
+
+.gd_stack_overlap:
+	; Print the warning + halt. We don't restore registers / rts
+	; because the caller would otherwise jmp into a non-installed
+	; blob and crash worse. Halt loop is recoverable via SELECT /
+	; power-cycle, which brings the user back to the menu where
+	; [R] reloc addr can be raised.
+	print	gd_overlap_msg
+.gd_stack_overlap_halt:
+	bra.s	.gd_stack_overlap_halt
+
+gd_overlap_msg:
+	dc.b	13,10,'Reloc/stack overlap.',13,10
+	dc.b	'Raise [R] in setup menu, reset.',13,10,0
+	even
 
 end_pre_auto:
 	even
