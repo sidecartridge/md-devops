@@ -63,6 +63,19 @@ typedef struct {
 static GemDtaSlot dtaTable[GEMDRIVE_MAX_DTAS];
 static uint32_t dtaLruCounter;
 
+// Cached HELLO payload — phystop, screenmem (= XBIOS Logbase, same as
+// _v_bas_ad at $44E), and the MMU-derived total RAM. The setup-menu
+// uses these to render Phystop and Screenmem rows; the Phystop row
+// gets an optional `(!)` marker when TOS' phystop disagrees with the
+// silicon (a sign that a reset-resistant program lowered phystop and
+// the user must power-cycle to recover). Populated on every
+// CMD_GEMDRIVE_HELLO; until the first HELLO lands gemdriveHelloLanded
+// is false.
+static bool gemdriveHelloLanded = false;
+static uint32_t gemdrivePhystop = 0;       // TOS-reported, raw
+static uint32_t gemdriveScreenmem = 0;     // logical screen base
+static bool gemdrivePhystopMismatch = false;
+
 // ---------------------------------------------------------------------------
 // aconfig helpers
 // ---------------------------------------------------------------------------
@@ -1359,7 +1372,26 @@ void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
   }
 
   // ---- HELLO ----
-  uint32_t screenBase = TPROTO_GET_PAYLOAD_PARAM32(payload);
+  // Payload (12 bytes, m68k publishes via gemdrive_handshake):
+  //   [0..3]  screen_base   — XBIOS Logbase
+  //   [4..7]  phystop       — TOS-reported _phystop ($42E)
+  //   [8..11] total_ram_kb  — decoded from MMU bank-config nibble at
+  //                           $FFFF8001; 0 = unrecognised silicon
+  uint32_t screenBase   = TPROTO_GET_PAYLOAD_PARAM32(payload);
+  uint32_t phystop      = TPROTO_GET_NEXT32_PAYLOAD_PARAM32(payload);
+  uint32_t totalRamKb   = TPROTO_GET_NEXT32_PAYLOAD_PARAM32(payload);
+
+  // Cache phystop + screenmem + mismatch flag for the menu render.
+  // screenmem is just the screen_base value from XBIOS Logbase (same
+  // as _v_bas_ad at $44E). The mismatch flag fires only when the
+  // silicon reading is recognisable AND it disagrees with what TOS
+  // reports.
+  gemdrivePhystop = phystop;
+  gemdriveScreenmem = screenBase;
+  gemdrivePhystopMismatch =
+      (totalRamKb != 0) &&
+      (phystop != ((uint32_t)totalRamKb << 10));
+  gemdriveHelloLanded = true;
 
   bool enabled = aconfigBool(ACONFIG_PARAM_GEMDRIVE_ENABLED, true);
   if (!enabled) {
@@ -1401,9 +1433,14 @@ void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
   publishDriveAndReentry(driveNumber, letter);
 
   DPRINTF(
-      "GEMDRIVE HELLO: screen_base=0x%08lX -> reloc=0x%08lX (%s), "
-      "memtop=0x%08lX (%s), drive=%c (#%u)\n",
-      (unsigned long)screenBase, (unsigned long)effectiveReloc,
+      "GEMDRIVE HELLO: screen_base=0x%08lX phystop=0x%08lX "
+      "total_ram=%lu KB (%s) -> reloc=0x%08lX (%s), memtop=0x%08lX (%s), "
+      "drive=%c (#%u)\n",
+      (unsigned long)screenBase, (unsigned long)phystop,
+      (unsigned long)totalRamKb,
+      gemdrivePhystopMismatch ? "MISMATCH" :
+        (totalRamKb == 0 ? "unrecognised" : "ok"),
+      (unsigned long)effectiveReloc,
       (relocOverride != 0) ? "override" : "auto",
       (unsigned long)effectiveMemtop,
       (memtopOverride != 0) ? "override" : "auto",
@@ -1423,4 +1460,17 @@ void gemdrive_init(void) {
   for (int i = 0; i < GEMDRIVE_MAX_DTAS; i++) dtaTable[i].inUse = false;
   chandler_addCB(gemdrive_command_cb);
   DPRINTF("GEMDRIVE callback registered.\n");
+}
+
+bool gemdrive_getPhystop(uint32_t *out_phystop, bool *out_mismatch) {
+  if (!gemdriveHelloLanded) return false;
+  if (out_phystop != NULL) *out_phystop = gemdrivePhystop;
+  if (out_mismatch != NULL) *out_mismatch = gemdrivePhystopMismatch;
+  return true;
+}
+
+bool gemdrive_getScreenmem(uint32_t *out_screenmem) {
+  if (!gemdriveHelloLanded) return false;
+  if (out_screenmem != NULL) *out_screenmem = gemdriveScreenmem;
+  return true;
 }

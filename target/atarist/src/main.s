@@ -453,9 +453,52 @@ gemdrive_handshake:
 	trap #14
 	addq.l #2, sp
 
-	; Publish screen_base, RP applies overrides + writes back
+	; d3 = screen_base
 	move.l d0, d3
-	send_sync CMD_GEMDRIVE_HELLO, 4
+
+	; d4 = TOS-reported phystop ($42E). The setup menu displays this
+	; for the user, and compares it against the MMU bank-config below
+	; so the RP can flag a mismatch (reset-resistant program tampered
+	; with _phystop and survived warm reset).
+	move.l phystop.w, d4
+
+	; d5 = total RAM in KB decoded from the MMU bank-config nibble at
+	; $FFFF8001 (lower 4 bits). Same decode table as runner_meminfo.
+	; A nibble we don't recognise leaves d5 = 0, which the RP reads
+	; as "unknown silicon — skip the mismatch check".
+	moveq.l #0, d5
+	moveq.l #0, d0
+	move.b $FFFF8001, d0
+	and.w #$0F, d0
+	cmp.b #%0000, d0		; bank0=128, bank1=128 → 256 KB
+	bne.s .ph_n0100
+	move.l #256, d5
+	bra.s .ph_decoded
+.ph_n0100:
+	cmp.b #%0100, d0		; bank0=512, bank1=128 → 640 KB
+	bne.s .ph_n0101
+	move.l #640, d5
+	bra.s .ph_decoded
+.ph_n0101:
+	cmp.b #%0101, d0		; bank0=512, bank1=512 → 1024 KB
+	bne.s .ph_n1000
+	move.l #1024, d5
+	bra.s .ph_decoded
+.ph_n1000:
+	cmp.b #%1000, d0		; bank0=2048, bank1=128 → 2176 KB
+	bne.s .ph_n1010
+	move.l #2176, d5
+	bra.s .ph_decoded
+.ph_n1010:
+	cmp.b #%1010, d0		; bank0=2048, bank1=2048 → 4096 KB
+	bne.s .ph_decoded		; any other → d5 stays 0
+	move.l #4096, d5
+.ph_decoded:
+
+	; Publish (screen_base, phystop, total_ram_kb). RP applies
+	; aconfig overrides + flags phystop mismatch + writes effective
+	; reloc/memtop back into shared variables.
+	send_sync CMD_GEMDRIVE_HELLO, 12
 
 	movem.l (sp)+, d0-d7/a0-a3
 	rts

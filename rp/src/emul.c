@@ -94,7 +94,21 @@ static bool menuScreenActive = false;
 // menu() (initial paint) and the main loop (live refresh) touch
 // it. Fixed cursor row so the overdraw doesn't have to walk the
 // terminal state.
-#define MENU_USBCDC_ROW 15
+#define MENU_USBCDC_ROW 17
+// Phystop and Screenmem value rows (inside the GEMDRIVE block,
+// under Mem[t]op). menu() always paints placeholders at these rows
+// so the layout below stays fixed even before the m68k HELLO has
+// landed; refreshPhystopLine() / refreshScreenmemLine() overdraw
+// once HELLO arrives.
+#define MENU_PHYSTOP_ROW   7
+#define MENU_SCREENMEM_ROW 8
+
+// Forward decls — both refresh helpers are defined further down
+// (next to refreshUsbCdcLine), but emul_onGemdriveHello (above the
+// definition) needs to call them as the m68k HELLO arrives so the
+// menu's "(waiting...)" placeholders update immediately.
+static void refreshPhystopLine(void);
+static void refreshScreenmemLine(void);
 static int g_menuLastUsbCdcAttached = -1;
 
 // Runner state owned RP-side (the m68k can't write to the cartridge
@@ -453,6 +467,14 @@ void emul_recordRunnerAdvLoadAck(void) { runnerAdvLoadAcked = true; }
 void emul_clearRunnerAdvLoadAck(void) { runnerAdvLoadAcked = false; }
 
 void emul_onGemdriveHello(void) {
+  // The m68k just published its HELLO payload (screen_base, phystop,
+  // total_ram_kb). Trigger the Phystop / Screenmem row overdraws so
+  // the live menu updates from "(waiting...)" to the real values.
+  // These run whether we're on the menu screen or already past it;
+  // each refresh helper gates on menuScreenActive internally.
+  refreshPhystopLine();
+  refreshScreenmemLine();
+
   if (!runnerActive) return;
   // The m68k just cold-booted (HELLO is sent from gemdrive_init,
   // which only runs at CA_INIT). If we were in Runner mode before,
@@ -596,21 +618,22 @@ static void refreshSetupInfoLine(void) {
   }
 }
 
-// u8g2 menu polish (Tier 1). Thin horizontal
-// dividers between the menu's config groups. Drawn in the gap
-// row above each section header (term row 7 = y=56, row 10 =
-// y=80, row 14 = y=112) so they don't overlap any character
-// cell. One pixel tall, full-width edge-to-edge.
+// Thin horizontal dividers between the menu's config groups.
+// Drawn in the gap row above each section header so they don't
+// overlap any character cell. One pixel tall, full-width edge-
+// to-edge. Positions shifted +16 px from the original layout
+// because two new GEMDRIVE rows (Phystop + Screenmem) bump every
+// section below them down by two rows (16 px).
 static void drawMenuDividers(void) {
   u8g2_t *ref = display_getU8g2Ref();
   u8g2_SetDrawColor(ref, 1);
-  // Above Adv [V]ector (between row 6 GEMDRIVE last and row 8
+  // Above Adv [V]ector (between row 8 GEMDRIVE last and row 10
   // Adv header).
-  u8g2_DrawHLine(ref, 0, 60, DISPLAY_WIDTH);
-  // Above API Endpoint (between row 9 and row 11).
-  u8g2_DrawHLine(ref, 0, 84, DISPLAY_WIDTH);
-  // Above USB CDC (between row 13 and row 15).
-  u8g2_DrawHLine(ref, 0, 116, DISPLAY_WIDTH);
+  u8g2_DrawHLine(ref, 0, 76, DISPLAY_WIDTH);
+  // Above API Endpoint (between row 11 and row 13).
+  u8g2_DrawHLine(ref, 0, 100, DISPLAY_WIDTH);
+  // Above USB CDC (between row 15 and row 17).
+  u8g2_DrawHLine(ref, 0, 132, DISPLAY_WIDTH);
 }
 
 // status icons via u8g2_font_open_iconic_embedded_1x_t.
@@ -632,9 +655,9 @@ static void drawMenuDividers(void) {
 // glyph baseline is at y_top + 7 (font is 8 px tall).
 #define MENU_ICON_X              (DISPLAY_WIDTH - 12)
 #define MENU_ICON_GEMDRIVE_YTOP  16   // term row 2
-#define MENU_ICON_ADV_YTOP       64   // term row 8
-#define MENU_ICON_API_YTOP       88   // term row 11
-#define MENU_ICON_USB_YTOP       120  // term row 15
+#define MENU_ICON_ADV_YTOP       80   // term row 10 (Phystop + Screenmem add 2 rows)
+#define MENU_ICON_API_YTOP       104  // term row 13
+#define MENU_ICON_USB_YTOP       136  // term row 17
 #define MENU_ICON_GLYPH_COG          0x42
 #define MENU_ICON_GLYPH_LIGHTBULB    0x4D
 #define MENU_ICON_GLYPH_HARD_DRIVE   0x4C
@@ -650,7 +673,7 @@ static void drawIconCell(uint16_t x, uint16_t y_top, uint8_t glyph,
   // box would leave that row untouched and a hide→show
   // transition would expose a residual top edge of the prior
   // glyph. The four icon positions in this menu all have an
-  // unused pixel row directly above (the hrules at y=60/84/116
+  // unused pixel row directly above (the hrules at y=76/100/132
   // sit further up still), so the +1 row of erase margin is
   // safe.
   u8g2_SetDrawColor(ref, 0);
@@ -770,6 +793,74 @@ static void refreshUsbCdcLine(void) {
   // overdraw doesn't leave it stranded over the USB CDC line.
   // "Select an option: " is 18 chars, so col 18 is the spot
   // the user expects to type into.
+  vt52Cursor(TERM_SCREEN_SIZE_Y - 1, 18);
+  display_refresh();
+}
+
+// Live-refresh of the Phystop row inside the GEMDRIVE block. The menu
+// renders a "(waiting...)" placeholder at paint time because the m68k
+// HELLO usually hasn't landed yet (the Pico boots first, the ST is
+// still in TOS init). Once HELLO arrives this overdraws the line
+// with the real value + optional (!) marker. Caches the last shown
+// values so we only redraw on transition.
+static int g_menuLastPhystopReady = -1;     // -1 = not yet drawn
+static uint32_t g_menuLastPhystop = 0;
+static int g_menuLastPhystopMismatch = -1;
+static void refreshPhystopLine(void) {
+  if (!menuScreenActive) return;
+  uint32_t phystop = 0;
+  bool mismatch = false;
+  bool ready = gemdrive_getPhystop(&phystop, &mismatch);
+  if ((int)ready == g_menuLastPhystopReady &&
+      phystop == g_menuLastPhystop &&
+      (int)mismatch == g_menuLastPhystopMismatch) {
+    return;  // no change since last paint
+  }
+  g_menuLastPhystopReady = (int)ready;
+  g_menuLastPhystop = phystop;
+  g_menuLastPhystopMismatch = (int)mismatch;
+  vt52Cursor(MENU_PHYSTOP_ROW, 0);
+  char val[24];
+  if (ready) {
+    snprintf(val, sizeof(val), "0x%06X%s",
+             (unsigned)phystop, mismatch ? " (!)" : "");
+  } else {
+    snprintf(val, sizeof(val), "(waiting...)");
+  }
+  char buf[48];
+  snprintf(buf, sizeof(buf), "  Phystop     : %-16s", val);
+  term_printString(buf);
+  // Restore cursor to the prompt column on the bottom row, same as
+  // refreshUsbCdcLine, so we don't leave the cursor stranded.
+  vt52Cursor(TERM_SCREEN_SIZE_Y - 1, 18);
+  display_refresh();
+}
+
+// Live-refresh of the Screenmem row. Same shape as
+// refreshPhystopLine: cache the last shown value, only redraw on
+// transition. No mismatch marker — this value is purely informational.
+static int g_menuLastScreenmemReady = -1;
+static uint32_t g_menuLastScreenmem = 0;
+static void refreshScreenmemLine(void) {
+  if (!menuScreenActive) return;
+  uint32_t screenmem = 0;
+  bool ready = gemdrive_getScreenmem(&screenmem);
+  if ((int)ready == g_menuLastScreenmemReady &&
+      screenmem == g_menuLastScreenmem) {
+    return;
+  }
+  g_menuLastScreenmemReady = (int)ready;
+  g_menuLastScreenmem = screenmem;
+  vt52Cursor(MENU_SCREENMEM_ROW, 0);
+  char val[24];
+  if (ready) {
+    snprintf(val, sizeof(val), "0x%06X", (unsigned)screenmem);
+  } else {
+    snprintf(val, sizeof(val), "(waiting...)");
+  }
+  char buf[48];
+  snprintf(buf, sizeof(buf), "  Screenmem   : %-16s", val);
+  term_printString(buf);
   vt52Cursor(TERM_SCREEN_SIZE_Y - 1, 18);
   display_refresh();
 }
@@ -1039,6 +1130,50 @@ static void __not_in_flash_func(menu)(void) {
              (unsigned)memtop);
   }
   term_printString(memtopLine);
+
+  // Phystop row — read-only display of TOS' _phystop ($42E) value in
+  // hex, with a `(!)` marker when it disagrees with the silicon's MMU
+  // bank-config reading. The marker means a reset-resistant program
+  // lowered phystop and survived warm reset; only a power-cycle
+  // restores the correct value.
+  //
+  // ALWAYS print this row — even before the m68k HELLO has landed —
+  // so the row layout below stays stable (the icon Y coordinates and
+  // MENU_USBCDC_ROW assume Phystop is here). refreshPhystopLine()
+  // overdraws the value once HELLO arrives (called from the main loop
+  // and from emul_onGemdriveHello).
+  uint32_t phystop = 0;
+  bool phystopMismatch = false;
+  bool phystopReady = gemdrive_getPhystop(&phystop, &phystopMismatch);
+  char phystopVal[24];
+  if (phystopReady) {
+    snprintf(phystopVal, sizeof(phystopVal), "0x%06X%s",
+             (unsigned)phystop, phystopMismatch ? " (!)" : "");
+  } else {
+    snprintf(phystopVal, sizeof(phystopVal), "(waiting...)");
+  }
+  char phystopLine[48];
+  snprintf(phystopLine, sizeof(phystopLine),
+           "\n  Phystop     : %-16s", phystopVal);
+  term_printString(phystopLine);
+
+  // Screenmem row — read-only display of XBIOS Logbase / _v_bas_ad
+  // ($44E) at HELLO time. Same always-paint pattern as Phystop so
+  // the icon Y-tops + MENU_USBCDC_ROW below stay correct;
+  // refreshScreenmemLine() overdraws once HELLO arrives.
+  uint32_t screenmem = 0;
+  bool screenmemReady = gemdrive_getScreenmem(&screenmem);
+  char screenmemVal[24];
+  if (screenmemReady) {
+    snprintf(screenmemVal, sizeof(screenmemVal), "0x%06X",
+             (unsigned)screenmem);
+  } else {
+    snprintf(screenmemVal, sizeof(screenmemVal), "(waiting...)");
+  }
+  char screenmemLine[48];
+  snprintf(screenmemLine, sizeof(screenmemLine),
+           "\n  Screenmem   : %-16s", screenmemVal);
+  term_printString(screenmemLine);
 
   term_printString("\n\n");
 
@@ -1771,6 +1906,8 @@ void emul_start() {
     // see the plug/unplug transition whether they've stopped the
     // counter or not).
     refreshUsbCdcLine();
+    refreshPhystopLine();
+    refreshScreenmemLine();
   }
 
   // 10. Send RESET computer command

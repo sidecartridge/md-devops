@@ -160,4 +160,21 @@ void gemdrive_init(void);
 // chandler callback. Public so emul.c can register it via chandler_addCB.
 void gemdrive_command_cb(TransmissionProtocol *protocol, uint16_t *payload);
 
+// Read the cached phystop value from the most recent GEMDRIVE_CMD_HELLO.
+// Returns false if no HELLO has landed yet (handshake hasn't completed —
+// happens for a sub-millisecond window at boot). When true, *out_phystop
+// holds the TOS-reported _phystop ($42E) value and *out_mismatch is true
+// iff TOS' phystop disagrees with the silicon's MMU bank-config reading
+// (a sign that a reset-resistant program lowered phystop and survived
+// warm reset; the user must power-cycle to recover).
+//
+// out_phystop / out_mismatch may be NULL if the caller is interested
+// only in whether HELLO has landed.
+bool gemdrive_getPhystop(uint32_t *out_phystop, bool *out_mismatch);
+
+// Read the cached screenmem (logical screen base) value from the most
+// recent CMD_GEMDRIVE_HELLO. Same as XBIOS Logbase / _v_bas_ad ($44E)
+// at HELLO time. Returns false if no HELLO has landed yet.
+bool gemdrive_getScreenmem(uint32_t *out_screenmem);
+
 #endif  // GEMDRIVE_H

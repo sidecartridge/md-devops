@@ -102,6 +102,8 @@ GEMDRIVE                                   💾
   [D]rive     : C:
   [R]eloc addr: auto (screen-16KB)
   Mem[t]op    : auto (matches reloc)
+  Phystop     : 0x100000
+  Screenmem   : 0x078000
 
 Adv [V]ector                               ⚙
   Hook        : vbl ($70)
@@ -120,7 +122,7 @@ Select an option: ▌
 
 | Section | What it shows | Keys |
 | --- | --- | --- |
-| **GEMDRIVE** | Which microSD folder is mounted as the emulated drive, the drive letter assigned to it, the GEMDRIVE relocation address (`auto` = `screen_base − 16 KB`), and the patched `_memtop` value. The hard-drive icon appears whenever the section is live. | `[o]` change folder, `[d]` change drive letter, `[r]` change reloc addr, `[t]` change `_memtop`. |
+| **GEMDRIVE** | Which microSD folder is mounted as the emulated drive, the drive letter assigned to it, the GEMDRIVE relocation address (`auto` = `screen_base − 16 KB`), the patched `_memtop` value, the read-only `_phystop` value (`$42E`) the ST reports, and the read-only screen-memory base (`_v_bas_ad`, `$44E`). A `(!)` marker on the Phystop line means TOS' phystop disagrees with the silicon's MMU bank-config — a reset-resistant program lowered phystop and survived warm reset; **only a power-cycle restores it**. The hard-drive icon appears whenever the section is live. | `[o]` change folder, `[d]` change drive letter, `[r]` change reloc addr, `[t]` change `_memtop`. (Phystop and Screenmem are read-only.) |
 | **Adv [V]ector** | Which interrupt vector the Advanced Runner installs its hook into — `vbl ($70)` or `etv_timer ($400)`. See *Picking a hook vector* below for the trade-off. The cog icon appears whenever the section is live. | `[V]` toggle between `vbl` / `etv_timer`. |
 | **API Endpoint** | mDNS hostname and the IP DHCP leased. The Wi-Fi icon appears once the network is up; if there's no IP yet (Wi-Fi still associating) the icon is hidden. | (read-only) |
 | **USB CDC (Debug serial)** | `connected` / `disconnected` — live-refreshed as you plug or unplug a USB cable into the Pico. The lightbulb icon flips in lock-step. | (read-only) |
