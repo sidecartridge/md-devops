@@ -1759,8 +1759,16 @@ void emul_start() {
     }
   }
 
-  // 7. Configure the SELECT button so menu status can show it immediately.
+  // 7. Configure the SELECT button and register the reset callbacks.
+  //    Short press → reset_device. Long press (≥ SELECT_LONG_RESET ms)
+  //    → reset_deviceAndEraseFlash. Edge detection + debounce + long-
+  //    press timing run in the foreground via select_checkPushReset(),
+  //    polled from the main loop below — Core 1 stays idle here, since
+  //    launching it interferes with the cyw43_arch_wait_for_work_until
+  //    poll the main loop relies on for Wi-Fi service.
   select_configure();
+  select_setResetCallback(reset_device);
+  select_setLongResetCallback(reset_deviceAndEraseFlash);
 
   // 8. Now complete the terminal emulator initialization
   // The terminal emulator is used to interact with the user to configure the
@@ -1793,6 +1801,13 @@ void emul_start() {
     // (Epic 05 v2 / S5). Cheap when no host is attached or the
     // debugcap ring is empty.
     usbcdc_drain();
+
+    // Foreground SELECT-button poll. Edge-debounces in 30 ms windows
+    // only at press / release transitions; while the button is held or
+    // released-steady this returns immediately, so it doesn't impact
+    // the main-loop cadence. Short press fires reset_device; long
+    // press (≥ SELECT_LONG_RESET ms) fires reset_deviceAndEraseFlash.
+    select_checkPushReset();
 
     // Run the terminal foreground (consume the published command, render
     // output, etc.).
