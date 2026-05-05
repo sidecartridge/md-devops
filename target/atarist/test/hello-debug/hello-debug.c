@@ -12,7 +12,7 @@
  * consumers MUST discard it.
  *
  * The window is only live in firmware mode (after the user has
- * committed [U]/[G]/[F] in the setup menu). Reads in menu mode
+ * committed [U] or [G] in the setup menu). Reads in menu mode
  * are captured by the same PIO state machine but discarded by the
  * RP-side filter, so they cause no harm.
  *

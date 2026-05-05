@@ -1348,7 +1348,7 @@ void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
     case GEMDRIVE_CMD_VERIFY_MEMTOP: {
       uint32_t observed = TPROTO_GET_PAYLOAD_PARAM32(payload);
       DPRINTF(
-          "GEMDRIVE VERIFY_MEMTOP: [F]irmware path read 0x%08lX from $436\n",
+          "GEMDRIVE VERIFY_MEMTOP: [G]EMDRIVE path read 0x%08lX from $436\n",
           (unsigned long)observed);
       return;
     }

@@ -255,7 +255,7 @@ detect_emulated_file_handler	macro
 ; ====================================================================
 ; ENTRY TABLE — first 8 bytes of the relocated blob.
 ; offset 0: install_entry  (called from main.s gemdrive_install after copy)
-; offset 4: diagnostic_entry (called from rom_function on [F]irmware)
+; offset 4: diagnostic_entry (called from rom_function on [G]EMDRIVE)
 ; ====================================================================
 	bra.w	install_entry			; offset 0
 	bra.w	diagnostic_entry		; offset 4
@@ -308,7 +308,7 @@ install_entry:
 	rts
 
 ; ====================================================================
-; diagnostic_entry — reachable via [F]irmware terminal command
+; diagnostic_entry — reachable via [G]EMDRIVE terminal command
 ; ====================================================================
 diagnostic_entry:
 	movem.l	d0-d7/a0-a3, -(sp)

@@ -56,9 +56,7 @@ enum {
 };
 
 // Command handlers
-static void cmdMenu(const char *arg);
 static void cmdGemdrive(const char *arg);
-static void cmdFirmware(const char *arg);
 static void cmdBooster(const char *arg);
 static void cmdGemdriveFolder(const char *arg);
 static void cmdGemdriveDrive(const char *arg);
@@ -66,21 +64,13 @@ static void cmdGemdriveRelocAddr(const char *arg);
 static void cmdGemdriveMemtop(const char *arg);
 static void cmdAdvHookVector(const char *arg);
 static void cmdRunner(const char *arg);
-static void cmdHiddenSettings(const char *arg);
-static void cmdPrint(const char *arg);
-static void cmdSave(const char *arg);
-static void cmdErase(const char *arg);
-static void cmdGet(const char *arg);
-static void cmdPutInt(const char *arg);
-static void cmdPutBool(const char *arg);
-static void cmdPutString(const char *arg);
 
-// Command table. Single-letter keys mirror md-drives-emulator. The hidden
-// "?" entry exposes the raw settings commands (print/save/get/...).
+// Command table. Every key here corresponds to a label on the on-screen
+// setup menu — keys that aren't advertised in the UI used to live here
+// too (m, ?, print, save, erase, get, put_*) but were retired to avoid
+// fat-finger / terminal-noise hazards.
 static const Command commands[] = {
-    {"m", cmdMenu},
     {"g", cmdGemdrive},
-    {"f", cmdFirmware},
     {"x", cmdBooster},
     {"o", cmdGemdriveFolder},
     {"d", cmdGemdriveDrive},
@@ -88,14 +78,6 @@ static const Command commands[] = {
     {"t", cmdGemdriveMemtop},
     {"v", cmdAdvHookVector},
     {"u", cmdRunner},
-    {"?", cmdHiddenSettings},
-    {"print", cmdPrint},
-    {"save", cmdSave},
-    {"erase", cmdErase},
-    {"get", cmdGet},
-    {"put_int", cmdPutInt},
-    {"put_bool", cmdPutBool},
-    {"put_str", cmdPutString},
 };
 
 // Number of commands in the table
@@ -1148,14 +1130,8 @@ static void __not_in_flash_func(showCounter)(int cdown) {
 
 // --- Command handlers (single-key dispatch) ----------------------------
 
-void cmdMenu(const char *arg) {
-  (void)arg;
-  haltCountdown = true;
-  menu();
-}
-
 // [G]EMDRIVE — drops straight into GEMDRIVE-only on the Atari ST
-// without activating the Runner control surface (same path as [F]).
+// without activating the Runner control surface.
 void cmdGemdrive(const char *arg) {
   (void)arg;
   haltCountdown = true;
@@ -1169,25 +1145,11 @@ void cmdGemdrive(const char *arg) {
   SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START);
 }
 
-void cmdFirmware(const char *arg) {
-  (void)arg;
-  haltCountdown = true;
-  menuScreenActive = false;
-  term_printString("Launching DevOps on the Atari ST...\n");
-  // Epic 05 v2 — commit firmware mode. This site also covers the
-  // boot-countdown auto-launch path, which calls cmdFirmware when
-  // the timer hits zero.
-  emul_enterFirmwareMode();
-  // CMD_START is the cartridge sentinel that GEMDRIVE polls during
-  // pre_auto; receiving it makes the m68k jump into the GEMDRIVE blob.
-  SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START);
-}
-
-// [U] launches Runner mode (Epic 03). Same shape as cmdFirmware but
-// sends DISPLAY_COMMAND_START_RUNNER, which the m68k's check_commands
-// dispatch maps to runner_function (jmp RUNNER_BLOB). GEMDRIVE has
-// already been installed by pre_auto's gemdrive_init — the Runner
-// runs alongside it, in foreground.
+// [U] launches Runner mode. Same shape as cmdGemdrive but sends
+// DISPLAY_COMMAND_START_RUNNER, which the m68k's check_commands
+// dispatch maps to runner_function (jmp RUNNER_BLOB). GEMDRIVE
+// gets installed inline by gemdrive_install (deferred from boot)
+// — the Runner runs alongside it, in foreground.
 void cmdRunner(const char *arg) {
   (void)arg;
   haltCountdown = true;
@@ -1391,76 +1353,11 @@ void cmdAdvHookVector(const char *arg) {
   menu();
 }
 
-// Hidden command list — switches the term to line-based COMMAND_INPUT so
-// the user can type 'print', 'save', 'get key', etc.
-void cmdHiddenSettings(const char *arg) {
-  (void)arg;
-  haltCountdown = true;
-  menuScreenActive = false;
-  showTitle();
-  term_printString(
-      "\n\n"
-      "Available settings commands:\n"
-      "  print   - Show settings\n"
-      "  save    - Save settings\n"
-      "  erase   - Erase settings\n"
-      "  get     - Get setting (requires key)\n"
-      "  put_int - Set integer (key and value)\n"
-      "  put_bool- Set boolean (key and value)\n"
-      "  put_str - Set string (key and value)\n\n"
-      "Enter command. Type 'm' to return > ");
-  term_setCommandLevel(TERM_COMMAND_LEVEL_COMMAND_INPUT);
-}
-
-void cmdPrint(const char *arg) {
-  haltCountdown = true;
-  menuScreenActive = false;
-  term_cmdPrint(arg);
-}
-
-void cmdSave(const char *arg) {
-  haltCountdown = true;
-  menuScreenActive = false;
-  term_cmdSave(arg);
-  // Cartridge-side state (GEMDRIVE relocation, _memtop patch, etc.) is
-  // applied by gemdrive_init at CA_INIT time, so a saved aconfig change
-  // is invisible until the m68k re-runs CA_INIT. Issue an automatic ST
-  // reset so the change takes effect immediately.
-  term_printString("Resetting Atari ST to apply changes...\n");
-  display_refresh();
-  sleep_ms(300);
-  SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_RESET);
-}
-
-void cmdErase(const char *arg) {
-  haltCountdown = true;
-  menuScreenActive = false;
-  term_cmdErase(arg);
-}
-
-void cmdGet(const char *arg) {
-  haltCountdown = true;
-  menuScreenActive = false;
-  term_cmdGet(arg);
-}
-
-void cmdPutInt(const char *arg) {
-  haltCountdown = true;
-  menuScreenActive = false;
-  term_cmdPutInt(arg);
-}
-
-void cmdPutBool(const char *arg) {
-  haltCountdown = true;
-  menuScreenActive = false;
-  term_cmdPutBool(arg);
-}
-
-void cmdPutString(const char *arg) {
-  haltCountdown = true;
-  menuScreenActive = false;
-  term_cmdPutString(arg);
-}
+// (Hidden settings sub-menu and raw aconfig poke verbs were retired
+// to avoid silent flash-mutation footguns from terminal-noise input.
+// The settings persistence path is still in place — it just isn't
+// reachable from the menu prompt anymore. Edit aconfig directly via
+// the Booster app if you need to override defaults.)
 
 // This section contains the functions that are called from the main loop
 
@@ -1864,7 +1761,7 @@ void emul_start() {
           haltCountdown = true;
           // Autoboot expired — launch DevOps Runner on the Atari ST. Same
           // path as pressing [U]. Runner is the more useful default:
-          // it includes the [F]/[G] GEMDRIVE behaviour AND the
+          // it includes the [G] GEMDRIVE behaviour AND the
           // workstation-driven Runner control surface.
           cmdRunner(NULL);
         }
