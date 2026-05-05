@@ -117,7 +117,8 @@ RUNNER_RES_ERR_MONO		equ -1	; current rez is high (mono); request ignored
 RUNNER_RES_ERR_BAD		equ -2	; requested rez out of range
 
 ; Shared-variable slot 12 (drive number) is published by the RP-side
-; handleGemdriveHello during gemdrive_init. The m68k's TOS process was
+; handleGemdriveHello during the boot-time gemdrive_handshake. The
+; m68k's TOS process was
 ; created at GEMDOS init time — *before* install_entry ran — so its
 ; current drive was inherited from the boot ROM's _bootdev (typically
 ; A:), not from the value install_entry later wrote. The Runner forces
@@ -224,7 +225,7 @@ runner_entry:
 	; GEMDRIVE blob, inside the same 16 KB protected region the
 	; RP-side already lowered _memtop to cover), then jmps into the
 	; relocated copy at runner_post_reloc. No need to re-patch
-	; _memtop here: gemdrive_init already set it to gemdrive_reloc
+	; _memtop here: gemdrive_install already set it to gemdrive_reloc
 	; (= screen_base − 16 KB) which protects RUNNER_BLOB too. The
 	; cartridge-ROM source is unused after the copy; the RAM copy
 	; is what actually executes for the lifetime of this Runner

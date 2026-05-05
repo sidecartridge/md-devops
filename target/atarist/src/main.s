@@ -50,14 +50,15 @@ TRANSTABLE		equ APP_BUFFERS_ADDR				; high-res translation table
 ; Cartridge code layout (devops.ld; CARTRIDGE_CODE_SIZE = 10 KB):
 ;   $0000..$07FF  main.s     2 KB   boot + dispatch + terminal
 ;   $0800..$1BFF  gemdrive.s 5 KB   GEMDRIVE blob (relocated to RAM)
-;   $1C00..$27FF  runner.s   3 KB   Epic 03 Runner foreground loop
-; At boot, gemdrive_init copies GEMDRIVE_BLOB_SIZE bytes from
-; GEMDRIVE_BLOB into a configurable RAM address (default
-; screen_base - 16 KB) so the resident GEMDRIVE code can survive past
-; cartridge teardown and be reached after _memtop has been lowered to
-; protect the region. RUNNER_BLOB self-relocates at runner_entry into
-; the same protected 16 KB region, just above GEMDRIVE_BLOB — see
-; runner.s' RUNNER_ABOVE_GEMDRIVE_OFFSET.
+;   $1C00..$27FF  runner.s   3 KB   Runner foreground loop
+; On mode-commit (rom_function or runner_function reached from the
+; setup-menu polling), gemdrive_install copies GEMDRIVE_BLOB_SIZE
+; bytes from GEMDRIVE_BLOB into a configurable RAM address (default
+; screen_base - 16 KB) so the resident GEMDRIVE code can survive
+; past cartridge teardown and be reached after _memtop has been
+; lowered to protect the region. RUNNER_BLOB self-relocates at
+; runner_entry into the same protected 16 KB region, just above
+; GEMDRIVE_BLOB — see runner.s' RUNNER_ABOVE_GEMDRIVE_OFFSET.
 GEMDRIVE_BLOB		equ (ROM4_ADDR + $800)			; $FA0800
 GEMDRIVE_BLOB_SIZE	equ $1400				; 5 KB allocated by devops.ld
 RUNNER_BLOB		equ (ROM4_ADDR + $1C00)			; $FA1C00
@@ -245,11 +246,14 @@ first:
     even
 
 pre_auto:
-; Relocate the GEMDRIVE blob to RAM and patch _memtop. Runs once at
-; boot, in cartridge ROM (this code is not part of start_rom_code so it
-; never executes from the relocated print-loop copy). See gemdrive_init
-; below for the protocol.
-	bsr gemdrive_init
+; Boot-time handshake with the RP only — sends screen_base, reads back
+; the effective reloc / memtop. The actual GEMDRIVE blob copy + Setexc
+; install is deferred to gemdrive_install, called from rom_function /
+; runner_function once the user commits a mode at the setup menu. That
+; way a bad reloc destination (overlap with stack, weird screen-base
+; placement) cannot prevent the menu from painting — the user can
+; recover via the [R] menu option without a watchdog reboot.
+	bsr gemdrive_handshake
 
 ; Relocate the content of the cartridge ROM to the RAM
 
@@ -367,22 +371,26 @@ boot_gem:
     rts
 
 ; Dispatcher invoked on CMD_START from the sentinel poll in
-; check_commands. Jumps to the GEMDRIVE blob's diagnostic_entry at
-; cartridge offset $0804 (entry table: bra.w install at +0, bra.w
-; diagnostic at +4). The cartridge-ROM copy is fine for the diagnostic
-; print; the install_entry must NEVER be re-entered after boot
-; (re-installing the trap vector would chain to ourselves), so we
-; deliberately route [F]irmware to +4 and not +0.
+; check_commands — the user picked [E]/[F] in the setup terminal
+; (or the autoboot countdown elapsed onto the GEMDRIVE-only path).
+; First call gemdrive_install (deferred copy + Setexc trap-#1 hook),
+; then jump to the diagnostic entry at offset +4 of the relocated
+; blob (entry table: bra.w install at +0, bra.w diagnostic at +4).
+; The diagnostic prints the GEMDRIVE banner; install_entry was
+; already run by gemdrive_install, so we route to +4 and not +0.
 rom_function:
+    jsr gemdrive_install
     jmp GEMDRIVE_BLOB+4
 
 ; Dispatcher invoked on CMD_START_RUNNER from the sentinel poll in
 ; check_commands — the user pressed [U] in the setup terminal.
-; Hands control to the Runner blob (runner.s). gemdrive_init has
-; already run from pre_auto so GEMDRIVE's trap hook is in place;
-; the Runner runs in foreground from cartridge ROM (no relocation
-; in v1) and never returns.
+; Install the deferred GEMDRIVE blob + trap-#1 hook so programs
+; the Runner Pexec's see the emulated drive, then hand control to
+; runner_entry. RUNNER_BLOB self-relocates from cartridge ROM into
+; the protected 16 KB region (above the relocated GEMDRIVE blob)
+; via runner.s' relocation harness, and never returns.
 runner_function:
+    jsr gemdrive_install
     jmp RUNNER_BLOB
 
 ; Shared functions included at the end of the file
@@ -403,64 +411,89 @@ end_rom_code:
 	even
 
 ; -----------------------------------------------------------------------
-; gemdrive_init — GEMDRIVE relocation harness (called once from pre_auto)
+; gemdrive_handshake — boot-time HELLO round-trip (called once from
+; pre_auto, before the menu paints).
 ; -----------------------------------------------------------------------
-; Steps:
-;   1. Read screen base via XBIOS Logbase (fn 2).
-;   2. Send CMD_GEMDRIVE_HELLO with d3 = screen_base. The RP-side
-;      gemdrive_command_cb reads it, applies aconfig overrides
-;      (GEMDRIVE_RELOC_ADDR / GEMDRIVE_MEMTOP) or falls back to the
-;      default screen_base - 16 KB, and writes the effective values into
-;      shared variable slots SHARED_VAR_GEMDRIVE_RELOC_ADDR and
-;      SHARED_VAR_GEMDRIVE_MEMTOP. send_sync round-trips through the
-;      random-token ack, so by the time the macro returns the shared
-;      region is up to date — no separate ready flag is needed.
-;   3. Read the effective reloc + memtop from the shared region.
-;   4. Copy the GEMDRIVE blob (GEMDRIVE_BLOB_SIZE bytes from
-;      GEMDRIVE_BLOB) to the chosen RAM address.
-;   5. Patch _memtop ($436) so TOS won't allocate over the resident
-;      blob on subsequent Pexec calls. The cartridge runs at CA_INIT
-;      bit 27 (after GEMDOS init, before disk boot) so the patch only
-;      affects future TPA computations, which is what we want.
+; Reads screen_base via XBIOS Logbase, sends CMD_GEMDRIVE_HELLO, and
+; lets the RP-side gemdrive_command_cb apply aconfig overrides
+; (GEMDRIVE_RELOC_ADDR / GEMDRIVE_MEMTOP) or fall back to the default
+; screen_base - 16 KB. By the time send_sync's random-token ack
+; returns, the effective reloc + memtop have been written into shared
+; variable slots SHARED_VAR_GEMDRIVE_RELOC_ADDR and
+; SHARED_VAR_GEMDRIVE_MEMTOP. The setup-menu rendering reads those
+; slots so the user sees the resolved [R]eloc addr immediately.
 ;
-; This routine lives outside start_rom_code..end_rom_code so it is not
-; copied with the print-loop relocation; it executes once from
+; The actual GEMDRIVE blob copy + _memtop patch + Setexc install are
+; NOT done here — they're deferred to gemdrive_install (called from
+; rom_function / runner_function on mode commit) so the menu remains
+; reachable even if the chosen reloc destination is unsafe.
+;
+; This routine lives outside start_rom_code..end_rom_code so it is
+; not copied with the print-loop relocation; it executes once from
 ; cartridge ROM and is never re-entered.
-gemdrive_init:
+gemdrive_handshake:
 	movem.l d0-d7/a0-a3, -(sp)
 
-	; Step 1: Logbase (XBIOS fn 2) → d0.l = screen base
+	; Logbase (XBIOS fn 2) → d0.l = screen base
 	move.w #2, -(sp)
 	trap #14
 	addq.l #2, sp
 
-	; Step 2: publish screen_base, RP applies overrides + writes back
+	; Publish screen_base, RP applies overrides + writes back
 	move.l d0, d3
 	send_sync CMD_GEMDRIVE_HELLO, 4
 
-	; Step 3: read effective reloc and memtop. Both are written by the
-	; RP-side gemdrive_command_cb during the send_sync round-trip above.
+	movem.l (sp)+, d0-d7/a0-a3
+	rts
+
+; gemdrive_install — deferred GEMDRIVE relocation + trap-#1 install.
+; -----------------------------------------------------------------------
+; Called from rom_function and runner_function once the user has
+; committed a mode at the setup menu (or the autoboot countdown
+; elapsed). Reads the effective reloc + memtop that gemdrive_handshake
+; published into shared variables, copies the GEMDRIVE blob to the
+; chosen RAM destination, lowers _memtop so TOS won't allocate over
+; it, and calls into install_entry (offset 0 of the relocated blob)
+; to wire up the GEMDOS trap-#1 hook.
+;
+; Lives outside start_rom_code..end_rom_code, so the print-loop
+; relocation doesn't carry a stale copy. The dispatchers in the
+; relocated print-loop reach this routine via absolute-long jsr.
+;
+; Called exactly once per ST cold reset: each user mode-commit fires
+; one of the two dispatchers, which calls this routine, after which
+; either the diagnostic (rom_function) or runner_entry
+; (runner_function) takes over and never returns to the menu.
+gemdrive_install:
+	movem.l d0-d7/a0-a3, -(sp)
+
+	; Read the effective reloc and memtop the RP wrote during the
+	; boot-time handshake.
 	move.l SHARED_VARIABLES+(SHARED_VAR_GEMDRIVE_RELOC_ADDR*4), d0
 	move.l SHARED_VARIABLES+(SHARED_VAR_GEMDRIVE_MEMTOP*4), d1
 
-	; Step 4: copy blob from cartridge ROM to RAM
+	; Copy GEMDRIVE_BLOB from cartridge ROM to the user-chosen RAM dst.
 	move.l d0, a1
 	move.l #GEMDRIVE_BLOB, a0
 	move.l #GEMDRIVE_BLOB_SIZE, d2
 	lsr.w #2, d2
 	subq #1, d2
-.gd_copy_loop:
+.gd_install_copy_loop:
 	move.l (a0)+, (a1)+
-	dbf d2, .gd_copy_loop
+	dbf d2, .gd_install_copy_loop
 
-	; Step 5: lower _memtop so TOS won't allocate over the relocated copy
+	; Lower _memtop so TOS won't allocate over the resident blob on
+	; subsequent Pexec calls. We're still inside CA_INIT bit 27
+	; (pre_auto hasn't returned to TOS yet for the GEMDRIVE-only path,
+	; or the Runner is about to take over and never return), so the
+	; patch lands before any TPA computations.
 	move.l d1, memtop.w
 
-	; Step 6: call the relocated install_entry to wire up the GEMDOS
-	; trap #1 hook. The blob's offset 0 is install_entry (entry table:
-	; bra.w install at +0, bra.w diagnostic at +4 — see gemdrive.s).
-	; install_entry runs Setexc + sends CMD_SAVE_VECTORS to the RP, then
-	; rts back here. d0 still holds the reloc address from step 3.
+	; Call into the relocated install_entry (offset 0 of the blob:
+	; entry table is bra.w install at +0, bra.w diagnostic at +4 —
+	; see gemdrive.s). install_entry runs Setexc + sends
+	; CMD_SAVE_VECTORS to the RP, then rts back here. d0 still
+	; holds the reloc address.
 	move.l d0, a1
 	jsr (a1)
 

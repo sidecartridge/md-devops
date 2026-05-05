@@ -11,8 +11,9 @@
  *   $1C00..$27FF  runner.s   3 KB   Runner foreground loop
  *                                   (self-relocates to RAM at runner_entry)
  *
- * The gemdrive blob is copied at boot to a configurable RAM address
- * (default screen_base - 16 KB) by main.s's gemdrive_init. The Runner
+ * The gemdrive blob is copied to a configurable RAM address
+ * (default screen_base - 16 KB) by main.s's gemdrive_install once
+ * the user commits a mode at the setup menu. The Runner
  * blob self-relocates at runner_entry to gemdrive_reloc +
  * RUNNER_ABOVE_GEMDRIVE_OFFSET (above gemdrive in the same 16 KB
  * protected region). Both .s files must be position-independent —
