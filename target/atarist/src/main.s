@@ -385,7 +385,7 @@ boot_gem:
     rts
 
 ; Dispatcher invoked on CMD_START from the sentinel poll in
-; check_commands — the user picked [E]/[F] in the setup terminal
+; check_commands — the user picked [G]/[F] in the setup terminal
 ; (or the autoboot countdown elapsed onto the GEMDRIVE-only path).
 ; First call gemdrive_install (deferred copy + Setexc trap-#1 hook),
 ; then jump to the diagnostic entry at offset +4 of the relocated

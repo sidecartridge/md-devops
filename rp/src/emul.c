@@ -57,7 +57,7 @@ enum {
 
 // Command handlers
 static void cmdMenu(const char *arg);
-static void cmdExit(const char *arg);
+static void cmdGemdrive(const char *arg);
 static void cmdFirmware(const char *arg);
 static void cmdBooster(const char *arg);
 static void cmdGemdriveFolder(const char *arg);
@@ -79,7 +79,7 @@ static void cmdPutString(const char *arg);
 // "?" entry exposes the raw settings commands (print/save/get/...).
 static const Command commands[] = {
     {"m", cmdMenu},
-    {"e", cmdExit},
+    {"g", cmdGemdrive},
     {"f", cmdFirmware},
     {"x", cmdBooster},
     {"o", cmdGemdriveFolder},
@@ -609,7 +609,7 @@ static void drawSetupInfoLine(const char *message) {
 
 static void refreshSetupInfoLine(void) {
   if (haltCountdown) {
-    drawSetupInfoLine("Countdown stopped. Press [E], [U] or [X] to continue.");
+    drawSetupInfoLine("Countdown stopped. Press [G], [U] or [X] to continue.");
   } else {
     showCounter(countdown);
   }
@@ -1000,7 +1000,7 @@ static enum navStatus __not_in_flash_func(navigate_directory)(
 
 // Builds the menu — single GEMDRIVE block + bottom navigation strip.
 // Layout follows the source's menu(): vt52Cursor positions, the F[o]lder/
-// [D]rive labels, and the bottom "[E]xit / [X] Return to Booster" line.
+// [D]rive labels, and the bottom "[G]EMDRIVE / [X] Return to Booster" line.
 static void __not_in_flash_func(menu)(void) {
   term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
   menuScreenActive = true;
@@ -1118,7 +1118,7 @@ static void __not_in_flash_func(menu)(void) {
   term_printString(usbAttached ? "connected   " : "disconnected");
 
   vt52Cursor(TERM_SCREEN_SIZE_Y - 2, 0);
-  term_printString("[E]xit (launch)  r[U]nner  [X] Booster");
+  term_printString("[G]EMDRIVE  r[U]nner  [X] Booster");
 
   vt52Cursor(TERM_SCREEN_SIZE_Y - 1, 0);
   term_printString("Select an option: ");
@@ -1154,10 +1154,9 @@ void cmdMenu(const char *arg) {
   menu();
 }
 
-// [E]xit doubles as the firmware-launch shortcut now: per the user's
-// directive, leaving the menu drops straight into GEMDRIVE on the Atari ST
-// (same path as [F]).
-void cmdExit(const char *arg) {
+// [G]EMDRIVE — drops straight into GEMDRIVE-only on the Atari ST
+// without activating the Runner control surface (same path as [F]).
+void cmdGemdrive(const char *arg) {
   (void)arg;
   haltCountdown = true;
   menuScreenActive = false;
@@ -1849,7 +1848,7 @@ void emul_start() {
     // showCounter is only called inside the decrement branch below.
     static bool lastHaltState = false;
     if (haltCountdown && !lastHaltState) {
-      drawSetupInfoLine("Countdown stopped. Press [E], [U] or [X] to continue.");
+      drawSetupInfoLine("Countdown stopped. Press [G], [U] or [X] to continue.");
       display_refresh();
     }
     lastHaltState = haltCountdown;
@@ -1864,8 +1863,8 @@ void emul_start() {
         if (countdown <= 0) {
           haltCountdown = true;
           // Autoboot expired — launch DevOps Runner on the Atari ST. Same
-          // path as pressing [U] (Epic 06 / S2). Runner is the more useful
-          // default: it includes the [F]/[E] GEMDRIVE behaviour AND the
+          // path as pressing [U]. Runner is the more useful default:
+          // it includes the [F]/[G] GEMDRIVE behaviour AND the
           // workstation-driven Runner control surface.
           cmdRunner(NULL);
         }

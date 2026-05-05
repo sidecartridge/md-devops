@@ -1012,7 +1012,7 @@ One cartridge cycle per byte. The 8-bit read result is undefined
 and MUST be discarded.
 
 The capture is gated on the firmware-mode flag — it goes live
-the moment the user picks `[U]` / `[E]` / `[F]` in the setup
+the moment the user picks `[U]` / `[G]` / `[F]` in the setup
 menu and the device commits to firmware mode. Pre-commit reads
 in the debug window are dropped at the RP filter so menu-mode
 activity never pollutes the diagnostic stream.
@@ -1042,7 +1042,7 @@ bytes; safe to poll at any cadence.
 
 | Field | Meaning |
 | --- | --- |
-| `firmware_mode` | `true` once `[U]` / `[E]` / `[F]` has committed; until then, debug emits are dropped at the RP filter. |
+| `firmware_mode` | `true` once `[U]` / `[G]` / `[F]` has committed; until then, debug emits are dropped at the RP filter. |
 | `ring_used` | Bytes currently in the producer's ring (capped at `ring_capacity`). |
 | `ring_capacity` | Ring size (8192 today). |
 | `bytes_dropped` | Producer-side drops. Always 0 in the current design (the producer overwrites; per-consumer drops are reported separately). |

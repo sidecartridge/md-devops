@@ -81,7 +81,7 @@ seconds. From there you have four top-level commands:
 | Key | Action |
 | --- | --- |
 | `[U]` | **Runner mode** (recommended). GEMDRIVE comes up, plus the Runner control surface for `runner run` / `load` / `exec` / etc. |
-| `[E]` or `[F]` | Same as `[U]` for GEMDRIVE-only purposes — ST drops straight into the emulated drive — but does **not** activate the Runner. Use this if you only want file emulation and don't need the workstation to drive the ST. |
+| `[G]` or `[F]` | Same as `[U]` for GEMDRIVE-only purposes — ST drops straight into the emulated drive — but does **not** activate the Runner. Use this if you only want file emulation and don't need the workstation to drive the ST. |
 | `[X]` | Return to the Booster menu (e.g. to install another app). |
 | any key | Halt the auto-launch countdown so the menu stays up indefinitely while you read it. |
 
@@ -113,7 +113,7 @@ API Endpoint                               📶
 USB CDC (Debug serial)                     💡
   Status      : connected
 
-[E]xit (launch)  r[U]nner  [X] Booster
+[G]EMDRIVE  r[U]nner  [X] Booster
 Select an option: ▌
 [████████░░░░░░░░░░] Booting in 12 s — any key halts
 ```
@@ -124,8 +124,8 @@ Select an option: ▌
 | **Adv [V]ector** | Which interrupt vector the Advanced Runner installs its hook into — `vbl ($70)` or `etv_timer ($400)`. See *Picking a hook vector* below for the trade-off. The cog icon appears whenever the section is live. | `[V]` toggle between `vbl` / `etv_timer`. |
 | **API Endpoint** | mDNS hostname and the IP DHCP leased. The Wi-Fi icon appears once the network is up; if there's no IP yet (Wi-Fi still associating) the icon is hidden. | (read-only) |
 | **USB CDC (Debug serial)** | `connected` / `disconnected` — live-refreshed as you plug or unplug a USB cable into the Pico. The lightbulb icon flips in lock-step. | (read-only) |
-| **Bottom navigation strip** | Top-level command keys + a one-character prompt area for typing them. | `[E]` / `[U]` / `[X]` (and `[F]` does the same as `[E]`). |
-| **Animated countdown bar** | Shrinking white bar; the message "Booting in N s — any key halts" is overlaid in inverted colour so it stays readable both halves. Becomes "Countdown stopped. Press [E], [U] or [X] to continue." once any key has been pressed. | (passive — but pressing any key halts the countdown) |
+| **Bottom navigation strip** | Top-level command keys + a one-character prompt area for typing them. | `[G]` / `[U]` / `[X]` (and `[F]` does the same as `[G]`). |
+| **Animated countdown bar** | Shrinking white bar; the message "Booting in N s — any key halts" is overlaid in inverted colour so it stays readable both halves. Becomes "Countdown stopped. Press [G], [U] or [X] to continue." once any key has been pressed. | (passive — but pressing any key halts the countdown) |
 
 ### Picking a hook vector
 
@@ -788,7 +788,7 @@ discarded.
 >    firmware auto-commits Runner mode. When you subsequently
 >    power the ST, it sees the cartridge already in Runner
 >    state and skips the menu — you never get a chance to
->    press `[U]` / `[E]` / `[F]`.
+>    press `[U]` / `[G]` / `[F]`.
 > 2. Any Runner state the Pico accumulated before the ST booted
 >    (a previously-loaded program, a stale cwd, etc.) survives
 >    into the new ST session — the Pico has no way to detect
@@ -880,7 +880,7 @@ usbcdc_dropped : 0
 ```
 
 `firmware_mode` flips to `yes` once the user has committed a
-mode at the menu (`[U]` / `[E]` / `[F]`) — the capture is
+mode at the menu (`[U]` / `[G]` / `[F]`) — the capture is
 gated on this so menu activity never pollutes the stream.
 `ring used / capacity` is the snapshot fill of the in-RAM
 debug ring at the moment of the request. `bytes_dropped` and

@@ -28,7 +28,7 @@ void emul_start();
  * @brief Whether the user picked Runner mode at boot ([U] in the
  *        setup menu). Set RP-side by cmdRunner because the m68k
  *        cannot write a handshake into the read-only cartridge area.
- *        Returns false for the GEMDRIVE-only [E]/[F]/countdown path.
+ *        Returns false for the GEMDRIVE-only [G]/[F]/countdown path.
  */
 bool emul_isRunnerActive(void);
 
@@ -301,7 +301,7 @@ void emul_scheduleRunnerRelaunch(uint32_t at_ms);
 /**
  * @brief Commit the firmware-mode transition (Epic 05 v2). Called
  *        from the menu code paths right before they hand control
- *        off — the user picked [U] / [E] / [F]. Idempotent and
+ *        off — the user picked [U] / [G] / [F]. Idempotent and
  *        one-way: subsequent calls are no-ops.
  *
  *        The chandler ingest filter uses this flag to gate
