@@ -1,4 +1,14 @@
+<div align="center">
+
+<img src="icon.png" alt="SidecarTridge Multi-device DevOps" width="180" />
+
 # SidecarTridge Multi-device DevOps microfirmware
+
+[![Build](https://github.com/sidecartridge/md-devops/actions/workflows/build.yml/badge.svg)](https://github.com/sidecartridge/md-devops/actions/workflows/build.yml)
+[![Release](https://github.com/sidecartridge/md-devops/actions/workflows/release.yml/badge.svg)](https://github.com/sidecartridge/md-devops/actions/workflows/release.yml)
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
+
+</div>
 
 This microfirmware turns the cartridge slot of an Atari ST / STE / Mega ST(E) into a remote
 development surface for the m68k. While it boots, the cartridge
@@ -15,6 +25,8 @@ floppies, ACSI), the sister app
 is what you want. **md-devops** is the developer-focused variant
 of that surface — same drive emulation, plus the runner / debug /
 HTTP-management surface stitched on top.
+
+> 🛒 **Get the hardware:** [SidecarTridge Multi-device](https://sidecartridge.com/products/sidecartridge-multidevice-atari-st/)
 
 ## Highlights
 
