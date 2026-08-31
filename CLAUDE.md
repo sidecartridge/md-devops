@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-See also: `programming.md` (full shared-region table and budget rules), `README.md` (high-level region/userfw overview), `AGENTS.md` (overlapping playbook + troubleshooting table).
+See also: `programming.md` (full shared-region table and budget rules), `README.md` (user-facing setup menu, GEMDRIVE/Runner usage, HTTP API, project internals), `AGENTS.md` (overlapping playbook + troubleshooting table).
 
 ## What this repo is
 
@@ -26,7 +26,7 @@ Required host environment:
 
 Build flow (orchestrated by `build.sh`):
 1. Copies `version.txt` into `rp/` and `target/atarist/`.
-2. Builds the Atari ST target (`target/atarist/build.sh`) via `stcmd make`. Enforces an **8 KB hard limit** on `BOOT.BIN` (the cartridge code budget — `CHANDLER_CARTRIDGE_CODE_SIZE` in `rp/src/include/chandler.h`, mirrored as `CARTRIDGE_CODE_SIZE` in `target/atarist/src/main.s`); a build that exceeds it aborts with `ERROR: cartridge code is N bytes; limit is 8192`. A separate copy (`FIRMWARE.IMG`) is then padded to 64 KB to fill the entire shared region, and `firmware.py` converts it into `rp/src/include/target_firmware.h` (a C byte array embedded in the RP firmware).
+2. Builds the Atari ST target (`target/atarist/build.sh`) via `stcmd make`. Enforces a **10 KB hard limit** on `BOOT.BIN` (the cartridge code budget — `CHANDLER_CARTRIDGE_CODE_SIZE` in `rp/src/include/chandler.h`, mirrored as `CARTRIDGE_CODE_SIZE` in `target/atarist/src/main.s`); a build that exceeds it aborts with `ERROR: cartridge code is N bytes; limit is 10240`. A separate copy (`FIRMWARE.IMG`) is then padded to 64 KB to fill the entire shared region, and `firmware.py` converts it into `rp/src/include/target_firmware.h` (a C byte array embedded in the RP firmware).
 3. Builds the RP firmware (`rp/build.sh`): pins submodule versions (pico-sdk 2.2.0, pico-extras sdk-2.2.0, fatfs-sdk at a specific commit), runs CMake, produces `rp/dist/rp-<board>.uf2`. The FatFs configuration lives at `rp/src/ff/ffconf.h` and shadows the submodule's default via `target_include_directories(... BEFORE PRIVATE)` in `rp/src/CMakeLists.txt`, so the `fatfs-sdk` submodule stays pristine.
 4. Computes MD5, renames to `dist/<APP_UUID>-<VERSION>.uf2`, and substitutes UUID/MD5/version into `dist/<APP_UUID>.json` from the `desc/app.json` template.
 
@@ -60,9 +60,12 @@ The firmware is a **two-target build**: m68k assembly that runs on the Atari ST 
 
 ### Atari ST side (`target/atarist/`)
 - `src/main.s` — m68k cartridge boot + dispatch + terminal. Lives at `$FA0000` in the ST address space (ROM4 cartridge region). Defines the cartridge header (`CA_MAGIC`, `CA_INIT`, …), command magic numbers, and the shared-variable layout used to talk to the RP2040.
-- `src/userfw.s` — **the primary extension point for app-specific m68k code.** `src/userfw.ld` places `main.s` at offset `0x0000` (2 KB budget) and `userfw.s` at offset `0x0800` (6 KB budget); `main.s` exposes the latter as `USERFW equ (ROM4_ADDR + $800)`. When the RP-side terminal command `f` ([F]irmware) is selected, the RP writes `CMD_START = 4` to the cartridge sentinel; the m68k's vsync-polled `check_commands` dispatches to `rom_function`, which `jmp`s to `USERFW`. The default `userfw.s` is a Cconws demo — replace its body with your own logic.
-- Adding more m68k modules: add a new `.text_<name>` section in `userfw.ld`, mirror the offset with an `equ (ROM4_ADDR + $????)` in `main.s`, and add the `.o` target to `target/atarist/Makefile` (same pattern as `gemdrive.ld` in `md-drives-emulator`).
-- Built via `stcmd make release` (m68k assembler in Docker); the cartridge image (header + all `.text_*` sections) must fit in 8 KB. A 64 KB padded copy is then converted to `target_firmware.h` for inclusion in the RP build.
+- `src/devops.ld` — absolute layout of the cartridge image. The 10 KB budget (`CARTRIDGE_CODE_SIZE = $2800`) is split: `main.s` at `$0000` (2 KB), `gemdrive.s` at `$0800` (5 KB), `runner.s` at `$1C00` (3 KB). `main.s` mirrors the last two as `GEMDRIVE_BLOB` / `RUNNER_BLOB`.
+- `src/gemdrive.s` — GEMDOS trap-#1 hooks + protocol blob. `gemdrive_install` copies `GEMDRIVE_BLOB_SIZE` bytes into RAM (default `screen_base - 16 KB`) once the user commits a mode, so the resident code survives cartridge teardown.
+- `src/runner.s` — Runner foreground loop; self-relocates at `runner_entry` to just above the GEMDRIVE blob inside the same protected 16 KB region (`RUNNER_ABOVE_GEMDRIVE_OFFSET`).
+- Dispatch: the RP writes `CMD_START = 4` ([G]) or `CMD_START_RUNNER = 5` ([U]) to the cartridge sentinel; the m68k's vsync-polled `check_commands` dispatches to `rom_function` / `runner_function`, both of which `jsr gemdrive_install` first.
+- Adding more m68k modules: add a new `.text_<name>` section in `devops.ld`, mirror the offset with an `equ (ROM4_ADDR + $????)` in `main.s`, add the `.o` target to `target/atarist/Makefile`, and account for it in the 10 KB budget.
+- Built via `stcmd make release` (m68k assembler in Docker); the cartridge image (header + all `.text_*` sections) must fit in 10 KB. A 64 KB padded copy is then converted to `target_firmware.h` for inclusion in the RP build.
 
 ### Shared 64 KB cartridge region
 The Atari ST sees a 64 KB window at `$FA0000`–`$FAFFFF` (mirrored RP-side at `0x20030000`). This is the **single source of truth** for any cross-target data layout — both sides derive every offset symbolically from constants in `rp/src/include/chandler.h` (RP-side) and `target/atarist/src/main.s` (m68k side). **Apps must never hard-code an address inside this region** — always reference the named offset/symbol.
