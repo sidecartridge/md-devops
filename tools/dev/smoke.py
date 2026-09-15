@@ -65,6 +65,16 @@ class Probe:
     def ready(self) -> bool:
         return self.elf is not None
 
+    @property
+    def has_mailbox(self) -> bool:
+        """The debug mailbox is in debug builds only."""
+        if not self.ready:
+            return False
+        try:
+            return bool(swd.elf_symbols(self.elf, swd.MAILBOX_SYMBOL))
+        except swd.SwdError:
+            return False
+
     def app(self, name: str) -> bool:
         """Run an app command from the debug mailbox."""
         command_id = swd.include_defines().get("DEVHOOKS_APP_" + name.upper())
@@ -231,7 +241,7 @@ class Smoke:
     def step_stop_countdown(self) -> None:
         """Stop the boot countdown so the ST stays on the menu."""
         name = "1b stop the countdown"
-        if self.probe.ready:
+        if self.probe.has_mailbox:
             try:
                 # The menu comes up about 11 s after a reset; the countdown
                 # only starts with it.
@@ -247,9 +257,17 @@ class Smoke:
             except swd.SwdError as exc:
                 self.record(name, "fail", f"probe: {exc}")
                 return
+        # A release build has no mailbox: ask instead.
         ok = self.ask("Stop the countdown. Is the ST on the menu?")
-        self.record(name, "skip" if ok is None else ("pass" if ok else "fail"),
-                    "needs --manual or the probe")
+        if ok is None:
+            self.record(name, "skip", "no mailbox (release build); needs --manual")
+            return
+        detail = "reported by the tester"
+        if ok and self.probe.ready:
+            menu = self.probe.wait_for_text("Select an option", 10)
+            ok = ok and menu
+            detail += f", menu text {'found' if menu else 'NOT found'}"
+        self.record(name, "pass" if ok else "fail", detail)
 
     def step_gemdrive_desktop(self) -> None:
         name = "2 [G] desktop and file copy"
