@@ -75,6 +75,8 @@ python3 tools/dev/swd.py select short                            # press SELECT 
 python3 tools/dev/swd.py key g                                   # a keystroke, as if typed on the ST
 python3 tools/dev/swd.py app countdown_stop                      # app command (countdown_restart too)
 python3 tools/dev/swd.py inject 0x0001 0x0067 0                  # any protocol command
+python3 tools/dev/swd.py crash                                   # why did it last reboot?
+python3 tools/dev/swd.py postmortem                              # halt, backtraces, resume
 ```
 
 `screen` renders the 320×200 framebuffer at the top of the cartridge window as a PNG (scaled 2×,
@@ -106,3 +108,17 @@ firmware handles it through its normal path. `app NAME` runs the app command def
 `DEVHOOKS_APP_<NAME>` in `rp/src/include` (md-devops: `countdown_stop`, `countdown_restart`). To
 support them in another microfirmware, include `devhooks.h` in one file, call `devhooks_poll()` from
 the main loop, and register app commands with `devhooks_setAppHandler()`.
+
+`crash` explains the last reboot without stopping the RP: the watchdog reason and scratch
+registers, and the breadcrumb the firmware decoded at boot when the ELF has it (md-devops keeps
+`bootCause`, `bootPhase`, `bootPc`, `bootLr`, `bootSp` in RAM), with code addresses resolved to
+source lines by `addr2line`.
+
+`postmortem` halts the RP and prints both cores' backtraces, the registers, the watchdog registers
+and the interesting variables through GDB (`$ARM_GDB_PATH/bin/arm-none-eabi-gdb`, as in
+`.vscode/launch.json`), then resumes it; `--leave-halted` keeps it stopped for `swd.py resume`. It
+takes a few seconds, so during a hang start it well inside the 8 s watchdog window. While the CPU
+is halted the RP2040 pauses the timer and the watchdog, so a hang that is halted in its first
+seconds reboots as `reboot` rather than `hang`: the stall mark that tells them apart needs five
+one-second ticks after the last watchdog feed. The backtrace is the better evidence. Halting also
+stops the cartridge bus, so the ST sees a dead cartridge until the RP resumes.

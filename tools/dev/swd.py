@@ -21,6 +21,8 @@ Usage:
     python3 tools/dev/swd.py key CHAR [--shift] [--scan N] [--elf ELF]
     python3 tools/dev/swd.py app NAME [--elf ELF]
     python3 tools/dev/swd.py inject COMMAND_ID [WORD ...] [--elf ELF]
+    python3 tools/dev/swd.py crash [--elf ELF]
+    python3 tools/dev/swd.py postmortem [--elf ELF] [--leave-halted]
 
 `running` waits until the vector table register (VTOR) holds the ELF's RAM
 vector table, which the SDK's runtime init installs, and core 0 is not halted:
@@ -49,6 +51,15 @@ a stuck override.
 `key` sends a keystroke as the ST would, `inject` any protocol command with the
 given 16-bit payload words after the random token, and `app` an app command
 named by a DEVHOOKS_APP_<NAME> define, for example `app countdown_stop`.
+
+`crash` explains the last reboot without stopping the RP: the watchdog reason
+and scratch registers and, when the ELF has them, the breadcrumb the firmware
+decoded at boot (md-devops health.c: bootCause, bootPhase, bootPc, bootLr,
+bootSp), with code addresses resolved to source lines. `postmortem` halts the
+RP and prints both cores' backtraces, the registers, the watchdog registers and
+key variables through GDB ($ARM_GDB_PATH/bin/arm-none-eabi-gdb or
+arm-none-eabi-gdb), then resumes it unless --leave-halted. Halting stops the
+cartridge bus and pauses the watchdog until the RP resumes.
 
 OpenOCD is $OPENOCD, `openocd` on PATH, or ../pico/openocd/src/openocd next to
 the repo; its scripts come from $PICO_OPENOCD_PATH (as in .vscode/launch.json),
@@ -96,6 +107,14 @@ MB_SEQ, MB_ACK, MB_KIND, MB_RESULT, MB_CMD, MB_SIZE, MB_PAYLOAD = (
     4, 8, 12, 16, 20, 22, 24)
 MAILBOX_WORDS = 16
 KIND_PROTOCOL, KIND_APP = 1, 2
+WATCHDOG_REASON = 0x40058008
+WATCHDOG_SCRATCH0 = 0x4005800C
+GDB_PORT = 3333
+# Variables postmortem prints when the ELF has them (md-devops health.c and
+# commemul.c); other microfirmwares simply lack them.
+POSTMORTEM_VARIABLES = ("bootCause", "bootPhase", "bootPc", "bootLr", "bootSp",
+                        "crashCount", "feedCount", "stallMs", "heapMinFree",
+                        "sbrkHighWater", "commReadIdx", "commLastWritten")
 BUILD_ID_SYMBOL = "release_build_id"
 
 
@@ -554,6 +573,155 @@ def cmd_app(args: argparse.Namespace) -> int:
     return 0 if result else 3
 
 
+def header_enums(path: str) -> dict[str, dict[int, str]]:
+    """Values of each `typedef enum {...} name;` in a C header."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    text = re.sub(r"//[^\n]*", " ", text)
+    enums = {}
+    for body, name in re.findall(r"typedef\s+enum\s*\{([^}]*)\}\s*(\w+)\s*;",
+                                 text):
+        values, nxt = {}, 0
+        for item in (i.strip() for i in body.split(",")):
+            if not item:
+                continue
+            m = re.match(r"(\w+)\s*(?:=\s*(\S+))?$", item)
+            if not m:
+                continue
+            if m.group(2):
+                nxt = int(m.group(2), 0)
+            values[nxt] = m.group(1)
+            nxt += 1
+        enums[name] = values
+    return enums
+
+
+def resolve_address(elf: str, address: int) -> str:
+    """`function at file:line` for a code address, or '' when not code."""
+    if not (0x10000000 <= address < 0x10100000 or
+            0x20000000 <= address < 0x20030000):
+        return ""
+    out = subprocess.run(["arm-none-eabi-addr2line", "-f", "-i", "-p", "-e",
+                          elf, f"0x{address & ~1:08x}"],
+                         capture_output=True, text=True).stdout.strip()
+    return "" if out.startswith("??") else out.replace("\n", "; ")
+
+
+def cmd_crash(args: argparse.Namespace) -> int:
+    elf = matching_elf(args.elf)
+    reason, *scratch = struct.unpack("<5I", read_memory(WATCHDOG_REASON, 20))
+    print(f"watchdog reason 0x{reason:08x}; scratch 0-3: " +
+          " ".join(f"0x{v:08x}" for v in scratch))
+    names = ("bootCause", "bootPhase", "bootPc", "bootLr", "bootSp")
+    syms = elf_symbols(elf, *names)
+    if len(syms) < len(names):
+        for i, v in enumerate(scratch):
+            where = resolve_address(elf, v)
+            if where:
+                print(f"  scratch {i}: {where}")
+        return 0
+    values = {}
+    for name in names:
+        addr, size = syms[name]
+        values[name] = int.from_bytes(read_memory(addr, size or 4), "little")
+    enums = {}
+    for header in glob.glob(os.path.join(INCLUDE_DIR, "*.h")):
+        enums.update(header_enums(header))
+    cause = enums.get("health_boot_t", {}).get(values["bootCause"],
+                                               str(values["bootCause"]))
+    print(f"last boot cause: {cause}")
+    if cause.endswith("HANG"):
+        phase = enums.get("health_phase_t", {}).get(values["bootPhase"],
+                                                    str(values["bootPhase"]))
+        print(f"  phase: {phase}")
+    for label, name in (("pc", "bootPc"), ("lr", "bootLr"), ("sp", "bootSp")):
+        v = values[name]
+        if v:
+            where = resolve_address(elf, v)
+            print(f"  {label} 0x{v:08x}" + (f"  {where}" if where else ""))
+    return 0
+
+
+def gdb_command() -> str:
+    gdb_dir = os.environ.get("ARM_GDB_PATH")
+    candidates = [os.path.join(gdb_dir, "bin", "arm-none-eabi-gdb")] if gdb_dir else []
+    candidates.append(shutil.which("arm-none-eabi-gdb") or "")
+    for c in candidates:
+        if c and os.access(c, os.X_OK):
+            return c
+    raise SwdError("no arm-none-eabi-gdb: set ARM_GDB_PATH")
+
+
+def cmd_postmortem(args: argparse.Namespace) -> int:
+    elf = matching_elf(args.elf)
+    gdb = gdb_command()
+    server = openocd_command() + [
+        "-c", f"gdb_port {GDB_PORT}", "-c", "tcl_port disabled",
+        "-c", "telnet_port disabled"]
+    if args.leave_halted:
+        # OpenOCD resumes the target when GDB detaches, unless told not to.
+        for core in CORES:
+            server += ["-c", f"{core} configure -event gdb-detach {{}}"]
+    proc = subprocess.Popen(server, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    try:
+        deadline = time.monotonic() + 10
+        ready = False
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            if f"port {GDB_PORT}" in line:
+                ready = True
+                break
+        if not ready:
+            raise SwdError("OpenOCD did not start its GDB server")
+        present = elf_symbols(elf, *POSTMORTEM_VARIABLES)
+        gdb_cmds = ["set pagination off", "set confirm off",
+                    "set print pretty on",
+                    f"target extended-remote localhost:{GDB_PORT}",
+                    "monitor halt",
+                    "echo \\n=== threads (one per core)\\n", "info threads",
+                    "echo \\n=== backtraces\\n", "thread apply all bt",
+                    "echo \\n=== registers (current core)\\n",
+                    "info registers",
+                    "echo \\n=== watchdog reason and scratch 0-3\\n",
+                    f"x/5xw 0x{WATCHDOG_REASON:08x}"]
+        if present:
+            gdb_cmds.append("echo \\n=== variables\\n")
+            for name in POSTMORTEM_VARIABLES:
+                if name in present:
+                    gdb_cmds += [f"echo {name} = ", f"output {name}",
+                                 "echo \\n"]
+        if not args.leave_halted:
+            gdb_cmds.append("monitor resume")
+        gdb_cmds.append("detach")
+        argv = [gdb, "-nx", "-batch", elf]
+        for c in gdb_cmds:
+            argv += ["-ex", c]
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        print(out.stdout.rstrip())
+        errors = [l for l in out.stderr.splitlines()
+                  if l.strip() and "warning" not in l.lower()]
+        if errors:
+            print("\n".join(errors[-5:]), file=sys.stderr)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    if args.leave_halted:
+        halted = [c for c in CORES if read_word(DHCSR, c) & DHCSR_S_HALT]
+        print("\nleft halted: " + (", ".join(halted) or "nothing") +
+              " (swd.py resume to continue)")
+        return 0
+    # OpenOCD leaves debug mode enabled (C_DEBUGEN) after GDB detaches; clear
+    # it on both cores so the RP runs exactly as before the halt.
+    return cmd_resume(args)
+
+
 def cmd_program(args: argparse.Namespace) -> int:
     openocd(f"program {args.elf} verify reset")
     print(f"flashed {args.elf}")
@@ -615,6 +783,15 @@ def build_parser() -> argparse.ArgumentParser:
     ij.add_argument("words", nargs="*")
     ij.add_argument("--elf")
     ij.set_defaults(func=cmd_inject)
+
+    cr = sub.add_parser("crash", help="explain the last reboot")
+    cr.add_argument("--elf")
+    cr.set_defaults(func=cmd_crash)
+
+    pm = sub.add_parser("postmortem", help="halt, dump backtraces, resume")
+    pm.add_argument("--elf")
+    pm.add_argument("--leave-halted", action="store_true")
+    pm.set_defaults(func=cmd_postmortem)
 
     sc = sub.add_parser("screen", help="render the framebuffer as a PNG")
     sc.add_argument("out")

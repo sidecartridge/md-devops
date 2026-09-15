@@ -236,15 +236,20 @@ void health_init(void) {
 }
 
 // Timer interrupt, once a second: marks a stalled feed (see STALL_MAGIC).
+// scratch[1] is shared with the crash handlers, which store the PC there just
+// before the reboot. This timer can still run in that window, so it only
+// replaces its own values (0 or the mark), never a crash PC.
 static bool health_stallCheck(repeating_timer_t *timer) {
   (void)timer;
   if (feedCount != stallLastFeedCount) {
     stallLastFeedCount = feedCount;
     stallMs = 0;
-    watchdog_hw->scratch[1] = 0;
+    if (watchdog_hw->scratch[1] == STALL_MAGIC) watchdog_hw->scratch[1] = 0;
   } else if (stallMs < STALL_MARK_MS) {
     stallMs += STALL_CHECK_MS;
-    if (stallMs >= STALL_MARK_MS) watchdog_hw->scratch[1] = STALL_MAGIC;
+    if (stallMs >= STALL_MARK_MS && watchdog_hw->scratch[1] == 0) {
+      watchdog_hw->scratch[1] = STALL_MAGIC;
+    }
   }
   return true;
 }
