@@ -102,4 +102,13 @@ void __not_in_flash_func(chandler_loop)();
 
 void __not_in_flash_func(chandler_addCB)(CommandCallback cb);
 
+#if defined(_DEBUG) && (_DEBUG != 0)
+// Queue a command as if the ST had sent it (payload words in the order the
+// protocol parser stores them, random token first); chandler_loop() then
+// dispatches it. Returns false while another command is pending. Debug-only,
+// for devhooks.h.
+bool chandler_injectProtocol(uint16_t commandId, const uint16_t *payload,
+                             uint16_t payloadSize);
+#endif
+
 #endif  // CHANDLER_H

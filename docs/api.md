@@ -161,6 +161,8 @@ cadence.
 {
   "ok": true,
   "version": "v1.1.0",
+  "build": "b9b53cc",
+  "debug": false,
   "uptime_s": 312,
   "heap": { "total": 118720, "free": 61240, "min_free": 48812, "sbrk_high_water": 72316 },
   "stack": { "reserved": 2048, "high_water": 5324, "painted": 8192, "overflow": false },
@@ -176,6 +178,8 @@ cadence.
 
 | Field | Meaning |
 | --- | --- |
+| `build` | Git commit the firmware was built from: `<sha7>`, or `<sha7>-dirty.<diff7>` with uncommitted changes (`<diff7>` hashes the diff, so the same changes always give the same ID). Also printed on the debug console at boot. |
+| `debug` | `true` for a `debug` build (`DPRINTF` traces on the console), `false` for `release`. |
 | `uptime_s` | Seconds since the RP booted. `ping` counts from when the HTTP server started instead. |
 | `heap.total` | Bytes between the end of BSS and the heap cap at the start of the cartridge window. |
 | `heap.free` | Bytes `malloc` can still use: never-claimed heap plus free chunks inside the claimed part. |

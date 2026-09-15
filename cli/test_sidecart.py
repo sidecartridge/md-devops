@@ -206,6 +206,8 @@ def _health_payload(**overrides: object) -> dict:
     payload = {
         "ok": True,
         "version": "v1.1.0",
+        "build": "b9b53cc-dirty.1a2b3c4",
+        "debug": True,
         "uptime_s": 42,
         "heap": {"total": 180000, "free": 120000, "min_free": 90000,
                  "sbrk_high_water": 70000},
@@ -244,7 +246,7 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertEqual(self.server.state.last_method, "GET")
         self.assertEqual(self.server.state.last_path, "/api/v1/system/health")
-        for text in ("v1.1.0", "42 s", "120000 / 180000", "90000", "70000",
+        for text in ("v1.1.0", "b9b53cc-dirty.1a2b3c4 (debug)", "42 s", "120000 / 180000", "90000", "70000",
                      "5120 bytes, 2048 reserved, 8192 measured", "65536",
                      "power_on", "watchdog        : on",
                      "rom3 overruns   : 3", "usbcdc dropped  : 17"):

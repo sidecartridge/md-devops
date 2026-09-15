@@ -240,6 +240,8 @@ def cmd_health(args: argparse.Namespace) -> int:
     stack = parsed.get("stack", {})
     reset = parsed.get("reset", {})
     print(f"version         : {parsed.get('version', '?')}")
+    build_type = "debug" if parsed.get("debug") else "release"
+    print(f"build           : {parsed.get('build', '?')} ({build_type})")
     print(f"uptime          : {parsed.get('uptime_s', 0)} s")
     print(f"heap free       : {heap.get('free', 0)} / {heap.get('total', 0)} bytes")
     print(f"heap min free   : {heap.get('min_free', 0)} bytes")

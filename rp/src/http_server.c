@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "aconfig.h"
+#include "build_id.h"
 #include "chandler.h"
 #include "commemul.h"
 #include "debug.h"
@@ -2835,16 +2836,17 @@ static void handle_system_health(http_conn_t *c) {
   }
 
   // Static: the body is too big for the 2 KB core-0 stack. Sized for the
-  // longest possible report (521 bytes, 757 with the lwIP counters).
+  // longest possible report (567 bytes, 803 with the lwIP counters).
 #if LWIP_STATS && MEM_STATS && MEMP_STATS
-  static char body[768];
+  static char body[816];
 #else
-  static char body[544];
+  static char body[576];
 #endif
   size_t len = 0;
   bool fits = body_appendf(
       body, sizeof(body), &len,
-      "{\"ok\":true,\"version\":\"%s\",\"uptime_s\":%lu,"
+      "{\"ok\":true,\"version\":\"%s\",\"build\":\"%s\",\"debug\":%s,"
+      "\"uptime_s\":%lu,"
       "\"heap\":{\"total\":%lu,\"free\":%lu,\"min_free\":%lu,"
       "\"sbrk_high_water\":%lu},"
       "\"stack\":{\"reserved\":%lu,\"high_water\":%lu,\"painted\":%lu,"
@@ -2854,14 +2856,14 @@ static void handle_system_health(http_conn_t *c) {
       "\"sp\":%s,\"crash_count\":%u,\"crash_loop\":%s},"
       "\"watchdog\":%s,\"rom3_overruns\":%lu,\"debugcap_dropped\":%lu,"
       "\"usbcdc_dropped\":%lu",
-      RELEASE_VERSION, (unsigned long)(r.uptime_ms / 1000u),
-      (unsigned long)r.heap_total, (unsigned long)r.heap_free,
-      (unsigned long)r.heap_min_free, (unsigned long)r.sbrk_high_water,
-      (unsigned long)r.stack_reserved, (unsigned long)r.stack_high_water,
-      (unsigned long)r.stack_painted, r.stack_overflow ? "true" : "false",
-      (unsigned long)r.code_in_ram, health_bootName(r.boot), phase, pc, lr, sp,
-      (unsigned)r.crash_count, r.crash_loop ? "true" : "false",
-      r.watchdog_enabled ? "true" : "false",
+      RELEASE_VERSION, RELEASE_BUILD_ID, (_DEBUG != 0) ? "true" : "false",
+      (unsigned long)(r.uptime_ms / 1000u), (unsigned long)r.heap_total,
+      (unsigned long)r.heap_free, (unsigned long)r.heap_min_free,
+      (unsigned long)r.sbrk_high_water, (unsigned long)r.stack_reserved,
+      (unsigned long)r.stack_high_water, (unsigned long)r.stack_painted,
+      r.stack_overflow ? "true" : "false", (unsigned long)r.code_in_ram,
+      health_bootName(r.boot), phase, pc, lr, sp, (unsigned)r.crash_count,
+      r.crash_loop ? "true" : "false", r.watchdog_enabled ? "true" : "false",
       (unsigned long)commemul_getOverruns(), (unsigned long)bytes_dropped,
       (unsigned long)usbcdc_dropped);
 #if LWIP_STATS && MEM_STATS && MEMP_STATS

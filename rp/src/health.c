@@ -16,6 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "build_id.h"
 #include "commemul.h"
 #include "debug.h"
 #include "hardware/structs/scb.h"
@@ -221,7 +222,8 @@ void health_init(void) {
   health_paintStack();
   health_sampleHeap(NULL, NULL);
 
-  DPRINTF("health: boot cause %s", health_bootName(bootCause));
+  DPRINTF("health: build %s, boot cause %s", RELEASE_BUILD_ID,
+          health_bootName(bootCause));
   if (bootCause == HEALTH_BOOT_HANG) {
     DPRINTFRAW(" in %s", health_phaseName(bootPhase));
   } else if (bootCause == HEALTH_BOOT_PANIC ||
@@ -234,15 +236,20 @@ void health_init(void) {
 }
 
 // Timer interrupt, once a second: marks a stalled feed (see STALL_MAGIC).
+// scratch[1] is shared with the crash handlers, which store the PC there just
+// before the reboot. This timer can still run in that window, so it only
+// replaces its own values (0 or the mark), never a crash PC.
 static bool health_stallCheck(repeating_timer_t *timer) {
   (void)timer;
   if (feedCount != stallLastFeedCount) {
     stallLastFeedCount = feedCount;
     stallMs = 0;
-    watchdog_hw->scratch[1] = 0;
+    if (watchdog_hw->scratch[1] == STALL_MAGIC) watchdog_hw->scratch[1] = 0;
   } else if (stallMs < STALL_MARK_MS) {
     stallMs += STALL_CHECK_MS;
-    if (stallMs >= STALL_MARK_MS) watchdog_hw->scratch[1] = STALL_MAGIC;
+    if (stallMs >= STALL_MARK_MS && watchdog_hw->scratch[1] == 0) {
+      watchdog_hw->scratch[1] = STALL_MAGIC;
+    }
   }
   return true;
 }
