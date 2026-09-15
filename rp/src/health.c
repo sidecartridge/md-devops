@@ -16,6 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "build_id.h"
 #include "commemul.h"
 #include "debug.h"
 #include "hardware/structs/scb.h"
@@ -221,7 +222,8 @@ void health_init(void) {
   health_paintStack();
   health_sampleHeap(NULL, NULL);
 
-  DPRINTF("health: boot cause %s", health_bootName(bootCause));
+  DPRINTF("health: build %s, boot cause %s", RELEASE_BUILD_ID,
+          health_bootName(bootCause));
   if (bootCause == HEALTH_BOOT_HANG) {
     DPRINTFRAW(" in %s", health_phaseName(bootPhase));
   } else if (bootCause == HEALTH_BOOT_PANIC ||

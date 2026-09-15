@@ -238,6 +238,19 @@ message("RELEASE_DATE: " ${RELEASE_DATE})
 message("DEBUG_MODE: " ${_DEBUG})
 message("LATEST_RELEASE_URL: " ${LATEST_RELEASE_URL})
 
+# build_id.h (RELEASE_BUILD_ID, the git commit) is regenerated on every build;
+# see build_id.cmake. It is rewritten only when the ID changes, so only its
+# includers recompile.
+set(BUILD_ID_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/build_id/build_id.h)
+add_custom_target(build_id
+    COMMAND ${CMAKE_COMMAND} -DSRC_DIR=${CMAKE_CURRENT_LIST_DIR}
+            -DOUT=${BUILD_ID_HEADER} -P ${CMAKE_CURRENT_LIST_DIR}/build_id.cmake
+    BYPRODUCTS ${BUILD_ID_HEADER}
+    COMMENT "Checking the build ID")
+add_dependencies(${PROJECT_NAME} build_id)
+target_include_directories(${PROJECT_NAME} PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}/generated/build_id)
+
 # Pass these values to the C compiler
 add_definitions(-DRELEASE_TYPE="${RELEASE_TYPE}")
 add_definitions(-DRELEASE_VERSION="${RELEASE_VERSION}")
