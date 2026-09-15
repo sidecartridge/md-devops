@@ -27,7 +27,7 @@ cd ..
 echo "Pinning the FatFs SDK versions..."
 cd fatfs-sdk
 #git checkout v3.5.1
-git checkout 6bdb39f96fe8b897aff12bf3416e32515792e318
+git checkout 6c644cfc3ab03c161fee2dd7be4877e5b832fa71
 cd ..
 
 # FatFs configuration is overridden by rp/src/ff/ffconf.h; the CMake
