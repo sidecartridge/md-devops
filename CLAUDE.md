@@ -55,6 +55,8 @@ The top-level `./build.sh` also re-pins SDK submodules and rebuilds the full RP 
 ### Tests
 There is no test suite. "Verification" is: build succeeds, UF2 boots on hardware, manual interaction over the serial debug console.
 
+Host-side developer tools live in `tools/dev/` (see its README). `tools/dev/console.py watch` captures the debug console to `tools/dev/logs/console.log`; read it with `console.py since-boot`, `grep` or `wait` instead of asking for a pasted log.
+
 ## Architecture
 
 The firmware is a **two-target build**: m68k assembly that runs on the Atari ST is compiled into a ROM image, embedded as a C array inside the RP2040 firmware, and served back to the Atari over the cartridge bus that the RP2040 emulates via PIO + DMA.

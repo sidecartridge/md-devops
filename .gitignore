@@ -61,3 +61,4 @@ dist/
 .claude/
 docs/epics/
 cli/__pycache__/
+tools/dev/logs/
