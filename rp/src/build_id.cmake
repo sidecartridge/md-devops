@@ -1,5 +1,6 @@
-# Writes build_id.h with RELEASE_BUILD_ID, the git commit the firmware was
-# built from. Run on every build (not only at configure time), so an
+# Writes build_id.h (RELEASE_BUILD_ID) and build_id.c (the same string as the
+# release_build_id symbol in flash, which tools read over SWD) with the git
+# commit the firmware was built from. Run on every build (not only at configure time), so an
 # incremental build never reports a stale ID.
 #
 #   <sha7>                     clean tree
@@ -10,7 +11,7 @@
 #                              cut to 21 characters
 #   nogit                      not a git checkout
 #
-# Inputs: -DSRC_DIR=<rp/src> -DOUT=<path of build_id.h>
+# Inputs: -DSRC_DIR=<rp/src> -DOUT_DIR=<folder for build_id.h and build_id.c>
 
 if(DEFINED ENV{RELEASE_BUILD_ID} AND NOT "$ENV{RELEASE_BUILD_ID}" STREQUAL "")
   set(BUILD_ID "$ENV{RELEASE_BUILD_ID}")
@@ -43,13 +44,18 @@ endif()
 # The health report sizes its buffer for 21 characters (<sha7>-dirty.<diff7>).
 string(SUBSTRING "${BUILD_ID}" 0 21 BUILD_ID)
 
-set(CONTENT "#pragma once\n#define RELEASE_BUILD_ID \"${BUILD_ID}\"\n")
-if(EXISTS "${OUT}")
-  file(READ "${OUT}" OLD)
-else()
-  set(OLD "")
-endif()
-if(NOT "${OLD}" STREQUAL "${CONTENT}")
-  file(WRITE "${OUT}" "${CONTENT}")
-  message(STATUS "RELEASE_BUILD_ID: ${BUILD_ID}")
-endif()
+function(write_if_changed path content)
+  if(EXISTS "${path}")
+    file(READ "${path}" old)
+  else()
+    set(old "")
+  endif()
+  if(NOT "${old}" STREQUAL "${content}")
+    file(WRITE "${path}" "${content}")
+  endif()
+endfunction()
+
+write_if_changed("${OUT_DIR}/build_id.h"
+  "#pragma once\n#define RELEASE_BUILD_ID \"${BUILD_ID}\"\nextern const char release_build_id[];\n")
+write_if_changed("${OUT_DIR}/build_id.c"
+  "#include \"build_id.h\"\nconst char release_build_id[] = RELEASE_BUILD_ID;\n")

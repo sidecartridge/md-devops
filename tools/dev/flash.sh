@@ -1,27 +1,27 @@
 #!/bin/bash
-# Build the RP firmware out of tree, flash it, and confirm the device runs it.
+# Build the RP firmware out of tree, flash it, and confirm the RP runs it.
 #
 #   tools/dev/flash.sh <release|debug> [--src DIR] [--build-only] [--probe]
-#                      [--host HOST] [--timeout S]
+#                      [--timeout S]
 #
 # Builds into tools/dev/builds/<type> (incremental; never touches rp/build or
 # the submodules), keeps rp.elf as tools/dev/builds/elf/<type>-<build id>.elf,
-# flashes with picotool (or the Debug Probe when picotool cannot see the RP,
-# or with --probe), then polls GET /api/v1/system/health until it reports the
-# new build ID and build type. m68k changes need target/atarist/build.sh first.
+# and flashes with picotool (or the Debug Probe when picotool cannot see the
+# RP, or with --probe). Then checks over SWD, without the firmware's help, that
+# the RP booted the ELF, that its flash matches the ELF and that it carries the
+# new build ID (tools/dev/swd.py). m68k changes need target/atarist/build.sh
+# first.
 #
-# Environment: APP_UUID_KEY (default: the development UUID), SIDECART_HOST
-# (default sidecart.local), OPENOCD (openocd binary; default: openocd on PATH,
-# else ../pico/openocd next to the repo), PICO_OPENOCD_PATH (its scripts
-# folder, as in .vscode/launch.json), RELEASE_DATE (default: the date of the
-# HEAD commit, so builds of one commit are byte-identical).
+# Environment: APP_UUID_KEY (default: the development UUID), OPENOCD and
+# PICO_OPENOCD_PATH (see swd.py), RELEASE_DATE (default: the date of the HEAD
+# commit, so builds of one commit are byte-identical).
 set -Eeo pipefail
 trap 'echo "ERROR: ${BASH_SOURCE[0]}: failed at line ${LINENO}" >&2' ERR
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 
-usage() { sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 
 TYPE="${1:-}"
 case "$TYPE" in
@@ -33,14 +33,12 @@ shift
 SRC="$REPO/rp/src"
 BUILD_ONLY=0
 USE_PROBE=0
-HOST="${SIDECART_HOST:-sidecart.local}"
-TIMEOUT=90
+TIMEOUT=30
 while [ $# -gt 0 ]; do
   case "$1" in
     --src) SRC="$(cd "$2" && pwd)"; shift 2 ;;
     --build-only) BUILD_ONLY=1; shift ;;
     --probe) USE_PROBE=1; shift ;;
-    --host) HOST="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
     *) usage ;;
   esac
@@ -83,48 +81,25 @@ arm-none-eabi-size "$OUT/rp.elf" | tail -1
 echo "Built $TYPE $BUILD_ID: $OUT/rp.uf2"
 [ "$BUILD_ONLY" = 1 ] && exit 0
 
-probe_flash() {
-  local ocd="${OPENOCD:-}" scripts=()
-  if [ -z "$ocd" ] && command -v openocd > /dev/null; then
-    ocd="$(command -v openocd)"
-  elif [ -z "$ocd" ] && [ -x "$REPO/../pico/openocd/src/openocd" ]; then
-    ocd="$REPO/../pico/openocd/src/openocd"
-  fi
-  [ -n "$ocd" ] || { echo "ERROR: no openocd; set OPENOCD" >&2; return 1; }
-  # Scripts folder: PICO_OPENOCD_PATH, as in .vscode/launch.json, else the
-  # tcl/ folder of a source build run from its src/ folder.
-  local tcl="${PICO_OPENOCD_PATH:-$(dirname "$ocd")/../tcl}"
-  [ -f "$tcl/interface/cmsis-dap.cfg" ] && scripts=(-s "$tcl")
-  "$ocd" "${scripts[@]}" -f interface/cmsis-dap.cfg -f target/rp2040.cfg \
-    -c "adapter speed 5000" -c "program $OUT/rp.elf verify reset exit" \
-    > "$OUT/openocd.log" 2>&1 || { tail -5 "$OUT/openocd.log"; return 1; }
-  echo "Flashed with the Debug Probe"
-}
-
 if [ "$USE_PROBE" = 1 ]; then
-  probe_flash
+  python3 "$HERE/swd.py" program "$OUT/rp.elf"
 elif picotool load -f -x "$OUT/rp.uf2" > "$OUT/picotool.log" 2>&1; then
   echo "Flashed with picotool"
 else
   echo "picotool could not flash ($(grep -m1 -i 'no accessible\|error' "$OUT/picotool.log" || echo 'see picotool.log')); using the Debug Probe"
-  probe_flash
+  python3 "$HERE/swd.py" program "$OUT/rp.elf"
 fi
 
-want_debug=false
-[ "$TYPE" = debug ] && want_debug=true
-deadline=$((SECONDS + TIMEOUT))
-while [ $SECONDS -lt $deadline ]; do
-  if health="$(curl -s --max-time 3 "http://$HOST/api/v1/system/health")" \
-     && running="$(printf '%s' "$health" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("build",""), str(d.get("debug")).lower(), d.get("uptime_s"))' 2>/dev/null)"; then
-    read -r run_id run_debug uptime <<< "$running"
-    if [ "$run_id" = "$BUILD_ID" ] && [ "$run_debug" = "$want_debug" ]; then
-      echo "Running $TYPE $BUILD_ID on $HOST (up $uptime s)"
-      exit 0
-    fi
-  fi
-  sleep 2
-done
-echo "ERROR: $HOST did not report $TYPE $BUILD_ID within $TIMEOUT s (last: ${running:-no answer})" >&2
+# Verified over SWD, without the firmware's help: the RP has left the bootrom
+# for this ELF, its flash matches the ELF byte for byte, and the build ID is
+# the one just built.
+if python3 "$HERE/swd.py" running "$OUT/rp.elf" --timeout "$TIMEOUT" \
+   && python3 "$HERE/swd.py" verify "$OUT/rp.elf" \
+   && [ "$(python3 "$HERE/swd.py" build-id "$OUT/rp.elf")" = "$BUILD_ID" ]; then
+  echo "Running $TYPE $BUILD_ID"
+  exit 0
+fi
+echo "ERROR: the RP is not running $TYPE $BUILD_ID" >&2
 if [ -f "$HERE/logs/console.log" ]; then
   echo "--- console since the last boot (last 30 lines)" >&2
   python3 "$HERE/console.py" since-boot 2>/dev/null | tail -30 >&2 || true
