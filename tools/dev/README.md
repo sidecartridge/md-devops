@@ -122,3 +122,28 @@ is halted the RP2040 pauses the timer and the watchdog, so a hang that is halted
 seconds reboots as `reboot` rather than `hang`: the stall mark that tells them apart needs five
 one-second ticks after the last watchdog feed. The backtrace is the better evidence. Halting also
 stops the cartridge bus, so the ST sees a dead cartridge until the RP resumes.
+
+## Smoke test: `smoke.py`
+
+```bash
+python3 tools/dev/smoke.py --label debug --json smoke.json            # probe-driven, no prompts
+python3 tools/dev/smoke.py --manual --entries 500                     # also the ST-side steps
+python3 tools/dev/smoke.py --no-swd --manual                          # without the probe
+```
+
+Checks the device end to end: a 256 KB upload, download, rename and delete, a folder listing, the
+Runner (when it is active), stopping the countdown and a SELECT press. It reads
+`GET /api/v1/system/health` before and after each step and fails the step if the RP rebooted,
+counted a crash or overran the ROM3 ring.
+
+With the probe it stops the countdown, presses SELECT and reads the menu text and the firmware's
+own `haltCountdown` flag, so only the cold boot, the `[G]` desktop and file copy, and switching the
+ST to `[U]` still need a person (`--manual`; they are skipped otherwise). The mailbox commands need
+a `debug` build. `--json` writes the results with the build ID and the console log since the last
+boot.
+
+## Other tools
+
+- `measure_builds.sh` builds each build type out of tree with `-fstack-usage` and
+  `-fcallgraph-info=su`, and reports the flash, RAM and heap numbers.
+- `stackdepth.py` computes worst-case stack depth from those builds (static call edges only).

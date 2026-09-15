@@ -30,6 +30,13 @@ stcmd ls
 cd md-microfirmware-template
 PICO_TOOLCHAIN_PATH=/Applications/ArmGNUToolchain/14.2.rel1/arm-none-eabi/bin \
   ./build.sh pico_w release 123e4567-e89b-12d3-a456-426614174000
+
+# Developer tools with the hardware attached (see tools/dev/README.md)
+python3 tools/dev/console.py watch            # capture the debug console (921,600 baud)
+tools/dev/flash.sh debug                      # build out of tree, flash, verify over SWD
+python3 tools/dev/swd.py text                 # the setup menu as text
+python3 tools/dev/swd.py crash                # why the RP last rebooted
+python3 tools/dev/smoke.py --json smoke.json  # end-to-end hardware check
 ```
 
 ## 3. Build Notes & Gotchas

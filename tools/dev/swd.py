@@ -17,6 +17,7 @@ Usage:
     python3 tools/dev/swd.py resume
     python3 tools/dev/swd.py screen OUT.png [--elf ELF] [--scale N]
     python3 tools/dev/swd.py shared [--elf ELF] [--all]
+    python3 tools/dev/swd.py text [--elf ELF]
     python3 tools/dev/swd.py select short|long|release [--hold-ms MS] [--force]
     python3 tools/dev/swd.py key CHAR [--shift] [--scan N] [--elf ELF]
     python3 tools/dev/swd.py app NAME [--elf ELF]
@@ -38,6 +39,10 @@ sentinel, the random token and the indexed shared variables, named after the
 `*_SVAR_*` indexes in rp/src/include. Both find the window from the ELF's
 `__rom_in_ram_start__` and the offsets from rp/src/include/chandler.h; without
 `--elf` they use the cached ELF whose build ID matches the RP.
+
+`text` prints the terminal's character buffer (the `screen` array of term.c),
+which is the menu as text; the bottom status line is drawn straight to the
+framebuffer and only shows in `screen`.
 
 `select` presses the SELECT button: it forces the pin's input high through the
 GPIO input override (IO_BANK0 GPIOn_CTRL.INOVER) for the hold time, so the
@@ -394,6 +399,20 @@ def cmd_screen(args: argparse.Namespace) -> int:
     lit = sum(bin(b).count("1") for b in fb)
     print(f"wrote {args.out} ({FB_WIDTH * args.scale}x{FB_HEIGHT * args.scale}, "
           f"{lit} pixels lit) from 0x{base + offset:08x}")
+    return 0
+
+
+def cmd_text(args: argparse.Namespace) -> int:
+    elf = matching_elf(args.elf)
+    sym = elf_symbols(elf, "screen").get("screen")
+    if not sym or not sym[1]:
+        raise SwdError(f"{os.path.basename(elf)} has no term screen buffer")
+    defs = include_defines()
+    width = defs.get("TERM_SCREEN_SIZE_X", 40)
+    data = read_memory(sym[0], sym[1])
+    for y in range(sym[1] // width):
+        row = data[y * width:(y + 1) * width]
+        print("".join(chr(c) if 32 <= c < 127 else " " for c in row).rstrip())
     return 0
 
 
@@ -798,6 +817,10 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--elf")
     sc.add_argument("--scale", type=int, default=2)
     sc.set_defaults(func=cmd_screen)
+
+    tx = sub.add_parser("text", help="print the terminal screen as text")
+    tx.add_argument("--elf")
+    tx.set_defaults(func=cmd_text)
 
     sh = sub.add_parser("shared", help="print the shared variables")
     sh.add_argument("--elf")
