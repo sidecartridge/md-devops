@@ -21,6 +21,7 @@
 #include "commemul.h"
 #include "constants.h"
 #include "debug.h"
+#include "devhooks.h"
 #include "display.h"
 #include "display_term.h"
 #include "ff.h"
@@ -658,6 +659,33 @@ static void refreshSetupInfoLine(void) {
     showCounter(countdown);
   }
 }
+
+#if defined(_DEBUG) && (_DEBUG != 0)
+// Debug mailbox app commands (devhooks.h): stop or restart the boot countdown
+// from a host tool. Returns 1 when done, 0 for an unknown command.
+static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
+                                 uint16_t payloadSize) {
+  (void)payload;
+  (void)payloadSize;
+  switch (commandId) {
+    case DEVHOOKS_APP_COUNTDOWN_STOP:
+      haltCountdown = true;
+      return 1;
+    case DEVHOOKS_APP_COUNTDOWN_RESTART:
+      (void)term_consumeAnyKeyPressed();
+      countdown = BOOT_COUNTDOWN_SECONDS;
+      lastCountdownTick = get_absolute_time();
+      haltCountdown = false;
+      if (menuScreenActive) {
+        showCounter(countdown);
+        display_refresh();
+      }
+      return 1;
+    default:
+      return 0;
+  }
+}
+#endif
 
 // Thin horizontal dividers between the menu's config groups.
 // Drawn in the gap row above each section header so they don't
@@ -1639,6 +1667,9 @@ void emul_start() {
   // mark, then arm the watchdog. From here a hang reboots the RP.
   health_init();
   health_watchdogStart();
+#if defined(_DEBUG) && (_DEBUG != 0)
+  devhooks_setAppHandler(emul_devhooksApp);
+#endif
 
   // Bring up the USB CDC sink for the debugcap ring.
   // Idempotent stdio_init_all + detaches stdio from CDC so DPRINTF
@@ -1955,6 +1986,7 @@ void emul_start() {
 
     // Heap sampling, the debug summary and debug test hooks.
     health_tick();
+    devhooks_poll();
 
     // Run the terminal foreground (consume the published command, render
     // output, etc.).

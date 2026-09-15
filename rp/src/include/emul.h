@@ -24,6 +24,11 @@
  */
 void emul_start();
 
+// App commands for the debug mailbox (devhooks.h, DEVHOOKS_KIND_APP); host
+// tools read these names: tools/dev/swd.py app countdown_stop.
+#define DEVHOOKS_APP_COUNTDOWN_STOP 1
+#define DEVHOOKS_APP_COUNTDOWN_RESTART 2
+
 /**
  * @brief Whether the user picked Runner mode at boot ([U] in the
  *        setup menu). Set RP-side by cmdRunner because the m68k

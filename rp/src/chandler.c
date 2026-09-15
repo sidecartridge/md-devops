@@ -133,6 +133,25 @@ static inline void __not_in_flash_func(handle_protocol_command)(
   protocolPending = true;
 }
 
+#if defined(_DEBUG) && (_DEBUG != 0)
+bool chandler_injectProtocol(uint16_t commandId, const uint16_t *payload,
+                             uint16_t payloadSize) {
+  if (protocolPending) {
+    return false;
+  }
+  uint16_t size = tprotocol_clamp_payload_size(payloadSize);
+  pendingProtocol.command_id = commandId;
+  pendingProtocol.payload_size = size;
+  pendingProtocol.bytes_read = size;
+  pendingProtocol.final_checksum = 0;
+  memset(pendingProtocol.payload, 0, sizeof(pendingProtocol.payload));
+  memcpy(pendingProtocol.payload, payload, (size + 1u) & ~1u);
+  protocolPending = true;
+  DPRINTF("Injected command %04x (%u bytes)\n", commandId, size);
+  return true;
+}
+#endif
+
 static inline void __not_in_flash_func(handle_protocol_checksum_error)(
     const TransmissionProtocol *protocol) {
   DPRINTF(

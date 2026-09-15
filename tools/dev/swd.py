@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-swd — read and check a running RP2040 through the Debug Probe.
+swd — read, check and drive a running RP2040 through the Debug Probe.
 
 Single-file, stdlib-only (Python >= 3.10). Runs OpenOCD with the CMSIS-DAP
-probe for each command. Nothing here needs the firmware's cooperation: memory
-is read through the debug port while the CPU keeps running, so it works for any
-microfirmware and on a hung RP.
+probe for each command. It never uses the firmware's own services: memory is
+read through the debug port while the CPU keeps running, so it works for any
+microfirmware from the template and on a hung RP. Only `key`, `app` and
+`inject` need firmware help, the debug-only mailbox in devhooks.h.
 
 Usage:
     python3 tools/dev/swd.py running ELF [--timeout S]
@@ -16,14 +17,18 @@ Usage:
     python3 tools/dev/swd.py resume
     python3 tools/dev/swd.py screen OUT.png [--elf ELF] [--scale N]
     python3 tools/dev/swd.py shared [--elf ELF] [--all]
+    python3 tools/dev/swd.py select short|long|release [--hold-ms MS] [--force]
+    python3 tools/dev/swd.py key CHAR [--shift] [--scan N] [--elf ELF]
+    python3 tools/dev/swd.py app NAME [--elf ELF]
+    python3 tools/dev/swd.py inject COMMAND_ID [WORD ...] [--elf ELF]
 
 `running` waits until the vector table register (VTOR) holds the ELF's RAM
 vector table, which the SDK's runtime init installs, and core 0 is not halted:
 the RP has booted a firmware with that layout and got past its startup code.
-`resume` releases both cores after a debugger left them halted. `verify` compares the whole flashed image with the ELF (about 3 s
-for 630 KB). `build-id` reads the `release_build_id` string from flash; with no
-ELF it tries every ELF in tools/dev/builds/elf. `program` flashes the ELF and
-resets the RP.
+`resume` releases both cores after a debugger left them halted. `verify`
+compares the whole flashed image with the ELF (about 3 s for 630 KB).
+`build-id` reads the `release_build_id` string from flash; with no ELF it tries
+every ELF in tools/dev/builds/elf. `program` flashes the ELF and resets the RP.
 
 `screen` renders the 320x200 framebuffer at the top of the 64 KB cartridge
 window as a PNG: the setup menu as the ST shows it. `shared` prints the command
@@ -31,6 +36,19 @@ sentinel, the random token and the indexed shared variables, named after the
 `*_SVAR_*` indexes in rp/src/include. Both find the window from the ELF's
 `__rom_in_ram_start__` and the offsets from rp/src/include/chandler.h; without
 `--elf` they use the cached ELF whose build ID matches the RP.
+
+`select` presses the SELECT button: it forces the pin's input high through the
+GPIO input override (IO_BANK0 GPIOn_CTRL.INOVER) for the hold time, so the
+firmware sees a real press without any code of its own. `short` holds 300 ms,
+`long` holds SELECT_LONG_RESET + 1 s (rp/src/include/select.h) and needs
+`--force`, because in md-devops it erases the global settings. `release` clears
+a stuck override.
+
+`key`, `app` and `inject` need a debug build: they write the debug mailbox
+(rp/src/include/devhooks.h) and wait until the main loop acknowledges it.
+`key` sends a keystroke as the ST would, `inject` any protocol command with the
+given 16-bit payload words after the random token, and `app` an app command
+named by a DEVHOOKS_APP_<NAME> define, for example `app countdown_stop`.
 
 OpenOCD is $OPENOCD, `openocd` on PATH, or ../pico/openocd/src/openocd next to
 the repo; its scripts come from $PICO_OPENOCD_PATH (as in .vscode/launch.json),
@@ -67,6 +85,17 @@ DHCSR = 0xE000EDF0
 DHCSR_S_HALT = 1 << 17
 DHCSR_RELEASE = 0xA05F0000  # DBGKEY; clears C_HALT and C_DEBUGEN
 CORES = ("rp2040.core0", "rp2040.core1")
+IO_BANK0 = 0x40014000
+INOVER_SHIFT = 16
+INOVER_HIGH = 3
+SELECT_SHORT_MS = 300
+# DevhooksMailbox (rp/src/include/devhooks.h): offsets of its fields.
+MAILBOX_SYMBOL = "devhooksMailbox"
+MAILBOX_MAGIC = 0x444B4831
+MB_SEQ, MB_ACK, MB_KIND, MB_RESULT, MB_CMD, MB_SIZE, MB_PAYLOAD = (
+    4, 8, 12, 16, 20, 22, 24)
+MAILBOX_WORDS = 16
+KIND_PROTOCOL, KIND_APP = 1, 2
 BUILD_ID_SYMBOL = "release_build_id"
 
 
@@ -416,6 +445,115 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def include_defines() -> dict[str, int]:
+    defs: dict[str, int] = {}
+    for header in sorted(glob.glob(os.path.join(INCLUDE_DIR, "*.h"))):
+        defs.update(header_defines(header))
+    return defs
+
+
+def cmd_select(args: argparse.Namespace) -> int:
+    defs = include_defines()
+    gpio = defs["SELECT_GPIO"]
+    ctrl = IO_BANK0 + 4 + 8 * gpio
+    normal = read_word(ctrl) & ~(3 << INOVER_SHIFT)
+    if args.press == "release":
+        openocd(f"mww 0x{ctrl:08x} 0x{normal:08x}")
+        print(f"SELECT (GPIO {gpio}) override cleared")
+        return 0
+    if args.press == "long" and not args.force:
+        raise SwdError("a long press can erase settings (md-devops erases "
+                       "the global config, Wi-Fi included): add --force")
+    hold = args.hold_ms or (SELECT_SHORT_MS if args.press == "short"
+                            else defs["SELECT_LONG_RESET"] + 1000)
+    pressed = normal | (INOVER_HIGH << INOVER_SHIFT)
+    try:
+        openocd(f"mww 0x{ctrl:08x} 0x{pressed:08x}", f"sleep {hold}",
+                f"mww 0x{ctrl:08x} 0x{normal:08x}")
+    finally:
+        # Never leave the button pressed, even if OpenOCD failed mid-hold.
+        if read_word(ctrl) & (3 << INOVER_SHIFT):
+            openocd(f"mww 0x{ctrl:08x} 0x{normal:08x}")
+    print(f"SELECT (GPIO {gpio}) held {hold} ms")
+    return 0
+
+
+def mailbox_request(elf: str, kind: int, command_id: int, words: list[int],
+                    timeout: float = 5.0) -> int:
+    """Send one request through the debug mailbox; return its result."""
+    if len(words) > MAILBOX_WORDS:
+        raise SwdError(f"at most {MAILBOX_WORDS} payload words")
+    sym = elf_symbols(elf, MAILBOX_SYMBOL).get(MAILBOX_SYMBOL)
+    if not sym:
+        raise SwdError(f"{os.path.basename(elf)} has no {MAILBOX_SYMBOL}: "
+                       "a debug build is needed")
+    base = sym[0]
+    magic, seq, ack = struct.unpack("<III", read_memory(base, 12))
+    if magic != MAILBOX_MAGIC:
+        raise SwdError(f"no mailbox at 0x{base:08x} (magic 0x{magic:08x})")
+    if seq != ack:
+        raise SwdError("the previous request was never acknowledged: "
+                       "is the main loop running?")
+    commands = [f"mww 0x{base + MB_KIND:08x} {kind}",
+                f"mwh 0x{base + MB_CMD:08x} {command_id}",
+                f"mwh 0x{base + MB_SIZE:08x} {len(words) * 2}"]
+    for i, word in enumerate(words):
+        commands.append(f"mwh 0x{base + MB_PAYLOAD + 2 * i:08x} {word & 0xFFFF}")
+    # seq last: the firmware acts as soon as seq differs from ack.
+    commands.append(f"mww 0x{base + MB_SEQ:08x} {ack + 1}")
+    openocd(*commands)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        new_ack, _, result = struct.unpack(
+            "<III", read_memory(base + MB_ACK, MB_RESULT + 4 - MB_ACK))
+        if new_ack == ack + 1:
+            return result
+        time.sleep(0.1)
+    raise SwdError(f"no acknowledge within {timeout:g} s: "
+                   "is the main loop running?")
+
+
+def send_protocol(elf: str, command_id: int, words: list[int]) -> None:
+    # The payload starts with the random token, which only matters to the ST.
+    for _ in range(10):
+        if mailbox_request(elf, KIND_PROTOCOL, command_id, [0, 0] + words):
+            return
+        time.sleep(0.1)
+    raise SwdError("the firmware kept another command pending")
+
+
+def cmd_key(args: argparse.Namespace) -> int:
+    elf = matching_elf(args.elf)
+    defs = include_defines()
+    if len(args.char) != 1:
+        raise SwdError("CHAR must be one character")
+    command_id = defs["APP_TERMINAL"] | defs["APP_TERMINAL_KEYSTROKE"]
+    param = (ord(args.char) | (args.scan << defs["TERM_KEYBOARD_SCAN_SHIFT"]) |
+             ((1 if args.shift else 0) << defs["TERM_KEYBOARD_SHIFT_SHIFT"]))
+    send_protocol(elf, command_id, [param & 0xFFFF, param >> 16])
+    print(f"key {args.char!r} sent")
+    return 0
+
+
+def cmd_inject(args: argparse.Namespace) -> int:
+    elf = matching_elf(args.elf)
+    send_protocol(elf, int(args.command_id, 0),
+                  [int(w, 0) for w in args.words])
+    print(f"command {args.command_id} injected")
+    return 0
+
+
+def cmd_app(args: argparse.Namespace) -> int:
+    elf = matching_elf(args.elf)
+    name = "DEVHOOKS_APP_" + args.name.upper()
+    command_id = include_defines().get(name)
+    if command_id is None:
+        raise SwdError(f"no {name} define in rp/src/include")
+    result = mailbox_request(elf, KIND_APP, command_id, [])
+    print(f"{name}: result {result}")
+    return 0 if result else 3
+
+
 def cmd_program(args: argparse.Namespace) -> int:
     openocd(f"program {args.elf} verify reset")
     print(f"flashed {args.elf}")
@@ -452,6 +590,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     rs = sub.add_parser("resume", help="release both cores from a debug halt")
     rs.set_defaults(func=cmd_resume)
+
+    se = sub.add_parser("select", help="press the SELECT button")
+    se.add_argument("press", choices=("short", "long", "release"))
+    se.add_argument("--hold-ms", type=int)
+    se.add_argument("--force", action="store_true",
+                    help="allow a long press")
+    se.set_defaults(func=cmd_select)
+
+    k = sub.add_parser("key", help="send a keystroke as the ST would")
+    k.add_argument("char")
+    k.add_argument("--shift", action="store_true")
+    k.add_argument("--scan", type=int, default=0)
+    k.add_argument("--elf")
+    k.set_defaults(func=cmd_key)
+
+    ap = sub.add_parser("app", help="send an app command (DEVHOOKS_APP_*)")
+    ap.add_argument("name")
+    ap.add_argument("--elf")
+    ap.set_defaults(func=cmd_app)
+
+    ij = sub.add_parser("inject", help="inject a protocol command")
+    ij.add_argument("command_id")
+    ij.add_argument("words", nargs="*")
+    ij.add_argument("--elf")
+    ij.set_defaults(func=cmd_inject)
 
     sc = sub.add_parser("screen", help="render the framebuffer as a PNG")
     sc.add_argument("out")

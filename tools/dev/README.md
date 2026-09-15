@@ -71,6 +71,10 @@ python3 tools/dev/swd.py program tools/dev/builds/debug/rp.elf   # flash through
 python3 tools/dev/swd.py screen menu.png                         # the setup menu as the ST shows it
 python3 tools/dev/swd.py shared                                  # sentinel, token, shared variables
 python3 tools/dev/swd.py resume                                  # release cores a debugger left halted
+python3 tools/dev/swd.py select short                            # press SELECT (short press)
+python3 tools/dev/swd.py key g                                   # a keystroke, as if typed on the ST
+python3 tools/dev/swd.py app countdown_stop                      # app command (countdown_restart too)
+python3 tools/dev/swd.py inject 0x0001 0x0067 0                  # any protocol command
 ```
 
 `screen` renders the 320×200 framebuffer at the top of the cartridge window as a PNG (scaled 2×,
@@ -89,3 +93,16 @@ on `PATH`, or `../pico/openocd/src/openocd`; its scripts come from `$PICO_OPENOC
 variable `.vscode/launch.json` uses. A command that fails on a momentary debug-port drop (common
 while the firmware changes its clock early in boot) is retried. Close a VS Code debug session
 first: only one program can use the probe.
+
+`select` needs no firmware code: it forces the SELECT pin's input high through the RP2040's GPIO
+input override for 300 ms (`short`) or `SELECT_LONG_RESET` + 1 s (`long`). A long press needs
+`--force`, because in md-devops it erases the global settings, Wi-Fi included. `select release`
+clears an override left behind.
+
+`key`, `app` and `inject` need a `debug` build. They write a small mailbox in RAM
+(`rp/src/include/devhooks.h`, found by its `devhooksMailbox` symbol) and wait for the main loop to
+acknowledge it. `key` and `inject` queue a protocol command as if the ST had sent it, so the
+firmware handles it through its normal path. `app NAME` runs the app command defined as
+`DEVHOOKS_APP_<NAME>` in `rp/src/include` (md-devops: `countdown_stop`, `countdown_restart`). To
+support them in another microfirmware, include `devhooks.h` in one file, call `devhooks_poll()` from
+the main loop, and register app commands with `devhooks_setAppHandler()`.
