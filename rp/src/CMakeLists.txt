@@ -109,12 +109,14 @@ target_sources(${PROJECT_NAME} PRIVATE
         emul.c
         gconfig.c
         gemdrive.c
+        health.c
         http_server.c
         hw_config.c
         network.c
         reset.c
         romemul.c
         runner.c
+        sd_timeouts.c
         sdcard.c
         select.c
         term.c
@@ -124,6 +126,11 @@ target_sources(${PROJECT_NAME} PRIVATE
 
 # Create map/bin/hex/uf2 files
 pico_add_extra_outputs(${PROJECT_NAME})
+
+# A panic() records the reason and reboots through the watchdog instead of
+# stopping at a breakpoint nobody sees (health.c).
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    PICO_PANIC_FUNCTION=health_panic)
 
 # Link libraries required for the project
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -241,6 +248,14 @@ endif()
 
 # Pass the _DEBUG flag to the C compiler
 add_definitions(-D_DEBUG=${_DEBUG})
+
+# lwIP statistics are opt-in and debug-only (lwipopts.h). Set
+# DEVOPS_LWIP_STATS=1 in the environment of a debug build to report the
+# lwIP pool counters in GET /api/v1/system/health.
+if(DEFINED ENV{DEVOPS_LWIP_STATS} AND NOT "$ENV{DEVOPS_LWIP_STATS}" STREQUAL "")
+    message("DEVOPS_LWIP_STATS: $ENV{DEVOPS_LWIP_STATS}")
+    add_definitions(-DDEVOPS_LWIP_STATS=$ENV{DEVOPS_LWIP_STATS})
+endif()
 
 # Device/Computer type
 add_definitions(-DDISPLAY_ATARIST)

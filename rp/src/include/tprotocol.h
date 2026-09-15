@@ -201,6 +201,12 @@ static inline void __not_in_flash_func(tprotocol_parse)(
       break;
 
     case PAYLOAD_SIZE_READ:
+      // A size from a corrupted frame (lost ROM3 samples) must not walk
+      // the payload writes past the end of the buffer.
+      if (data > MAX_PROTOCOL_PAYLOAD_SIZE) {
+        tprotocol_nextTPstep = HEADER_DETECTION;
+        break;
+      }
       tprotocol_transmission.payload_size = data;
     case PAYLOAD_READ_START:
       tprotocol_transmission.bytes_read = 0;

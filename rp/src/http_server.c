@@ -9,15 +9,19 @@
 
 #include "aconfig.h"
 #include "chandler.h"
+#include "commemul.h"
 #include "debug.h"
 #include "debugcap.h"
 #include "display.h"
 #include "emul.h"
 #include "ff.h"
 #include "gconfig.h"
+#include "health.h"
 #include "memfunc.h"
 #include "lwip/err.h"
+#include "lwip/memp.h"
 #include "lwip/pbuf.h"
+#include "lwip/stats.h"
 #include "lwip/tcp.h"
 #include "pico/cyw43_arch.h"
 #include "pico/time.h"
@@ -1690,6 +1694,8 @@ static void __not_in_flash_func(handle_runner_load)(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_LOAD_TIMEOUT_US);
   while (emul_isRunnerBusy()) {
+    health_feed();
+    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
     chandler_loop();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
@@ -1819,6 +1825,8 @@ static void __not_in_flash_func(handle_runner_unload)(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_UNLOAD_TIMEOUT_US);
   while (emul_isRunnerBusy()) {
+    health_feed();
+    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
     chandler_loop();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
@@ -2266,6 +2274,8 @@ static bool __not_in_flash_func(adv_load_dispatch_chunk)(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), ADV_LOAD_TIMEOUT_US);
   while (!emul_isRunnerAdvLoadAcked()) {
+    health_feed();
+    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
     chandler_loop();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       DPRINTF("adv_load: chunk dispatch timed out at target=0x%lX len=%lu\n",
@@ -2386,6 +2396,8 @@ static bool __not_in_flash_func(handle_runner_adv_load_init)(
     absolute_time_t deadline =
         delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
     while (!emul_isRunnerMeminfoReady()) {
+      health_feed();
+      health_setPhase(HEALTH_PHASE_HTTP_WAIT);
       chandler_loop();
       if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
         runner_meminfo_t empty = {0};
@@ -2466,6 +2478,8 @@ static void __not_in_flash_func(handle_runner_adv_meminfo)(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
   while (!emul_isRunnerMeminfoReady()) {
+    health_feed();
+    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
     chandler_loop();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
@@ -2691,6 +2705,8 @@ static void __not_in_flash_func(handle_runner_meminfo)(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
   while (!emul_isRunnerMeminfoReady()) {
+    health_feed();
+    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
     chandler_loop();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       // Timeout — clear busy and report.
@@ -2783,6 +2799,129 @@ static bool __not_in_flash_func(body_appendf)(char *body, size_t cap, size_t *le
   *len += (size_t)n;
   return true;
 }
+
+// GET /api/v1/system/health — device health without a console.
+//
+// Heap and stack high-water marks, code copied to RAM, why the RP last
+// rebooted, ROM3 ring overruns and debug-byte drops. With a debug build
+// and DEVOPS_LWIP_STATS, also lwIP's pool counters as [used, max, err].
+// See docs/api.md for the field reference. Not time-critical, so it stays
+// in flash, unlike the rest of this file.
+static void handle_system_health(http_conn_t *c) {
+  health_report_t r;
+  health_getReport(&r);
+
+  uint32_t ring_used = 0;
+  uint32_t ring_capacity = 0;
+  uint32_t bytes_dropped = 0;
+  debugcap_getRingStats(&ring_used, &ring_capacity, &bytes_dropped);
+  uint32_t usbcdc_dropped = 0;
+  usbcdc_getStats(&usbcdc_dropped, NULL);
+
+  bool crashed = r.boot == HEALTH_BOOT_PANIC ||
+                 r.boot == HEALTH_BOOT_HARDFAULT || r.boot == HEALTH_BOOT_HANG;
+  char phase[24] = "null";
+  if (r.boot == HEALTH_BOOT_HANG) {
+    snprintf(phase, sizeof(phase), "\"%s\"", health_phaseName(r.boot_phase));
+  }
+  char pc[16] = "null";
+  char lr[16] = "null";
+  char sp[16] = "null";
+  if (crashed && r.boot != HEALTH_BOOT_HANG) {
+    snprintf(pc, sizeof(pc), "\"0x%08lx\"", (unsigned long)r.boot_pc);
+    snprintf(sp, sizeof(sp), "\"0x%08lx\"", (unsigned long)r.boot_sp);
+    if (r.boot == HEALTH_BOOT_HARDFAULT) {
+      snprintf(lr, sizeof(lr), "\"0x%08lx\"", (unsigned long)r.boot_lr);
+    }
+  }
+
+  // Static: the body is too big for the 2 KB core-0 stack. Sized for the
+  // longest possible report (521 bytes, 757 with the lwIP counters).
+#if LWIP_STATS && MEM_STATS && MEMP_STATS
+  static char body[768];
+#else
+  static char body[544];
+#endif
+  size_t len = 0;
+  bool fits = body_appendf(
+      body, sizeof(body), &len,
+      "{\"ok\":true,\"version\":\"%s\",\"uptime_s\":%lu,"
+      "\"heap\":{\"total\":%lu,\"free\":%lu,\"min_free\":%lu,"
+      "\"sbrk_high_water\":%lu},"
+      "\"stack\":{\"reserved\":%lu,\"high_water\":%lu,\"painted\":%lu,"
+      "\"overflow\":%s},"
+      "\"code_in_ram\":%lu,"
+      "\"reset\":{\"reason\":\"%s\",\"phase\":%s,\"pc\":%s,\"lr\":%s,"
+      "\"sp\":%s,\"crash_count\":%u,\"crash_loop\":%s},"
+      "\"watchdog\":%s,\"rom3_overruns\":%lu,\"debugcap_dropped\":%lu,"
+      "\"usbcdc_dropped\":%lu",
+      RELEASE_VERSION, (unsigned long)(r.uptime_ms / 1000u),
+      (unsigned long)r.heap_total, (unsigned long)r.heap_free,
+      (unsigned long)r.heap_min_free, (unsigned long)r.sbrk_high_water,
+      (unsigned long)r.stack_reserved, (unsigned long)r.stack_high_water,
+      (unsigned long)r.stack_painted, r.stack_overflow ? "true" : "false",
+      (unsigned long)r.code_in_ram, health_bootName(r.boot), phase, pc, lr, sp,
+      (unsigned)r.crash_count, r.crash_loop ? "true" : "false",
+      r.watchdog_enabled ? "true" : "false",
+      (unsigned long)commemul_getOverruns(), (unsigned long)bytes_dropped,
+      (unsigned long)usbcdc_dropped);
+#if LWIP_STATS && MEM_STATS && MEMP_STATS
+  const struct stats_mem *pools[] = {
+      &lwip_stats.mem, lwip_stats.memp[MEMP_PBUF_POOL],
+      lwip_stats.memp[MEMP_TCP_PCB], lwip_stats.memp[MEMP_TCP_SEG],
+      lwip_stats.memp[MEMP_SYS_TIMEOUT]};
+  const char *names[] = {"mem", "pbuf_pool", "tcp_pcb", "tcp_seg",
+                         "sys_timeout"};
+  fits = fits && body_appendf(body, sizeof(body), &len, ",\"lwip\":{");
+  for (size_t i = 0; fits && i < sizeof(pools) / sizeof(pools[0]); i++) {
+    fits = body_appendf(
+        body, sizeof(body), &len, "%s\"%s\":[%lu,%lu,%lu]", (i == 0) ? "" : ",",
+        names[i], (unsigned long)pools[i]->used, (unsigned long)pools[i]->max,
+        (unsigned long)pools[i]->err);
+  }
+  fits = fits && body_appendf(body, sizeof(body), &len, "}");
+#endif
+  fits = fits && body_appendf(body, sizeof(body), &len, "}\n");
+  if (!fits) {
+    write_error(c, 500, "Internal Server Error", "internal",
+                "Health report does not fit the response buffer");
+    return;
+  }
+  write_response(c, 200, "OK", "application/json", body, len);
+}
+
+#if defined(_DEBUG) && (_DEBUG != 0)
+// POST /api/v1/debug/test/<panic|hardfault|hang|stall|http-hang> —
+// debug builds only. Injects a fault to verify crash and hang recovery.
+// All but http-hang answer 202 and fire from the main loop shortly
+// after; http-hang never answers and hangs inside this handler.
+static void handle_debug_test(http_conn_t *c) {
+  static const char prefix[] = "/api/v1/debug/test/";
+  const char *what = c->path + sizeof(prefix) - 1;
+  health_test_t test = HEALTH_TEST_NONE;
+  if (strcmp(what, "panic") == 0) {
+    test = HEALTH_TEST_PANIC;
+  } else if (strcmp(what, "hardfault") == 0) {
+    test = HEALTH_TEST_HARDFAULT;
+  } else if (strcmp(what, "hang") == 0) {
+    test = HEALTH_TEST_HANG;
+  } else if (strcmp(what, "stall") == 0) {
+    test = HEALTH_TEST_STALL;
+  } else if (strcmp(what, "http-hang") == 0) {
+    DPRINTF("health: test hang inside an HTTP handler\n");
+    for (;;) tight_loop_contents();
+  }
+  if (test == HEALTH_TEST_NONE) {
+    write_error(c, 404, "Not Found", "not_found", "Unknown test");
+    return;
+  }
+  health_requestTest(test);
+  char body[64];
+  int n = snprintf(body, sizeof(body), "{\"ok\":true,\"test\":\"%s\"}\n", what);
+  if (n < 0) n = 0;
+  write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
+}
+#endif
 
 // --- Streaming directory listing (chunked transfer-encoding) ---
 //
@@ -4045,6 +4184,14 @@ static const route_t g_routes[] = {
     {"/api/v1/runner", M_GET | M_HEAD, handle_runner_status},
     {"/api/v1/debug", M_GET | M_HEAD, handle_debug_status},
     {"/api/v1/debug/log", M_GET | M_HEAD, handle_debug_log},
+    {"/api/v1/system/health", M_GET | M_HEAD, handle_system_health},
+#if defined(_DEBUG) && (_DEBUG != 0)
+    {"/api/v1/debug/test/panic", M_POST, handle_debug_test},
+    {"/api/v1/debug/test/hardfault", M_POST, handle_debug_test},
+    {"/api/v1/debug/test/hang", M_POST, handle_debug_test},
+    {"/api/v1/debug/test/stall", M_POST, handle_debug_test},
+    {"/api/v1/debug/test/http-hang", M_POST, handle_debug_test},
+#endif
 };
 
 #define ROUTES_COUNT (sizeof(g_routes) / sizeof(g_routes[0]))
@@ -4085,6 +4232,8 @@ static bool __not_in_flash_func(strip_rename_action)(char *rel) {
 }
 
 static void __not_in_flash_func(route)(http_conn_t *c) {
+  health_setPhase(HEALTH_PHASE_HTTP_REQUEST);
+
   // HEAD is treated as GET for matching purposes (the dispatcher
   // suppresses the body during write).
   uint8_t method_bit =

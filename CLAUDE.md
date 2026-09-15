@@ -90,6 +90,7 @@ See `programming.md` for the full table and budget rules.
 - `sdcard.c`, `hw_config.c` — FatFs over SPI/SDIO via the bundled `fatfs-sdk`.
 - `display.c`, `display_term.c`, `term.c`, `u8g2/` — terminal-style display rendered into the Atari framebuffer at `$FAE0C0` and/or a local OLED.
 - `blink.c`, `select.c`, `reset.c`, `tprotocol.c` — LED Morse status, SELECT-button handling, soft reset/jump-to-booster, transport protocol primitives.
+- `health.c` — watchdog (8 s), crash and hang reboots with the reason kept in watchdog scratch registers 0-3, crash-loop guard, stack and heap high-water marks. Reported by `GET /api/v1/system/health`. `sd_timeouts.c` overrides fatfs-sdk's weak SD timeout table so a failing card cannot outlast the watchdog.
 
 ### Memory layout (`rp/src/memmap_rp.ld`)
 The RP2040's 2 MB flash is sliced into named regions, and code is responsible for not stomping on them:
@@ -114,6 +115,8 @@ The build assumes Core 0 owns flash writes (`PICO_FLASH_ASSUME_CORE0_SAFE=1`). T
 
 - **Never modify** `pico-sdk/`, `pico-extras/`, or `fatfs-sdk/` — they are git submodules pinned to specific upstream revisions, and the build re-pins them on every run. To change FatFs configuration, edit `rp/src/ff/ffconf.h` (project-owned override); the include path is set up so this file wins over the submodule's default.
 - Don't touch `main.c` for feature work — start in `emul.c`.
+- **The watchdog fires after 8 s without `health_feed()`.** It is fed only in the main loop, `emul_pollTick`, the Wi-Fi connect loop, the HTTP spin-waits and two slow boot steps. Any new loop or blocking call that can run longer must feed it and set a `health_setPhase()`; don't feed it anywhere else, or a real hang there goes unnoticed.
+- `panic()` goes to `health_panic` (`PICO_PANIC_FUNCTION`), and the HardFault vector is replaced at boot. Both reboot the RP. Don't call `watchdog_reboot` or jump to Booster without going through `reset.c` / `reset.h`, which record the reason and stop the watchdog.
 - Match the existing C style (clang-format config in `.clang-format`, exposed as the `clang-format` CMake target when the binary is on `PATH`; clang-tidy config in `.clang-tidy`, used by editors, not by the build).
 - **m68k modules `gemdrive.s` and `runner.s` MUST be 100% relocatable and self-contained.** They cannot rely on any cross-module symbol from `main.o` or each other. Concretely:
   - **No `xref` / `xdef`.** Every macro and helper they call must be defined inside the same assembly unit. The protocol macros live in `inc/sidecart_macros.s` and `bsr.w` into functions defined in `inc/sidecart_functions.s`; both files are `include`'d verbatim at the top/bottom of each module so the bsr's resolve to a private local copy. vasm doesn't export plain labels so vlink doesn't see duplicates between main.o, gemdrive.o, and runner.o.

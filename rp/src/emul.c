@@ -26,6 +26,7 @@
 #include "ff.h"
 #include "gconfig.h"
 #include "gemdrive.h"
+#include "health.h"
 #include "http_server.h"
 #include "memfunc.h"
 #include "runner.h"
@@ -535,6 +536,7 @@ static absolute_time_t lastCountdownTick;
 // Polling tick used as the network poll callback so command handling stays
 // alive during multi-second WiFi operations.
 static void __not_in_flash_func(emul_pollTick)(void) {
+  health_feed();
   chandler_loop();
   usbcdc_drain();
   term_loop();
@@ -1079,6 +1081,13 @@ static void __not_in_flash_func(menu)(void) {
 
   showTitle();
 
+  // Why the RP rebooted, when it was a crash or a hang. Row 1 is free.
+  char bootLine[TERM_SCREEN_SIZE_X + 1];
+  if (health_getBootLine(bootLine, sizeof(bootLine))) {
+    vt52Cursor(1, 0);
+    term_printString(bootLine);
+  }
+
   // Folder + drive read straight from aconfig, like source/md-drives.
   vt52Cursor(2, 0);
   term_printString("GEMDRIVE\n");
@@ -1566,6 +1575,11 @@ static void init(void) {
 }
 
 void emul_start() {
+  // Decode why the RP started and paint the stack for the high-water
+  // mark, then arm the watchdog. From here a hang reboots the RP.
+  health_init();
+  health_watchdogStart();
+
   // Bring up the USB CDC sink for the debugcap ring.
   // Idempotent stdio_init_all + detaches stdio from CDC so DPRINTF
   // stays UART-only and the CDC interface is the dedicated raw-byte
@@ -1716,6 +1730,9 @@ void emul_start() {
     }
   }
 
+  // A failing card can take a few seconds to give up.
+  health_feed();
+
   // Initialize the display again (in case the terminal emulator changed it)
   display_setupU8g2();
 
@@ -1744,6 +1761,8 @@ void emul_start() {
       DPRINTF("WiFi mode is STA\n");
       wifiModeValue = WIFI_MODE_STA;
       int err = network_wifiInit(wifiModeValue);
+      // Loading the radio firmware takes a while.
+      health_feed();
       if (err != 0) {
         DPRINTF("Error initializing the network: %i. No initializing.\n", err);
       } else {
@@ -1800,6 +1819,12 @@ void emul_start() {
   select_setResetCallback(reset_device);
   select_setLongResetCallback(reset_deviceAndEraseFlash);
 
+  // Crash-loop guard: after repeated crash reboots, stay in the menu
+  // instead of autobooting into whatever keeps crashing.
+  if (health_isCrashLoop()) {
+    haltCountdown = true;
+  }
+
   // 8. Now complete the terminal emulator initialization
   // The terminal emulator is used to interact with the user to configure the
   // device.
@@ -1818,6 +1843,8 @@ void emul_start() {
   DPRINTF("Start the app loop here\n");
   lastCountdownTick = get_absolute_time();
   while (getKeepActive()) {
+    health_feed();
+    health_setPhase(HEALTH_PHASE_MAIN_LOOP);
 #if PICO_CYW43_ARCH_POLL
     network_safePoll();
     cyw43_arch_wait_for_work_until(make_timeout_time_ms(SLEEP_LOOP_MS));
@@ -1837,6 +1864,9 @@ void emul_start() {
     // the main-loop cadence. Short press fires reset_device; long
     // press (≥ SELECT_LONG_RESET ms) fires reset_deviceAndEraseFlash.
     select_checkPushReset();
+
+    // Heap sampling, the debug summary and debug test hooks.
+    health_tick();
 
     // Run the terminal foreground (consume the published command, render
     // output, etc.).

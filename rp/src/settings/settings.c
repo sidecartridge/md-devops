@@ -4,6 +4,8 @@
 
 #include "settings.h"
 
+#include "health.h"
+
 /*
  * -----------
  * STATIC HELPER FUNCTIONS
@@ -334,6 +336,7 @@ int __not_in_flash_func(settings_save)(SettingsContext *ctx,
            totalUsed < programSize ? totalUsed : programSize);
   }
 
+  health_setPhase(HEALTH_PHASE_FLASH_WRITE);
   uint32_t ints = 0;
   if (disable_interrupts) {
     ints = save_and_disable_interrupts();
@@ -365,6 +368,7 @@ int settings_erase(SettingsContext *ctx) {
   if (!ctx) return -1;
 
   // Erase the flash region
+  health_setPhase(HEALTH_PHASE_FLASH_WRITE);
   uint32_t ints = save_and_disable_interrupts();
   flash_range_erase(ctx->flashSettingsOffset, ctx->flashSettingsSize);
   restore_interrupts(ints);

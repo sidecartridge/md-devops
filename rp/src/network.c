@@ -1,5 +1,7 @@
 #include "include/network.h"
 
+#include "include/health.h"
+
 static bool cyw43Initialized = false;
 static wifi_mode_t wifiCurrentMode = WIFI_MODE_STA;
 static wifi_network_info_t wifiNetworkInfo = {.rssi = INT16_MIN};
@@ -854,6 +856,8 @@ wifi_sta_conn_process_status_t network_wifiStaConnect() {
   absolute_time_t wifiConnConnTimeout =
       make_timeout_time_ms(NETWORK_CONNECT_TIMEOUT * SEC_TO_MS);  // 30 seconds
   while (absolute_time_diff_us(get_absolute_time(), wifiConnConnTimeout) > 0) {
+    health_feed();
+    health_setPhase(HEALTH_PHASE_WIFI_CONNECT);
 #ifdef BLINK_H
     blink_morse('T');
 #endif

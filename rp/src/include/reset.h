@@ -12,6 +12,7 @@
 #include "constants.h"
 #include "debug.h"
 #include "gconfig.h"
+#include "health.h"
 #include "hardware/sync.h"
 #include "hardware/watchdog.h"
 #include "pico/multicore.h"
@@ -31,6 +32,9 @@
  * printed.
  */
 static inline void reset_jump_to_booster(void) {
+  // The jump does not reset the chip: stop our watchdog, or it reboots
+  // Booster 8 s later.
+  health_prepareJump();
   // This code jumps to the Booster application at the top of the flash memory.
   // The reason to perform this jump is for performance reasons.
   // It should be placed at the beginning of main() if the SELECT signal or

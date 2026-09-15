@@ -116,6 +116,34 @@ The button is the canonical recovery path for any banner the
 firmware shows on the ST screen (e.g. the `Reloc/stack
 overlap` warning described below).
 
+### When the Pico crashes or hangs
+
+The Pico reboots itself instead of freezing. A crash (a `panic` or a
+HardFault) reboots it within about 100 ms. A hang reboots it after
+8 s, when the watchdog fires. Either way the Pico comes back in the
+setup menu, and row 2 of the menu says why:
+
+```
+Recovered: panic @10012ABC
+Recovered: fault @10003F10 x2
+Recovered: hang in http_request
+```
+
+The address is the program counter at the crash, which the firmware's
+symbol file (`rp.elf`) turns into a function name. `x2` counts crash
+reboots in a row. The same record is in `sidecart.py health` and, on
+a `debug` build, on the UART console.
+
+What the ST sees: for about a second the cartridge window stops
+answering while the Pico re-initialises the bus. The ST program keeps
+running, but GEMDRIVE's open files and the Runner's state are gone, so
+it usually needs an ST reset.
+
+**Crash-loop guard.** After 3 crash reboots within 60 s, the boot
+countdown stays stopped, so the device waits in the menu instead of
+autobooting into whatever keeps crashing. A SELECT short press or a
+power cycle clears the guard.
+
 ## ⚙️ Setup menu screen
 
 The menu paints into the cartridge framebuffer at `$FAE0C0` so
@@ -408,6 +436,32 @@ unreachable too — fix Wi-Fi / mDNS first. Common causes:
 
 Once `ping` works, every other CLI command works too — they all
 talk to the same HTTP server.
+
+## 🩺 Device health: `health`
+
+`health` reads the device's own diagnostics, including on a `release`
+build that has no console: free heap and its low point, how deep the
+stack has gone, why the Pico last rebooted, and lost ROM3 samples or
+debug bytes.
+
+```sh
+$ python3 cli/sidecart.py health
+version         : v1.1.0
+uptime          : 312 s
+heap free       : 61240 / 118720 bytes
+heap min free   : 48812 bytes
+sbrk high-water : 72316 bytes
+stack high-water: 5324 bytes, 2048 reserved, 8192 measured
+code in RAM     : 71048 bytes
+last reset      : power_on
+crash count     : 0
+watchdog        : on
+rom3 overruns   : 0
+debugcap dropped: 0
+usbcdc dropped  : 0
+```
+
+See [`docs/api.md`](docs/api.md) for every field.
 
 ## 💾 GEMDRIVE commands — manage files and folders remotely
 
