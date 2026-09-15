@@ -74,8 +74,11 @@ cmake -S "$SRC" -B "$OUT" -DCMAKE_BUILD_TYPE=Release > "$OUT/cmake.log" 2>&1 \
 make -C "$OUT" -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)" > "$OUT/make.log" 2>&1 \
   || { grep -n 'error' "$OUT/make.log" | head -30; exit 1; }
 
+# A tree without build_id.cmake (an older commit, another microfirmware) has
+# no build ID; the flash is still verified against the ELF.
 BUILD_ID="$(sed -n 's/^#define RELEASE_BUILD_ID "\(.*\)"$/\1/p' \
-  "$OUT/generated/build_id/build_id.h")"
+  "$OUT/generated/build_id/build_id.h" 2> /dev/null || true)"
+BUILD_ID="${BUILD_ID:-no-build-id}"
 cp "$OUT/rp.elf" "$HERE/builds/elf/$TYPE-$BUILD_ID.elf"
 arm-none-eabi-size "$OUT/rp.elf" | tail -1
 echo "Built $TYPE $BUILD_ID: $OUT/rp.uf2"
@@ -95,7 +98,8 @@ fi
 # the one just built.
 if python3 "$HERE/swd.py" running "$OUT/rp.elf" --timeout "$TIMEOUT" \
    && python3 "$HERE/swd.py" verify "$OUT/rp.elf" \
-   && [ "$(python3 "$HERE/swd.py" build-id "$OUT/rp.elf")" = "$BUILD_ID" ]; then
+   && { [ "$BUILD_ID" = no-build-id ] \
+        || [ "$(python3 "$HERE/swd.py" build-id "$OUT/rp.elf")" = "$BUILD_ID" ]; }; then
   echo "Running $TYPE $BUILD_ID"
   exit 0
 fi
