@@ -31,9 +31,14 @@ void usbcdc_init(void) {
   if (g_usbcdcInitialized) {
     return;
   }
-  // Idempotent in the pico-sdk — fine to call even if main.c
-  // already invoked it under _DEBUG=1.
-  stdio_init_all();
+  // Start USB stdio (TinyUSB and its background task) unless main.c already
+  // did, through stdio_init_all() in a debug build. Not stdio_init_all()
+  // again: it is not idempotent. It re-runs uart_init(), which resets the
+  // UART and throws away up to 32 bytes still in the console FIFO, and
+  // stdio_usb_init() claims another IRQ and background task on every call.
+  if (!tud_inited()) {
+    stdio_usb_init();
+  }
 
   // Detach the CDC interface from stdio so fprintf(stderr, ...)
   // (DPRINTF) only lands on UART (when stdio_uart is enabled in

@@ -29,7 +29,7 @@
 #include "settings.h"
 #include "tprotocol.h"
 
-extern unsigned int __rom_in_ram_start__;
+extern unsigned char __rom_in_ram_start__[];
 
 // Layout invariants (mirror gemdrive.h / gemdrive.s):
 //   handles ≥ GEMDRIVE_FIRST_FD belong to GEMDRIVE; below = pass-through.

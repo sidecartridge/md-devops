@@ -65,6 +65,7 @@ static void cmdGemdriveRelocAddr(const char *arg);
 static void cmdGemdriveMemtop(const char *arg);
 static void cmdAdvHookVector(const char *arg);
 static void cmdRunner(const char *arg);
+static void clearLaunchBlock(void);
 
 // Command table. Every key here corresponds to a label on the on-screen
 // setup menu — keys that aren't advertised in the UI used to live here
@@ -475,6 +476,7 @@ void emul_onGemdriveHello(void) {
   // each refresh helper gates on menuScreenActive internally.
   refreshPhystopLine();
   refreshScreenmemLine();
+  clearLaunchBlock();
 
   if (!runnerActive) return;
   // The m68k just cold-booted (HELLO is sent from gemdrive_init,
@@ -612,9 +614,46 @@ static void drawSetupInfoLine(const char *message) {
   u8g2_SetFont(display_getU8g2Ref(), u8g2_font_amstrad_cpc_extended_8f);
 }
 
+// Set when [G] or [U] was refused because no HELLO arrived since the RP
+// booted (see emul_canLaunch). Cleared when HELLO lands.
+static bool launchNeedsStReset = false;
+// True while the countdown itself is launching, so a refusal can restart the
+// countdown once HELLO lands instead of leaving it stopped.
+static bool countdownLaunching = false;
+static bool restartCountdownOnHello = false;
+
+static void drawHaltedInfoLine(void) {
+  drawSetupInfoLine(
+      launchNeedsStReset
+          ? "Reset the Atari ST first: no HELLO since RP boot."
+          : "Countdown stopped. Press [G], [U] or [X] to continue.");
+}
+
+static void refreshSetupInfoLine(void);
+
+// HELLO landed: [G] and [U] can launch again.
+static void clearLaunchBlock(void) {
+  if (!launchNeedsStReset) return;
+  launchNeedsStReset = false;
+  if (restartCountdownOnHello) {
+    restartCountdownOnHello = false;
+    // Drop keystrokes that arrived while the countdown was halted (the ST
+    // sends some while it boots). The main loop only consumes them while
+    // the countdown runs, so a stale one would halt it again at once.
+    (void)term_consumeAnyKeyPressed();
+    countdown = BOOT_COUNTDOWN_SECONDS;
+    lastCountdownTick = get_absolute_time();
+    haltCountdown = false;
+  }
+  if (menuScreenActive) {
+    refreshSetupInfoLine();
+    display_refresh();
+  }
+}
+
 static void refreshSetupInfoLine(void) {
   if (haltCountdown) {
-    drawSetupInfoLine("Countdown stopped. Press [G], [U] or [X] to continue.");
+    drawHaltedInfoLine();
   } else {
     showCounter(countdown);
   }
@@ -1275,8 +1314,28 @@ static void __not_in_flash_func(showCounter)(int cdown) {
 
 // [G]EMDRIVE — drops straight into GEMDRIVE-only on the Atari ST
 // without activating the Runner control surface.
+// [G] and [U] make the m68k install GEMDRIVE at the address the RP computed
+// from the ST's HELLO, which the ST sends only at cold boot. After the RP
+// reboots while the ST keeps running (a crash, SELECT, a flash) no HELLO
+// arrives, the address is not published, and launching would halt the ST
+// with "Reloc/stack overlap". Until then it only worked because the previous
+// run's shared variables survived in uncleared RAM.
+static bool emul_canLaunch(void) {
+  haltCountdown = true;
+  if (gemdrive_getPhystop(NULL, NULL)) return true;
+  DPRINTF("Launch refused: no HELLO from the ST since the RP booted\n");
+  launchNeedsStReset = true;
+  restartCountdownOnHello = countdownLaunching;
+  // Redraw the whole menu: the countdown path has already cleared the screen
+  // for "Booting...". menu() paints the refusal on the bottom strip.
+  menu();
+  display_refresh();
+  return false;
+}
+
 void cmdGemdrive(const char *arg) {
   (void)arg;
+  if (!emul_canLaunch()) return;
   haltCountdown = true;
   menuScreenActive = false;
   showTitle();
@@ -1295,6 +1354,7 @@ void cmdGemdrive(const char *arg) {
 // — the Runner runs alongside it, in foreground.
 void cmdRunner(const char *arg) {
   (void)arg;
+  if (!emul_canLaunch()) return;
   haltCountdown = true;
   menuScreenActive = false;
   showTitle();
@@ -1639,6 +1699,27 @@ void emul_start() {
   //
   // Copy the terminal firmware to RAM
   COPY_FIRMWARE_TO_RAM((uint16_t *)target_firmware, target_firmware_length);
+#if defined(_DEBUG) && (_DEBUG != 0)
+  // The ST must see exactly the generated image.
+  if (memcmp((const void *)&__rom_in_ram_start__, target_firmware,
+             (size_t)target_firmware_length * sizeof(uint16_t)) != 0) {
+    DPRINTF("ERROR: cartridge image in RAM does not match target_firmware\n");
+  } else {
+    DPRINTF("Cartridge image in RAM verified (%u words)\n",
+            (unsigned)target_firmware_length);
+  }
+  // Nothing from a previous run may survive past the end of the image.
+  {
+    const uint8_t *window = (const uint8_t *)&__rom_in_ram_start__;
+    size_t used = (size_t)target_firmware_length * sizeof(uint16_t);
+    size_t leftovers = 0;
+    for (size_t i = used; i < ROM_SIZE_BYTES * ROM_BANKS; i++) {
+      if (window[i] != 0) leftovers++;
+    }
+    DPRINTF("Cartridge window after the image: %u non-zero bytes\n",
+            (unsigned)leftovers);
+  }
+#endif
 
   // Initialize the cartridge ROM4 read engine. ROM4 reads are served entirely
   // by chained DMAs feeding the PIO TX FIFO — no CPU/IRQ involvement.
@@ -1699,9 +1780,16 @@ void emul_start() {
   FATFS fsys;
   SettingsConfigEntry *folder =
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_FOLDER);
-  char *folderName = "/test";  // MODIFY THIS TO YOUR FOLDER NAME
+  char *folderName = "/devops";
   if (folder == NULL) {
     DPRINTF("FOLDER not found in the configuration. Using default value\n");
+  } else if (strcmp(folder->value, "/test") == 0) {
+    // Up to v1.1.0 the default was the template's "/test", which md-devops
+    // never used. Move stored settings to "/devops"; the folder is created
+    // below if it does not exist.
+    DPRINTF("FOLDER was /test; changing it to /devops\n");
+    settings_put_string(aconfig_getContext(), ACONFIG_PARAM_FOLDER, "/devops");
+    settings_save(aconfig_getContext(), true);
   } else {
     DPRINTF("FOLDER: %s\n", folder->value);
     folderName = folder->value;
@@ -1908,7 +1996,7 @@ void emul_start() {
     // showCounter is only called inside the decrement branch below.
     static bool lastHaltState = false;
     if (haltCountdown && !lastHaltState) {
-      drawSetupInfoLine("Countdown stopped. Press [G], [U] or [X] to continue.");
+      drawHaltedInfoLine();
       display_refresh();
     }
     lastHaltState = haltCountdown;
@@ -1926,7 +2014,9 @@ void emul_start() {
           // path as pressing [U]. Runner is the more useful default:
           // it includes the [G] GEMDRIVE behaviour AND the
           // workstation-driven Runner control surface.
+          countdownLaunching = true;
           cmdRunner(NULL);
+          countdownLaunching = false;
         }
       }
     }

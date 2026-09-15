@@ -4,6 +4,7 @@
 
 #include "settings.h"
 
+#include "debug.h"  // the firmware's DPRINTF, not the library fallback
 #include "health.h"
 
 /*

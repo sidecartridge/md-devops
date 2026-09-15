@@ -32,7 +32,7 @@
 // Cartridge shared-region mirror in RP RAM (memmap_rp.ld). Used by
 // the Runner endpoints to write path / cmdline buffers the m68k
 // Runner reads directly via cartridge bus.
-extern unsigned int __rom_in_ram_start__;
+extern unsigned char __rom_in_ram_start__[];
 
 // Per-conn response buffer. Sized to comfortably hold a full status
 // line + headers + the largest non-streaming body we emit. RAM is
@@ -46,9 +46,8 @@ extern unsigned int __rom_in_ram_start__;
 #define HTTP_PATH_BUF_BYTES 192
 #define HTTP_QUERY_BUF_BYTES 192
 
-// Listing cap. Spec says 1000, but the response buffer is the real
-// constraint — at ~80 bytes per entry the 1 KB resp lets us fit
-// roughly 8-10 entries before truncated:true.
+// Listing cap. The listing streams in chunks of up to 1 KB, so the response
+// buffer only limits entries per chunk, not the listing.
 #define HTTP_LISTING_MAX_ENTRIES 1000
 
 // FatFs absolute-path buffer. Smaller than FF_MAX_LFN (255) because
@@ -2937,6 +2936,11 @@ static void handle_debug_test(http_conn_t *c) {
 // chunk turns out to be the last.
 #define STREAM_CLOSE_RESERVE 32
 
+// Room one entry can need: a 255-character long name plus the JSON around
+// it (about 85 bytes). Checked before f_readdir, because an entry that has
+// been read and then does not fit cannot be put back.
+#define STREAM_MAX_ENTRY_BYTES (FF_MAX_LFN + 96)
+
 // Append one entry (with its leading comma when needed) to `out`.
 // Returns false if the formatted entry didn't fit.
 static bool __not_in_flash_func(stream_append_entry)(http_conn_t *c,
@@ -3006,10 +3010,10 @@ static size_t __not_in_flash_func(stream_build_body)(http_conn_t *c,
       c->stream_truncated = true;
       break;
     }
-    if (out_len + STREAM_CLOSE_RESERVE >= out_cap) {
-      // No room for one more entry plus closing envelope; stop here
-      // and let the next chunk pick up. (Not done — body_done stays
-      // false so we'll come back.)
+    if (out_len + STREAM_MAX_ENTRY_BYTES + STREAM_CLOSE_RESERVE >= out_cap) {
+      // No room for the largest possible entry plus the closing
+      // envelope; stop here and let the next chunk pick up. (Not done —
+      // body_done stays false so we'll come back.)
       return out_len;
     }
     FILINFO finfo;
