@@ -1,0 +1,21 @@
+# The two build types of ./build.sh, so a CMake Tools build in VS Code
+# compiles exactly what the scripts compile. CMakeLists.txt reads DEBUG_MODE
+# and APP_UUID_KEY from the environment at configure time; switch variants
+# and let CMake Tools reconfigure.
+buildType:
+  default: release
+  choices:
+    release:
+      short: release
+      long: Shipping build, CMake Release, no traces
+      buildType: Release
+      env:
+        DEBUG_MODE: "0"
+        APP_UUID_KEY: "44444444-4444-4444-8444-444444444444"
+    debug:
+      short: debug
+      long: Same Release build with DPRINTF traces on the UART console
+      buildType: Release
+      env:
+        DEBUG_MODE: "1"
+        APP_UUID_KEY: "44444444-4444-4444-8444-444444444444"
