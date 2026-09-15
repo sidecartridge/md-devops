@@ -242,6 +242,14 @@ endif()
 # Pass the _DEBUG flag to the C compiler
 add_definitions(-D_DEBUG=${_DEBUG})
 
+# lwIP statistics are opt-in and debug-only (lwipopts.h). Set
+# DEVOPS_LWIP_STATS=1 in the environment of a debug build to report the
+# lwIP pool counters in GET /api/v1/system/health.
+if(DEFINED ENV{DEVOPS_LWIP_STATS} AND NOT "$ENV{DEVOPS_LWIP_STATS}" STREQUAL "")
+    message("DEVOPS_LWIP_STATS: $ENV{DEVOPS_LWIP_STATS}")
+    add_definitions(-DDEVOPS_LWIP_STATS=$ENV{DEVOPS_LWIP_STATS})
+endif()
+
 # Device/Computer type
 add_definitions(-DDISPLAY_ATARIST)
 

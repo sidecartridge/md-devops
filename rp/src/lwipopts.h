@@ -9,6 +9,15 @@
 #define NO_SYS 1
 #endif
 
+// lwIP's statistics cost flash and RAM, so they are opt-in. Without them
+// an exhausted pool or heap inside lwIP is silent: allocations just fail.
+// Set to 1 (here or as a compile definition, see DEVOPS_LWIP_STATS in
+// CMakeLists.txt) to report the pool counters in the health report.
+// Debug builds only; ignored in release.
+#ifndef DEVOPS_LWIP_STATS
+#define DEVOPS_LWIP_STATS 0
+#endif
+
 // allow override in some examples
 #ifndef LWIP_SOCKET
 #define LWIP_SOCKET 0
@@ -45,9 +54,16 @@
 #define LWIP_NETIF_LINK_CALLBACK 1
 #define LWIP_NETIF_HOSTNAME 1
 #define LWIP_NETCONN 0
+// The "err" counters reveal a silently failed allocation. Debug builds
+// with DEVOPS_LWIP_STATS only; they cost RAM and flash.
+#if defined(_DEBUG) && (_DEBUG != 0) && (DEVOPS_LWIP_STATS != 0)
+#define MEM_STATS 1
+#define MEMP_STATS 1
+#else
 #define MEM_STATS 0
-#define SYS_STATS 0
 #define MEMP_STATS 0
+#endif
+#define SYS_STATS 0
 #define LINK_STATS 0
 // #define ETH_PAD_SIZE                2
 #define LWIP_CHKSUM_ALGORITHM 3
@@ -62,7 +78,10 @@
 #define LWIP_DHCP_DOES_ACD_CHECK 0
 #define LWIP_DHCP_GET_NTP_SRV 0
 
-#ifndef NDEBUG
+// Keyed off _DEBUG, not NDEBUG. Both build types compile as CMake
+// Release, which defines NDEBUG, so "#ifndef NDEBUG" left the statistics
+// out of every build.
+#if defined(_DEBUG) && (_DEBUG != 0) && (DEVOPS_LWIP_STATS != 0)
 #define LWIP_DEBUG 1
 #define LWIP_STATS 1
 #define LWIP_STATS_DISPLAY 1
