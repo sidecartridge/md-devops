@@ -84,8 +84,6 @@ set(CMAKE_C_STANDARD 11)
 # Creates a pico-sdk subdirectory in our project for the libraries
 pico_sdk_init()
 
-add_subdirectory(settings)
-
 # Add u8g2 library
 add_subdirectory(u8g2)
 
@@ -135,7 +133,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     pico_stdlib              # Core functionality
     pico_multicore          # Multicore support
     pico_lwip_mdns           # lwIP mDNS responder so <hostname>.local works
-    settings                 # Custom settings library
     u8g2                     # for display
 )
 
@@ -162,15 +159,14 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 target_include_directories(${PROJECT_NAME} BEFORE PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/ff)
 
-# Needed to include lwipopts.h properly
+# Needed to include lwipopts.h properly. settings/ holds settings.h;
+# settings.c is compiled directly into the target (see target_sources).
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/include
+    ${CMAKE_CURRENT_LIST_DIR}/settings
     ${CMAKE_CURRENT_LIST_DIR}/..)
 
-
-# Use reduced space for ROMs
-pico_set_binary_type(${PROJECT_NAME} rp)
 
 # Fetch the values from the environment variables
 set(RELEASE_TYPE $ENV{RELEASE_TYPE})
@@ -211,9 +207,10 @@ if (NOT _DEBUG)
         set(_DEBUG 0)
 endif()
 
-# Debug outputs
+# USB stdio stays compiled in because usbcdc.c runs the TinyUSB CDC
+# interface through it, detaching it from stdio at runtime. UART stdio is the
+# DPRINTF console, so only debug builds enable it.
 pico_enable_stdio_usb(${PROJECT_NAME} 1)
-# Workaround to disable USB output in release builds
 if(${_DEBUG} STREQUAL "0")
     pico_enable_stdio_uart(${PROJECT_NAME} 0)
 else()
@@ -264,20 +261,11 @@ add_definitions(-DPICO_FLASH_ASSUME_CORE0_SAFE=1)
 add_definitions(-DCFG_TUD_CDC_TX_BUFSIZE=1024)
 
 # Remove unused data
+# Symbols stay in rp.elf: they are not part of the flashed image, and crash
+# addresses and debug probes need them.
 target_link_options(${PROJECT_NAME} PRIVATE
    "-Wl,--gc-sections"
-   "-Wl,--strip-all"
 )
-
-# Enable clang-tidy (you need to have clang-tidy installed on your system)
-find_program(CLANG_TIDY_EXE NAMES clang-tidy)
-
-if(CLANG_TIDY_EXE)
-    set(CMAKE_C_CLANG_TIDY "${CLANG_TIDY_EXE}")
-    message(STATUS "Found clang-tidy: ${CLANG_TIDY_EXE}")
-else()
-    message(WARNING "clang-tidy not found, skipping linting")
-endif()
 
 # Find clang-format executable
 find_program(CLANG_FORMAT_BIN NAMES clang-format)
