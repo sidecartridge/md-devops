@@ -32,7 +32,7 @@
 // Cartridge shared-region mirror in RP RAM (memmap_rp.ld). Used by
 // the Runner endpoints to write path / cmdline buffers the m68k
 // Runner reads directly via cartridge bus.
-extern unsigned int __rom_in_ram_start__;
+extern unsigned char __rom_in_ram_start__[];
 
 // Per-conn response buffer. Sized to comfortably hold a full status
 // line + headers + the largest non-streaming body we emit. RAM is
