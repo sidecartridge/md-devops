@@ -1780,9 +1780,16 @@ void emul_start() {
   FATFS fsys;
   SettingsConfigEntry *folder =
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_FOLDER);
-  char *folderName = "/test";  // MODIFY THIS TO YOUR FOLDER NAME
+  char *folderName = "/devops";
   if (folder == NULL) {
     DPRINTF("FOLDER not found in the configuration. Using default value\n");
+  } else if (strcmp(folder->value, "/test") == 0) {
+    // Up to v1.1.0 the default was the template's "/test", which md-devops
+    // never used. Move stored settings to "/devops"; the folder is created
+    // below if it does not exist.
+    DPRINTF("FOLDER was /test; changing it to /devops\n");
+    settings_put_string(aconfig_getContext(), ACONFIG_PARAM_FOLDER, "/devops");
+    settings_save(aconfig_getContext(), true);
   } else {
     DPRINTF("FOLDER: %s\n", folder->value);
     folderName = folder->value;
