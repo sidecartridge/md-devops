@@ -49,6 +49,14 @@
 #define WINDOW_UPDATE_INTERVAL_MS 1000u
 #define SUMMARY_INTERVAL_MS 30000u
 #define CRASH_REBOOT_DELAY_MS 100u
+// Stall mark: a timer interrupt writes it to scratch[1] once the watchdog
+// has gone this long without a feed, and clears it when feeding resumes.
+// A watchdog reset only counts as a hang if the mark is there: a debug
+// probe resets the chip with SYSRESETREQ, which leaves the watchdog
+// reason and scratch registers exactly as a real expiry does.
+#define STALL_MAGIC 0x57A11ED0u
+#define STALL_CHECK_MS 1000u
+#define STALL_MARK_MS 5000u
 // Vector table slot of the HardFault exception.
 #define HEALTH_HARDFAULT_VECTOR 3u
 
@@ -71,6 +79,10 @@ static uint8_t crashCount = 0;
 // Seconds of the crash window already used by previous boots.
 static uint32_t crashWindowBaseS = 0;
 static bool watchdogEnabled = false;
+static uint32_t feedCount = 0;
+static uint32_t stallLastFeedCount = 0;
+static uint32_t stallMs = 0;
+static repeating_timer_t stallTimer;
 
 static uint32_t heapMinFree = UINT32_MAX;
 static uint32_t sbrkHighWater = 0;
@@ -161,10 +173,14 @@ void health_init(void) {
         bootCause = HEALTH_BOOT_HARDFAULT;
         break;
       default:
-        // Still "running" when the reset came: the watchdog fired if we
-        // had enabled it, otherwise someone else rebooted us.
-        bootCause = watchdog_enable_caused_reboot() ? HEALTH_BOOT_HANG
-                                                    : HEALTH_BOOT_REBOOT;
+        // Still "running" when the reset came. Only the stall mark proves
+        // the watchdog expired: a probe reset or flash looks the same in
+        // every register. A hang with interrupts off cannot set the mark
+        // and is reported as a reboot.
+        bootCause = (watchdog_enable_caused_reboot() &&
+                     watchdog_hw->scratch[1] == STALL_MAGIC)
+                        ? HEALTH_BOOT_HANG
+                        : HEALTH_BOOT_REBOOT;
         break;
     }
   }
@@ -217,15 +233,34 @@ void health_init(void) {
              health_isCrashLoop() ? ", crash loop: countdown stopped" : "");
 }
 
+// Timer interrupt, once a second: marks a stalled feed (see STALL_MAGIC).
+static bool health_stallCheck(repeating_timer_t *timer) {
+  (void)timer;
+  if (feedCount != stallLastFeedCount) {
+    stallLastFeedCount = feedCount;
+    stallMs = 0;
+    watchdog_hw->scratch[1] = 0;
+  } else if (stallMs < STALL_MARK_MS) {
+    stallMs += STALL_CHECK_MS;
+    if (stallMs >= STALL_MARK_MS) watchdog_hw->scratch[1] = STALL_MAGIC;
+  }
+  return true;
+}
+
 void health_watchdogStart(void) {
   watchdog_enable(HEALTH_WATCHDOG_TIMEOUT_MS, true);
   watchdogEnabled = true;
+  add_repeating_timer_ms((int32_t)STALL_CHECK_MS, health_stallCheck, NULL,
+                         &stallTimer);
   DPRINTF("health: watchdog enabled, %u ms\n",
           (unsigned)HEALTH_WATCHDOG_TIMEOUT_MS);
 }
 
 void health_feed(void) {
-  if (watchdogEnabled) watchdog_update();
+  if (watchdogEnabled) {
+    watchdog_update();
+    feedCount++;
+  }
 }
 
 void health_markReset(void) {
@@ -233,6 +268,7 @@ void health_markReset(void) {
 }
 
 void health_prepareJump(void) {
+  if (watchdogEnabled) cancel_repeating_timer(&stallTimer);
   watchdog_disable();
   watchdogEnabled = false;
   watchdog_hw->scratch[0] = 0;

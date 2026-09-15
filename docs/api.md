@@ -186,7 +186,7 @@ cadence.
 | `stack.painted` | Bytes below the stack top that are measured. |
 | `stack.overflow` | `true` when the stack reached the bottom of the measured area, so the real depth is unknown and memory below it was overwritten. |
 | `code_in_ram` | Bytes of code and initialised data copied to RAM at boot. |
-| `reset.reason` | Why the RP last started: `power_on` (power, RUN pin or debugger), `reset` (SELECT or a menu reset), `panic`, `hardfault`, `hang` (the watchdog fired), or `reboot` (any other reboot, such as from Booster or picotool). |
+| `reset.reason` | Why the RP last started: `power_on` (power, RUN pin or debugger), `reset` (SELECT or a menu reset), `panic`, `hardfault`, `hang` (the watchdog fired after the firmware stopped feeding it), or `reboot` (any other reboot, such as from Booster, picotool or a debug probe). A hang with interrupts disabled cannot be told apart from a probe reset and is reported as `reboot`. |
 | `reset.phase` | For a `hang`, where the firmware was: `boot`, `main_loop`, `wifi_connect`, `http_request`, `http_wait`, `gemdrive` or `flash_write`. Otherwise `null`. |
 | `reset.pc`, `reset.sp` | For a `panic`, the address that called `panic()` and the stack pointer there. For a `hardfault`, the faulting instruction and stack pointer. Otherwise `null`. |
 | `reset.lr` | For a `hardfault`, the link register at the fault. Otherwise `null`. |

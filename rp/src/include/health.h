@@ -13,7 +13,8 @@
  *
  *                scratch[0]  magic (8) | reason (4) | crash count (4) |
  *                            crash window s (8) | phase (8)
- *                scratch[1]  PC at the crash
+ *                scratch[1]  PC at the crash; while running, the stall
+ *                            mark that tells a real hang from a probe reset
  *                scratch[2]  LR at the crash (HardFault only)
  *                scratch[3]  SP at the crash
  */
@@ -52,7 +53,8 @@ typedef enum {
   HEALTH_BOOT_PANIC,
   HEALTH_BOOT_HARDFAULT,
   HEALTH_BOOT_HANG,    // the watchdog fired
-  HEALTH_BOOT_REBOOT,  // any other watchdog reboot (Booster, picotool)
+  HEALTH_BOOT_REBOOT,  // any other watchdog reboot (Booster, picotool, a
+                       // debug probe, a hang with interrupts off)
 } health_boot_t;
 
 typedef struct {
