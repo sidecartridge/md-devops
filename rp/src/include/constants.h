@@ -76,12 +76,15 @@
              (((uint32_t)RP2040_CLOCK_FREQ_KHZ) / 1000))
 
 // NOLINTBEGIN(readability-identifier-naming)
-extern unsigned int __flash_binary_start;
-extern unsigned int _rom_temp_start;
-extern unsigned int _booster_app_flash_start;
-extern unsigned int _config_flash_start;
-extern unsigned int _global_lookup_flash_start;
-extern unsigned int _global_config_flash_start;
+// Linker-defined flash regions, as arrays of unknown size for the same
+// reason as __rom_in_ram_start__ below: code reads whole regions through
+// them, which a 4-byte scalar declaration would make undefined behaviour.
+extern unsigned char __flash_binary_start[];
+extern unsigned char _rom_temp_start[];
+extern unsigned char _booster_app_flash_start[];
+extern unsigned char _config_flash_start[];
+extern unsigned char _global_lookup_flash_start[];
+extern unsigned char _global_config_flash_start[];
 // The 64 KB cartridge window. An array of unknown size, not a scalar: code
 // reads and writes the whole window through this symbol, and a scalar
 // declaration tells the compiler the object is 4 bytes, which makes every
