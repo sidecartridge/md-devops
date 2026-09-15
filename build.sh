@@ -24,8 +24,9 @@ cp version.txt rp/
 cp version.txt target/
 
 # Display the version information
+# Not exported: the stcmd installed by atarist-toolkit-docker's installer
+# (as in CI) uses $VERSION as its Docker image tag, and v1.1.0 is no image.
 VERSION=$(cat version.txt)
-export VERSION
 echo "Version: $VERSION"
 
 # Set the board type to be used for building
