@@ -23,6 +23,7 @@
 #include "debug.h"
 #include "emul.h"
 #include "ff.h"
+#include "health.h"
 #include "memfunc.h"
 #include "runner.h"
 #include "settings.h"
@@ -1276,6 +1277,9 @@ static void handleDtaReleaseCall(uint16_t *payload) {
 
 void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
                                               uint16_t *payload) {
+  if ((protocol->command_id & 0xFF00u) == GEMDRIVE_APP) {
+    health_setPhase(HEALTH_PHASE_GEMDRIVE);
+  }
   switch (protocol->command_id) {
     case GEMDRIVE_CMD_SAVE_VECTORS:
       handleSaveVectors(payload);

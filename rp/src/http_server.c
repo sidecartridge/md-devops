@@ -9,15 +9,19 @@
 
 #include "aconfig.h"
 #include "chandler.h"
+#include "commemul.h"
 #include "debug.h"
 #include "debugcap.h"
 #include "display.h"
 #include "emul.h"
 #include "ff.h"
 #include "gconfig.h"
+#include "health.h"
 #include "memfunc.h"
 #include "lwip/err.h"
+#include "lwip/memp.h"
 #include "lwip/pbuf.h"
+#include "lwip/stats.h"
 #include "lwip/tcp.h"
 #include "pico/cyw43_arch.h"
 #include "pico/time.h"
@@ -1690,6 +1694,8 @@ static void __not_in_flash_func(handle_runner_load)(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_LOAD_TIMEOUT_US);
   while (emul_isRunnerBusy()) {
+    health_feed();
+    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
     chandler_loop();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
@@ -1819,6 +1825,8 @@ static void __not_in_flash_func(handle_runner_unload)(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_UNLOAD_TIMEOUT_US);
   while (emul_isRunnerBusy()) {
+    health_feed();
+    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
     chandler_loop();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
@@ -2266,6 +2274,8 @@ static bool __not_in_flash_func(adv_load_dispatch_chunk)(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), ADV_LOAD_TIMEOUT_US);
   while (!emul_isRunnerAdvLoadAcked()) {
+    health_feed();
+    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
     chandler_loop();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       DPRINTF("adv_load: chunk dispatch timed out at target=0x%lX len=%lu\n",
@@ -2386,6 +2396,8 @@ static bool __not_in_flash_func(handle_runner_adv_load_init)(
     absolute_time_t deadline =
         delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
     while (!emul_isRunnerMeminfoReady()) {
+      health_feed();
+      health_setPhase(HEALTH_PHASE_HTTP_WAIT);
       chandler_loop();
       if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
         runner_meminfo_t empty = {0};
@@ -2466,6 +2478,8 @@ static void __not_in_flash_func(handle_runner_adv_meminfo)(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
   while (!emul_isRunnerMeminfoReady()) {
+    health_feed();
+    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
     chandler_loop();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
@@ -2691,6 +2705,8 @@ static void __not_in_flash_func(handle_runner_meminfo)(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
   while (!emul_isRunnerMeminfoReady()) {
+    health_feed();
+    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
     chandler_loop();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       // Timeout — clear busy and report.
@@ -4085,6 +4101,8 @@ static bool __not_in_flash_func(strip_rename_action)(char *rel) {
 }
 
 static void __not_in_flash_func(route)(http_conn_t *c) {
+  health_setPhase(HEALTH_PHASE_HTTP_REQUEST);
+
   // HEAD is treated as GET for matching purposes (the dispatcher
   // suppresses the body during write).
   uint8_t method_bit =

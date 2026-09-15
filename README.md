@@ -116,6 +116,34 @@ The button is the canonical recovery path for any banner the
 firmware shows on the ST screen (e.g. the `Reloc/stack
 overlap` warning described below).
 
+### When the Pico crashes or hangs
+
+The Pico reboots itself instead of freezing. A crash (a `panic` or a
+HardFault) reboots it within about 100 ms. A hang reboots it after
+8 s, when the watchdog fires. Either way the Pico comes back in the
+setup menu, and row 2 of the menu says why:
+
+```
+Recovered: panic @10012ABC
+Recovered: fault @10003F10 x2
+Recovered: hang in http_request
+```
+
+The address is the program counter at the crash, which the firmware's
+symbol file (`rp.elf`) turns into a function name. `x2` counts crash
+reboots in a row. The same record is in `sidecart.py health` and, on
+a `debug` build, on the UART console.
+
+What the ST sees: for about a second the cartridge window stops
+answering while the Pico re-initialises the bus. The ST program keeps
+running, but GEMDRIVE's open files and the Runner's state are gone, so
+it usually needs an ST reset.
+
+**Crash-loop guard.** After 3 crash reboots within 60 s, the boot
+countdown stays stopped, so the device waits in the menu instead of
+autobooting into whatever keeps crashing. A SELECT short press or a
+power cycle clears the guard.
+
 ## ⚙️ Setup menu screen
 
 The menu paints into the cartridge framebuffer at `$FAE0C0` so

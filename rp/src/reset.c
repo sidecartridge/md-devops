@@ -3,6 +3,8 @@
 void reset_device() {
   DPRINTF("Resetting the device\n");
 
+  // A reset the user asked for: the next boot clears the crash-loop guard.
+  health_markReset();
   save_and_disable_interrupts();
   // watchdog_enable(RESET_WATCHDOG_TIMEOUT, 0);
   watchdog_reboot(0, 0, RESET_WATCHDOG_TIMEOUT);
