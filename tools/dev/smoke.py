@@ -88,6 +88,17 @@ class Probe:
             return None
         return swd.read_memory(sym[0], sym[1] or 1)[0] != 0
 
+    def wait_for_text(self, needle: str, timeout: float = 60) -> bool:
+        """Wait for the menu (or any text) to appear on the RP's screen. After
+        a reset the boot screen is up for about 11 s before the menu."""
+        deadline = time.time() + timeout
+        while True:
+            if needle in self.text():
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(1)
+
     def text(self) -> str:
         sym = swd.elf_symbols(self.elf, "screen").get("screen")
         if not sym or not sym[1]:
@@ -222,14 +233,16 @@ class Smoke:
         name = "1b stop the countdown"
         if self.probe.ready:
             try:
+                # The menu comes up about 11 s after a reset; the countdown
+                # only starts with it.
+                menu = self.probe.wait_for_text("Select an option")
                 done = self.probe.app("countdown_stop")
                 halted = self.probe.flag("haltCountdown")
-                menu = "Select an option" in self.probe.text()
                 passed = done and halted is not False and menu
                 self.record(name, "pass" if passed else "fail",
                             f"mailbox {'ok' if done else 'refused'}, "
                             f"haltCountdown {halted}, menu text "
-                            f"{'found' if menu else 'NOT found'}")
+                            f"{'found' if menu else 'NOT found in 60 s'}")
                 return
             except swd.SwdError as exc:
                 self.record(name, "fail", f"probe: {exc}")
@@ -314,8 +327,12 @@ class Smoke:
             # Getting to [U] may have taken a SELECT or ST reset: compare the
             # next health check with the device as it is now.
             self.last_health = self.health()
-        with open(hellodbg, "rb") as f:
-            program = f.read()
+        try:
+            with open(hellodbg, "rb") as f:
+                program = f.read()
+        except OSError as exc:
+            self.record(name, "fail", f"test program unreadable: {exc}")
+            return
         status, _ = self.request("PUT", "/gemdrive/files/SMOKEDBG.TOS?overwrite=1",
                                  program, "application/octet-stream")
         if status not in (200, 201):
@@ -405,7 +422,7 @@ class Smoke:
         menu = True
         if self.probe.ready:
             try:
-                menu = "Select an option" in self.probe.text()
+                menu = self.probe.wait_for_text("Select an option")
             except swd.SwdError:
                 menu = False
         passed = ok and rebooted and reason == "reset" and menu
@@ -424,7 +441,7 @@ class Smoke:
 
 def main() -> int:
     here = os.path.dirname(os.path.abspath(__file__))
-    repo = os.path.abspath(os.path.join(here, "..", "..", ".."))
+    repo = os.path.abspath(os.path.join(here, "..", ".."))
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--host", default=os.environ.get("SIDECART_HOST", "sidecart.local"))
     parser.add_argument("--label", default="", help="build under test, for the report")
