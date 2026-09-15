@@ -13,13 +13,24 @@ Usage:
     python3 tools/dev/swd.py build-id [ELF ...]
     python3 tools/dev/swd.py read ADDRESS LENGTH OUTFILE
     python3 tools/dev/swd.py program ELF
+    python3 tools/dev/swd.py resume
+    python3 tools/dev/swd.py screen OUT.png [--elf ELF] [--scale N]
+    python3 tools/dev/swd.py shared [--elf ELF] [--all]
 
 `running` waits until the vector table register (VTOR) holds the ELF's RAM
-vector table, which the SDK's runtime init installs: the RP has booted a
-firmware with that layout and got past its startup code. `verify` compares the whole flashed image with the ELF (about 3 s
+vector table, which the SDK's runtime init installs, and core 0 is not halted:
+the RP has booted a firmware with that layout and got past its startup code.
+`resume` releases both cores after a debugger left them halted. `verify` compares the whole flashed image with the ELF (about 3 s
 for 630 KB). `build-id` reads the `release_build_id` string from flash; with no
 ELF it tries every ELF in tools/dev/builds/elf. `program` flashes the ELF and
 resets the RP.
+
+`screen` renders the 320x200 framebuffer at the top of the 64 KB cartridge
+window as a PNG: the setup menu as the ST shows it. `shared` prints the command
+sentinel, the random token and the indexed shared variables, named after the
+`*_SVAR_*` indexes in rp/src/include. Both find the window from the ELF's
+`__rom_in_ram_start__` and the offsets from rp/src/include/chandler.h; without
+`--elf` they use the cached ELF whose build ID matches the RP.
 
 OpenOCD is $OPENOCD, `openocd` on PATH, or ../pico/openocd/src/openocd next to
 the repo; its scripts come from $PICO_OPENOCD_PATH (as in .vscode/launch.json),
@@ -35,18 +46,27 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import ast
 import glob
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
+INCLUDE_DIR = os.path.join(REPO, "rp", "src", "include")
+FB_WIDTH, FB_HEIGHT = 320, 200
 VTOR = 0xE000ED08
+DHCSR = 0xE000EDF0
+DHCSR_S_HALT = 1 << 17
+DHCSR_RELEASE = 0xA05F0000  # DBGKEY; clears C_HALT and C_DEBUGEN
+CORES = ("rp2040.core0", "rp2040.core1")
 BUILD_ID_SYMBOL = "release_build_id"
 
 
@@ -100,8 +120,8 @@ def openocd(*commands: str, check: bool = True) -> str:
     return out
 
 
-def read_word(address: int) -> int:
-    out = openocd(f"mdw 0x{address:08x}")
+def read_word(address: int, core: str = CORES[0]) -> int:
+    out = openocd(f"targets {core}", f"mdw 0x{address:08x}")
     m = re.search(rf"0x{address:08x}:\s+([0-9a-fA-F]{{8}})", out)
     if not m:
         raise SwdError(f"cannot read 0x{address:08x}")
@@ -150,10 +170,11 @@ def cmd_running(args: argparse.Namespace) -> int:
     while True:
         try:
             vtor = read_word(VTOR)
-            if vtor in tables:
+            halted = read_word(DHCSR) & DHCSR_S_HALT
+            if vtor in tables and not halted:
                 print(f"running: VTOR 0x{vtor:08x}")
                 return 0
-            last = f"VTOR 0x{vtor:08x}"
+            last = f"VTOR 0x{vtor:08x}" + (", core 0 halted" if halted else "")
         except SwdError as exc:
             last = str(exc)
         if time.monotonic() >= deadline:
@@ -228,11 +249,170 @@ def elf_build_id(elf: str) -> str | None:
     return None
 
 
+def header_defines(path: str) -> dict[str, int]:
+    """Integer #defines of a C header, resolving references between them."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    text = re.sub(r"//[^\n]*", " ", text).replace("\\\n", " ")
+    raw = dict(re.findall(r"^\s*#\s*define\s+([A-Za-z_]\w*)[ \t]+([^\n]+)$",
+                          text, re.M))
+    values: dict[str, int] = {}
+
+    def resolve(name: str, depth: int = 0) -> int | None:
+        if name in values:
+            return values[name]
+        if name not in raw or depth > 20:
+            return None
+        expr = re.sub(r"\b(0x[0-9a-fA-F]+|\d+)[uUlL]+\b", r"\1", raw[name])
+        for ref in set(re.findall(r"\b[A-Za-z_]\w*\b", expr)):
+            v = resolve(ref, depth + 1)
+            if v is None:
+                return None
+            expr = re.sub(rf"\b{ref}\b", str(v), expr)
+        try:
+            tree = ast.parse(expr.strip(), mode="eval")
+        except SyntaxError:
+            return None
+        allowed = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+                   ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Div,
+                   ast.LShift, ast.RShift, ast.BitOr, ast.BitAnd, ast.USub)
+        if not all(isinstance(n, allowed) for n in ast.walk(tree)):
+            return None
+        v = eval(compile(tree, path, "eval"), {"__builtins__": {}})
+        if not isinstance(v, (int, float)):
+            return None
+        values[name] = int(v)
+        return values[name]
+
+    for name in raw:
+        resolve(name)
+    return values
+
+
+def matching_elf(explicit: str | None) -> str:
+    """The ELF given, or the cached ELF whose build ID the RP carries."""
+    if explicit:
+        return explicit
+    elfs = sorted(glob.glob(os.path.join(HERE, "builds", "elf", "*.elf")),
+                  key=os.path.getmtime, reverse=True)
+    for elf in elfs:
+        expected = elf_build_id(elf)
+        if expected and read_build_id(elf) == expected:
+            return elf
+    raise SwdError("no cached ELF matches the RP's build ID: pass --elf")
+
+
+def cartridge_window(elf: str) -> tuple[int, dict[str, int]]:
+    base = elf_symbols(elf, "__rom_in_ram_start__").get("__rom_in_ram_start__")
+    if not base:
+        raise SwdError(f"{elf} has no __rom_in_ram_start__")
+    return base[0], header_defines(os.path.join(INCLUDE_DIR, "chandler.h"))
+
+
+def write_png(path: str, width: int, height: int, rows: list[bytes]) -> None:
+    """8-bit greyscale PNG."""
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return (struct.pack(">I", len(data)) + body +
+                struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+    raw = b"".join(b"\0" + row for row in rows)
+    png = (b"\x89PNG\r\n\x1a\n" +
+           chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)) +
+           chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+def cmd_screen(args: argparse.Namespace) -> int:
+    elf = matching_elf(args.elf)
+    base, defs = cartridge_window(elf)
+    offset = defs["CHANDLER_FRAMEBUFFER_OFFSET"]
+    size = defs["CHANDLER_FRAMEBUFFER_SIZE"]
+    if size != FB_WIDTH * FB_HEIGHT // 8:
+        raise SwdError(f"framebuffer is {size} bytes, expected 320x200 mono")
+    fb = read_memory(base + offset, size)
+    stride = FB_WIDTH // 8
+    rows = []
+    for y in range(FB_HEIGHT):
+        line = fb[y * stride:(y + 1) * stride]
+        # Bit 7 of each byte is the leftmost of its eight pixels. Lit pixels
+        # are drawn black on white, as on the ST's monochrome screen.
+        pixels = bytes(0 if (line[x >> 3] >> (7 - (x & 7))) & 1 else 255
+                       for x in range(FB_WIDTH))
+        scaled = bytes(p for p in pixels for _ in range(args.scale))
+        rows.extend([scaled] * args.scale)
+    write_png(args.out, FB_WIDTH * args.scale, FB_HEIGHT * args.scale, rows)
+    lit = sum(bin(b).count("1") for b in fb)
+    print(f"wrote {args.out} ({FB_WIDTH * args.scale}x{FB_HEIGHT * args.scale}, "
+          f"{lit} pixels lit) from 0x{base + offset:08x}")
+    return 0
+
+
+def svar_names() -> dict[int, list[str]]:
+    names: dict[int, list[str]] = {}
+    for header in sorted(glob.glob(os.path.join(INCLUDE_DIR, "*.h"))):
+        defs = header_defines(header)
+        for name, value in defs.items():
+            if "_SVAR_" in name or name in ("CHANDLER_HARDWARE_TYPE",
+                                            "CHANDLER_SVERSION",
+                                            "CHANDLER_BUFFER_TYPE"):
+                names.setdefault(value, []).append(name)
+    return names
+
+
+def cmd_shared(args: argparse.Namespace) -> int:
+    elf = matching_elf(args.elf)
+    base, defs = cartridge_window(elf)
+    start = defs["CHANDLER_SHARED_BLOCK_OFFSET"]
+    var_off = defs["CHANDLER_SHARED_VARIABLES_OFFSET"]
+    slots = defs["CHANDLER_SHARED_VARIABLES_SLOTS"]
+    data = read_memory(base + start, var_off - start + slots * 4)
+
+    def long_at(offset: int) -> int:
+        # The ST reads big-endian longs made of two RP-order 16-bit words.
+        hi, lo = struct.unpack_from("<HH", data, offset - start)
+        return (hi << 16) | lo
+
+    print(f"cartridge window 0x{base:08x} (ST $FA0000), ELF {os.path.basename(elf)}")
+    for label, name in (("command sentinel", "CHANDLER_CMD_SENTINEL_OFFSET"),
+                        ("random token", "CHANDLER_RANDOM_TOKEN_OFFSET"),
+                        ("random token seed", "CHANDLER_RANDOM_TOKEN_SEED_OFFSET")):
+        off = defs[name]
+        print(f"  ${0xFA0000 + off:06X}  {label:<34} 0x{long_at(off):08x}")
+    names = svar_names()
+    for i in range(slots):
+        value = long_at(var_off + i * 4)
+        label = " / ".join(names.get(i, []))
+        if value == 0 and not label and not args.all:
+            continue
+        print(f"  ${0xFA0000 + var_off + i * 4:06X}  [{i:2}] {label or '-':<29} "
+              f"0x{value:08x}  {value}")
+    return 0
+
+
 def cmd_read(args: argparse.Namespace) -> int:
     data = read_memory(int(args.address, 0), int(args.length, 0))
     with open(args.outfile, "wb") as f:
         f.write(data)
     print(f"read {len(data)} bytes from {args.address} into {args.outfile}")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Release both cores from a debug halt. OpenOCD's own resume fails in a
+    new OpenOCD run, and a halted core 1 also pauses the RP2040's timer and
+    watchdog, which leaves core 0 asleep forever."""
+    commands = []
+    for core in CORES:
+        commands += [f"targets {core}", f"mww 0x{DHCSR:08x} 0x{DHCSR_RELEASE:08x}"]
+    openocd(*commands)
+    states = [read_word(DHCSR, core) & DHCSR_S_HALT for core in CORES]
+    if any(states):
+        print("still halted: " + ", ".join(
+            c for c, h in zip(CORES, states) if h), file=sys.stderr)
+        return 3
+    print("both cores released")
     return 0
 
 
@@ -269,6 +449,21 @@ def build_parser() -> argparse.ArgumentParser:
     g = sub.add_parser("program", help="flash the ELF and reset")
     g.add_argument("elf")
     g.set_defaults(func=cmd_program)
+
+    rs = sub.add_parser("resume", help="release both cores from a debug halt")
+    rs.set_defaults(func=cmd_resume)
+
+    sc = sub.add_parser("screen", help="render the framebuffer as a PNG")
+    sc.add_argument("out")
+    sc.add_argument("--elf")
+    sc.add_argument("--scale", type=int, default=2)
+    sc.set_defaults(func=cmd_screen)
+
+    sh = sub.add_parser("shared", help="print the shared variables")
+    sh.add_argument("--elf")
+    sh.add_argument("--all", action="store_true",
+                    help="also print unnamed slots that are zero")
+    sh.set_defaults(func=cmd_shared)
     return p
 
 

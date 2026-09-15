@@ -68,7 +68,21 @@ python3 tools/dev/swd.py verify tools/dev/builds/debug/rp.elf    # flash identic
 python3 tools/dev/swd.py build-id                                # which build is on the RP?
 python3 tools/dev/swd.py read 0x2003e0c0 8000 fb.bin             # dump memory
 python3 tools/dev/swd.py program tools/dev/builds/debug/rp.elf   # flash through the probe
+python3 tools/dev/swd.py screen menu.png                         # the setup menu as the ST shows it
+python3 tools/dev/swd.py shared                                  # sentinel, token, shared variables
+python3 tools/dev/swd.py resume                                  # release cores a debugger left halted
 ```
+
+`screen` renders the 320×200 framebuffer at the top of the cartridge window as a PNG (scaled 2×,
+`--scale`). It shows what the RP draws for the ST: the setup menu, not GEM or a running program.
+`shared` prints the command sentinel, the random token and the shared variables, named after the
+`*_SVAR_*` indexes in `rp/src/include`. Both take the window address from the ELF and the offsets
+from `chandler.h`; without `--elf` they use the cached ELF whose build ID the RP carries, so flash
+the build with `flash.sh` first.
+
+A halted RP can still be read. Halting core 1 also pauses the RP2040's timer and watchdog, so after
+a debugger halt run `resume`, which releases both cores; OpenOCD's own `resume` fails in a new
+OpenOCD run.
 
 `build-id` with no ELF tries the ELFs in `tools/dev/builds/elf`. OpenOCD is `$OPENOCD`, `openocd`
 on `PATH`, or `../pico/openocd/src/openocd`; its scripts come from `$PICO_OPENOCD_PATH`, the
