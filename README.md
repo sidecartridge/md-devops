@@ -437,6 +437,32 @@ unreachable too — fix Wi-Fi / mDNS first. Common causes:
 Once `ping` works, every other CLI command works too — they all
 talk to the same HTTP server.
 
+## 🩺 Device health: `health`
+
+`health` reads the device's own diagnostics, including on a `release`
+build that has no console: free heap and its low point, how deep the
+stack has gone, why the Pico last rebooted, and lost ROM3 samples or
+debug bytes.
+
+```sh
+$ python3 cli/sidecart.py health
+version         : v1.1.0
+uptime          : 312 s
+heap free       : 61240 / 118720 bytes
+heap min free   : 48812 bytes
+sbrk high-water : 72316 bytes
+stack high-water: 5324 bytes, 2048 reserved, 8192 measured
+code in RAM     : 71048 bytes
+last reset      : power_on
+crash count     : 0
+watchdog        : on
+rom3 overruns   : 0
+debugcap dropped: 0
+usbcdc dropped  : 0
+```
+
+See [`docs/api.md`](docs/api.md) for every field.
+
 ## 💾 GEMDRIVE commands — manage files and folders remotely
 
 The Atari ST sees a microSD subdirectory as a TOS drive (default

@@ -202,6 +202,127 @@ class PingTests(unittest.TestCase):
         self.assertIn("cannot reach", err)
 
 
+def _health_payload(**overrides: object) -> dict:
+    payload = {
+        "ok": True,
+        "version": "v1.1.0",
+        "uptime_s": 42,
+        "heap": {"total": 180000, "free": 120000, "min_free": 90000,
+                 "sbrk_high_water": 70000},
+        "stack": {"reserved": 2048, "high_water": 5120, "painted": 8192,
+                  "overflow": False},
+        "code_in_ram": 65536,
+        "reset": {"reason": "power_on", "phase": None, "pc": None,
+                  "lr": None, "sp": None, "crash_count": 0,
+                  "crash_loop": False},
+        "watchdog": True,
+        "rom3_overruns": 3,
+        "debugcap_dropped": 0,
+        "usbcdc_dropped": 17,
+    }
+    payload.update(overrides)
+    return payload
+
+
+class HealthTests(unittest.TestCase):
+    """`sidecart health` — GET /api/v1/system/health."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        self.server.state.next_status = status
+        self.server.state.next_body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_health_human_prints_every_field(self) -> None:
+        self._set_response(200, _health_payload())
+        code, out, err = _run_cli(["--host", self.server.host, "health"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(err, "")
+        self.assertEqual(self.server.state.last_method, "GET")
+        self.assertEqual(self.server.state.last_path, "/api/v1/system/health")
+        for text in ("v1.1.0", "42 s", "120000 / 180000", "90000", "70000",
+                     "5120 bytes, 2048 reserved, 8192 measured", "65536",
+                     "power_on", "watchdog        : on",
+                     "rom3 overruns   : 3", "usbcdc dropped  : 17"):
+            self.assertIn(text, out)
+        self.assertNotIn("OVERFLOW", out)
+        self.assertNotIn("lwip", out)
+
+    def test_health_panic_shows_pc_and_sp(self) -> None:
+        self._set_response(200, _health_payload(
+            reset={"reason": "panic", "phase": None, "pc": "0x10001234",
+                   "lr": None, "sp": "0x20041f00", "crash_count": 3,
+                   "crash_loop": True}))
+        code, out, _err = _run_cli(["--host", self.server.host, "health"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("panic at 0x10001234", out)
+        self.assertIn("sp=0x20041f00", out)
+        self.assertIn("crash loop", out)
+
+    def test_health_hardfault_shows_lr(self) -> None:
+        self._set_response(200, _health_payload(
+            reset={"reason": "hardfault", "phase": None, "pc": "0x10002000",
+                   "lr": "0x10003001", "sp": "0x20041e00", "crash_count": 1,
+                   "crash_loop": False}))
+        code, out, _err = _run_cli(["--host", self.server.host, "health"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("hardfault at 0x10002000  lr=0x10003001", out)
+
+    def test_health_hang_shows_phase(self) -> None:
+        self._set_response(200, _health_payload(
+            reset={"reason": "hang", "phase": "http_wait", "pc": None,
+                   "lr": None, "sp": None, "crash_count": 1,
+                   "crash_loop": False}))
+        code, out, _err = _run_cli(["--host", self.server.host, "health"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("hang in http_wait", out)
+
+    def test_health_stack_overflow_flagged(self) -> None:
+        self._set_response(200, _health_payload(
+            stack={"reserved": 2048, "high_water": 8192, "painted": 8192,
+                   "overflow": True}))
+        code, out, _err = _run_cli(["--host", self.server.host, "health"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("OVERFLOW", out)
+
+    def test_health_lwip_counters(self) -> None:
+        self._set_response(200, _health_payload(
+            lwip={"mem": [100, 2000, 0], "pbuf_pool": [2, 12, 5]}))
+        code, out, _err = _run_cli(["--host", self.server.host, "health"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("lwip pbuf_pool  : used 2  max 12  err 5", out)
+
+    def test_health_json(self) -> None:
+        self._set_response(200, _health_payload())
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "--json", "health"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(json.loads(out)["heap"]["min_free"], 90000)
+
+    def test_health_quiet(self) -> None:
+        self._set_response(200, _health_payload())
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "-q", "health"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(out, "")
+
+    def test_health_404_on_older_firmware(self) -> None:
+        self._set_response(404, {"ok": False, "code": "not_found",
+                                 "message": "Route not found"})
+        code, _out, err = _run_cli(["--host", self.server.host, "health"])
+        self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
+        self.assertIn("not_found", err)
+
+    def test_health_unreachable(self) -> None:
+        code, _out, err = _run_cli(["--host", "127.0.0.1:1", "health"])
+        self.assertEqual(code, sidecart.EXIT_NETWORK)
+        self.assertIn("cannot reach", err)
+
+
 class VolumeTests(unittest.TestCase):
 
     def setUp(self) -> None:

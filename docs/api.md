@@ -149,6 +149,77 @@ python3 cli/sidecart.py ping
 
 ---
 
+### `GET /api/v1/system/health` — device health
+
+Reads the device's diagnostics, in both build types: heap and stack
+high-water marks, why the RP last rebooted, and lost ROM3 samples and
+debug bytes. Sampling is cheap and changes nothing; poll it at any
+cadence.
+
+**Success** (`200`):
+```json
+{
+  "ok": true,
+  "version": "v1.1.0",
+  "uptime_s": 312,
+  "heap": { "total": 118720, "free": 61240, "min_free": 48812, "sbrk_high_water": 72316 },
+  "stack": { "reserved": 2048, "high_water": 5324, "painted": 8192, "overflow": false },
+  "code_in_ram": 71048,
+  "reset": { "reason": "panic", "phase": null, "pc": "0x10012abc", "lr": null,
+             "sp": "0x20041e58", "crash_count": 1, "crash_loop": false },
+  "watchdog": true,
+  "rom3_overruns": 0,
+  "debugcap_dropped": 0,
+  "usbcdc_dropped": 0
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `uptime_s` | Seconds since the RP booted. `ping` counts from when the HTTP server started instead. |
+| `heap.total` | Bytes between the end of BSS and the heap cap at the start of the cartridge window. |
+| `heap.free` | Bytes `malloc` can still use: never-claimed heap plus free chunks inside the claimed part. |
+| `heap.min_free` | Lowest `heap.free` seen since boot, sampled every 100 ms in the main loop and on every health request. |
+| `heap.sbrk_high_water` | Most heap ever claimed from the system, in bytes. |
+| `stack.reserved` | Core-0 stack size the linker reserves. |
+| `stack.high_water` | Deepest core-0 stack use since boot. It can exceed `reserved`: the stack then runs into the unused core-1 stack area below it. |
+| `stack.painted` | Bytes below the stack top that are measured. |
+| `stack.overflow` | `true` when the stack reached the bottom of the measured area, so the real depth is unknown and memory below it was overwritten. |
+| `code_in_ram` | Bytes of code and initialised data copied to RAM at boot. |
+| `reset.reason` | Why the RP last started: `power_on` (power, RUN pin or debugger), `reset` (SELECT or a menu reset), `panic`, `hardfault`, `hang` (the watchdog fired), or `reboot` (any other reboot, such as from Booster or picotool). |
+| `reset.phase` | For a `hang`, where the firmware was: `boot`, `main_loop`, `wifi_connect`, `http_request`, `http_wait`, `gemdrive` or `flash_write`. Otherwise `null`. |
+| `reset.pc`, `reset.sp` | For a `panic`, the address that called `panic()` and the stack pointer there. For a `hardfault`, the faulting instruction and stack pointer. Otherwise `null`. |
+| `reset.lr` | For a `hardfault`, the link register at the fault. Otherwise `null`. |
+| `reset.crash_count` | Crash reboots (panic, HardFault or hang) in a row within 60 s. |
+| `reset.crash_loop` | `true` after 3 of them: the boot countdown stays stopped until a SELECT reset or a power cycle. |
+| `watchdog` | `true` once the 8 s watchdog is armed. |
+| `rom3_overruns` | Times the ROM3 command ring overflowed because the main loop fell behind. Each one lost commands (the ST retries them) and debug bytes. |
+| `debugcap_dropped` | Same as `bytes_dropped` in `GET /api/v1/debug`. |
+| `usbcdc_dropped` | Same as `usbcdc_dropped` in `GET /api/v1/debug`. |
+
+A `debug` build compiled with `DEVOPS_LWIP_STATS=1` in the environment
+adds lwIP's allocation counters, each as `[used, max, err]`. A non-zero
+`err` means lwIP failed an allocation:
+
+```json
+"lwip": { "mem": [812, 5120, 0], "pbuf_pool": [0, 4, 0], "tcp_pcb": [1, 3, 0],
+          "tcp_seg": [0, 9, 0], "sys_timeout": [9, 11, 0] }
+```
+
+**`curl`**:
+```sh
+curl http://sidecart.local/api/v1/system/health
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py health
+```
+
+`HEAD` is also accepted and returns the same headers with no body.
+
+---
+
 ### `GET /api/v1/gemdrive/volume` — SD card capacity
 
 **Success** (`200`):
@@ -1099,6 +1170,27 @@ screen /dev/tty.usbmodem*  115200          # baud is informational
 The CDC port is dedicated to debug bytes — the firmware's own
 DPRINTF diagnostics go to the UART debug header, not the CDC
 port. (Toggle `_DEBUG=1` in the build to enable UART DPRINTF.)
+
+### `POST /api/v1/debug/test/<fault>` — fault injection (debug builds)
+
+Only `debug` builds have these routes. They exist to check on hardware
+that the firmware recovers from a crash or a hang and reports it.
+
+| Path | Effect |
+| --- | --- |
+| `/api/v1/debug/test/panic` | Calls `panic()` from the main loop. The RP reboots with reason `panic`. |
+| `/api/v1/debug/test/hardfault` | Reads an unmapped address from the main loop. The RP reboots with reason `hardfault`. |
+| `/api/v1/debug/test/hang` | Spins forever in the main loop. After 8 s the watchdog reboots the RP with reason `hang`, phase `main_loop`. |
+| `/api/v1/debug/test/http-hang` | Spins forever inside the request handler and never answers. Reason `hang`, phase `http_request`. |
+| `/api/v1/debug/test/stall` | Blocks the main loop for 500 ms without reading the ROM3 ring. With the ST streaming debug bytes, `rom3_overruns` goes up. |
+
+All but `http-hang` answer `202` and act about 250 ms later, so the
+response gets out first:
+
+```sh
+curl -X POST http://sidecart.local/api/v1/debug/test/panic
+{"ok":true,"test":"panic"}
+```
 
 ### Verifying the path end-to-end
 
