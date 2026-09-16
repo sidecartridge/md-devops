@@ -158,7 +158,7 @@ void term_setLastSingleKeyCommand(char key) { lastSingleKeyCommand = key; }
  * the random token) but term doesn't use it directly — it re-derives the
  * pointer from the published snapshot inside term_loop().
  */
-void term_command_cb(TransmissionProtocol *protocol,
+void __not_in_flash_func(term_command_cb)(TransmissionProtocol *protocol,
                                           uint16_t *payloadPtr) {
   (void)payloadPtr;
   uint8_t writeIndex = protocolWriteIndex;
@@ -621,7 +621,7 @@ void term_init(void) {
 
 // Invoke this function to process the commands from the active loop in the
 // main function
-void term_loop() {
+void __not_in_flash_func(term_loop)() {
   TransmissionProtocol protocolSnapshot = {0};
   bool protocolReady = false;
   uint32_t overwriteCountSnapshot = 0;

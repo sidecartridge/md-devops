@@ -13,7 +13,7 @@
 // (RUNNER_CMD_DONE_EXECUTE so far). The payload follows the same
 // shape gemdrive_command_cb uses — TPROTO_GET_PAYLOAD_PARAM32 reads
 // the next 32-bit user payload word in m68k order.
-static void runner_command_cb(
+static void __not_in_flash_func(runner_command_cb)(
     TransmissionProtocol *protocol, uint16_t *payload) {
   switch (protocol->command_id) {
     case RUNNER_CMD_DONE_EXECUTE: {

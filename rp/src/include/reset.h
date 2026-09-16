@@ -13,6 +13,8 @@
 #include "debug.h"
 #include "gconfig.h"
 #include "health.h"
+#include "hardware/irq.h"
+#include "hardware/regs/m0plus.h"
 #include "hardware/sync.h"
 #include "hardware/watchdog.h"
 #include "pico/multicore.h"
@@ -35,6 +37,18 @@ static inline void reset_jump_to_booster(void) {
   // The jump does not reset the chip: stop our watchdog, or it reboots
   // Booster 8 s later.
   health_prepareJump();
+
+  // Nor does the jump quieten our interrupts, and from the instruction that
+  // writes VTOR onwards they would vector through Booster's table, into
+  // handlers it has not installed yet. One of ours (the buffered console's
+  // UART transmit, USB, an alarm) then locked the core up: after the jump the
+  // debug probe read PC 0xfffffffe with Booster's stack pointer loaded, so
+  // the ST kept showing this app's last screen and Booster never ran. Mask and
+  // clear every NVIC interrupt first; Booster enables what it needs itself.
+  irq_set_mask_enabled(0xFFFFFFFFu, false);
+  *((volatile uint32_t *)(PPB_BASE + M0PLUS_NVIC_ICPR_OFFSET)) = 0xFFFFFFFFu;
+  __dsb();
+  __isb();
   // This code jumps to the Booster application at the top of the flash memory.
   // The reason to perform this jump is for performance reasons.
   // It should be placed at the beginning of main() if the SELECT signal or

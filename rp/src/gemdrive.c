@@ -1282,7 +1282,7 @@ static void handleDtaReleaseCall(uint16_t *payload) {
 // Dispatcher
 // ---------------------------------------------------------------------------
 
-void gemdrive_command_cb(TransmissionProtocol *protocol,
+void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
                                               uint16_t *payload) {
   if ((protocol->command_id & 0xFF00u) == GEMDRIVE_APP) {
     health_setPhase(HEALTH_PHASE_GEMDRIVE);
