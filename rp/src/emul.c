@@ -1001,8 +1001,25 @@ typedef struct {
   char topDir[MAX_FILENAME_LENGTH + 1];
 } DirNavigation;
 
-static DirNavigation navStateStorage;
-static DirNavigation *navState = &navStateStorage;
+// 24.8 KB, so it exists only while the folder picker is open (upstream's
+// pattern): allocated when [o] opens the picker, freed when it closes.
+static DirNavigation *navState = NULL;
+
+static bool navStateOpen(void) {
+  if (navState != NULL) return true;
+  navState = calloc(1, sizeof(DirNavigation));
+  if (navState == NULL) {
+    DPRINTF("Folder picker: cannot allocate %u bytes\n",
+            (unsigned)sizeof(DirNavigation));
+    return false;
+  }
+  return true;
+}
+
+static void navStateClose(void) {
+  free(navState);
+  navState = NULL;
+}
 
 // Filter: directories only — we list folders, never files. Hidden dotfiles
 // are skipped. Mirrors the spirit of source's floppiesFilter for our case.
@@ -1468,6 +1485,11 @@ void cmdGemdriveFolder(const char *arg) {
   switch (term_getCommandLevel()) {
     case TERM_COMMAND_LEVEL_SINGLE_KEY: {
       DPRINTF("Folder picker entering reentry mode.\n");
+      if (!navStateOpen()) {
+        drawSetupInfoLine("Not enough memory to open the folder picker.");
+        display_refresh();
+        return;
+      }
       SettingsConfigEntry *gemDriveFolder = settings_find_entry(
           aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER);
       const char *seed =
@@ -1485,6 +1507,12 @@ void cmdGemdriveFolder(const char *arg) {
       char key = arg[0];
       // ESC cancels the picker and returns to the menu.
       if (key == 27) {
+        navStateClose();
+        term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
+        menu();
+        return;
+      }
+      if (navState == NULL) {
         term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
         menu();
         return;
@@ -1508,8 +1536,17 @@ void cmdGemdriveFolder(const char *arg) {
       settings_put_string(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER,
                           navState->folderPath);
       (void)saveAppSettings();
+      navStateClose();
       term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
       menu();
+      break;
+    }
+    case NAV_DIR_ERROR: {
+      navStateClose();
+      term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
+      menu();
+      drawSetupInfoLine("Could not read the folder from the SD card.");
+      display_refresh();
       break;
     }
     default:
