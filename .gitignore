@@ -51,6 +51,7 @@ Module.symvers
 Mkfile.old
 dkms.conf
 
+*.pyc
 ffconf.h.bak
 secrets.sh
 upload_s3.sh
