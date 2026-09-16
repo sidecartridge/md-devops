@@ -55,7 +55,8 @@ a stuck override.
 (rp/src/include/devhooks.h) and wait until the main loop acknowledges it.
 `key` sends a keystroke as the ST would, `inject` any protocol command with the
 given 16-bit payload words after the random token, and `app` an app command
-named by a DEVHOOKS_APP_<NAME> define, for example `app countdown_stop`.
+named by a DEVHOOKS_APP_<NAME> define, with optional 16-bit payload words, for
+example `app countdown_stop` or `app heap_hold 16`.
 
 `crash` explains the last reboot without stopping the RP: the watchdog reason
 and scratch registers and, when the ELF has them, the breadcrumb the firmware
@@ -587,7 +588,8 @@ def cmd_app(args: argparse.Namespace) -> int:
     command_id = include_defines().get(name)
     if command_id is None:
         raise SwdError(f"no {name} define in rp/src/include")
-    result = mailbox_request(elf, KIND_APP, command_id, [])
+    words = [int(w, 0) for w in args.words]
+    result = mailbox_request(elf, KIND_APP, command_id, words)
     print(f"{name}: result {result}")
     return 0 if result else 3
 
@@ -794,6 +796,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ap = sub.add_parser("app", help="send an app command (DEVHOOKS_APP_*)")
     ap.add_argument("name")
+    ap.add_argument("words", nargs="*", help="16-bit payload words")
     ap.add_argument("--elf")
     ap.set_defaults(func=cmd_app)
 

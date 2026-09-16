@@ -28,6 +28,9 @@ void emul_start();
 // tools read these names: tools/dev/swd.py app countdown_stop.
 #define DEVHOOKS_APP_COUNTDOWN_STOP 1
 #define DEVHOOKS_APP_COUNTDOWN_RESTART 2
+// Hold the given number of KB of heap (first payload word), to test what the
+// firmware does when memory runs out; 0 KB releases it again.
+#define DEVHOOKS_APP_HEAP_HOLD 3
 
 /**
  * @brief Whether the user picked Runner mode at boot ([U] in the

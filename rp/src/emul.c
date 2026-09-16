@@ -683,11 +683,37 @@ static void refreshSetupInfoLine(void) {
 #if defined(_DEBUG) && (_DEBUG != 0)
 // Debug mailbox app commands (devhooks.h): stop or restart the boot countdown
 // from a host tool. Returns 1 when done, 0 for an unknown command.
+// Blocks held by DEVHOOKS_APP_HEAP_HOLD, so a test can squeeze the heap in
+// steps; holding 0 KB frees them all.
+typedef struct DevhooksHeldBlock {
+  struct DevhooksHeldBlock *next;
+} DevhooksHeldBlock;
+static DevhooksHeldBlock *devhooksHeldHeap = NULL;
+
 static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
                                  uint16_t payloadSize) {
-  (void)payload;
-  (void)payloadSize;
   switch (commandId) {
+    case DEVHOOKS_APP_HEAP_HOLD: {
+      uint32_t kb = (payloadSize >= 2u) ? payload[0] : 0u;
+      if (kb == 0u) {
+        while (devhooksHeldHeap != NULL) {
+          DevhooksHeldBlock *next = devhooksHeldHeap->next;
+          free(devhooksHeldHeap);
+          devhooksHeldHeap = next;
+        }
+        DPRINTF("devhooks: heap hold released\n");
+        return 1;
+      }
+      DevhooksHeldBlock *block =
+          malloc(sizeof(DevhooksHeldBlock) + kb * 1024u);
+      if (block != NULL) {
+        block->next = devhooksHeldHeap;
+        devhooksHeldHeap = block;
+      }
+      DPRINTF("devhooks: holding %lu KB more heap: %s\n", (unsigned long)kb,
+              (block != NULL) ? "ok" : "refused");
+      return (block != NULL) ? 1u : 0u;
+    }
     case DEVHOOKS_APP_COUNTDOWN_STOP:
       haltCountdown = true;
       return 1;
