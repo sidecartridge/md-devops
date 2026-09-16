@@ -134,6 +134,7 @@ typedef struct http_conn {
   char resp[HTTP_RESPONSE_BUF_BYTES];
   size_t resp_len;
   size_t resp_sent;
+  bool resp_queued;  // resp is in lwIP's send queue; false means retry it
 
   // Streaming directory listing state. Active while state ==
   // HC_STREAM_LISTING; the dir handle outlives a single TCP recv/sent
@@ -209,6 +210,7 @@ static void parse_and_dispatch(http_conn_t *c, struct pbuf *seg,
                                size_t body_off);
 static void route(http_conn_t *c);
 static void __not_in_flash_func(send_buffered)(http_conn_t *c);
+static void __not_in_flash_func(send_buffered_try)(http_conn_t *c);
 
 static void write_response(http_conn_t *c, int status, const char *reason,
                            const char *content_type, const char *body,
@@ -384,6 +386,19 @@ static void conn_release_resources(http_conn_t *c) {
   }
 }
 
+// Set when conn_close had to abort a pcb. lwIP requires the callback that
+// caused the abort to return ERR_ABRT (core/tcp.c, tcp_abort docs), and
+// conn_close is called from deep inside the response writers, so it reports
+// through this flag rather than a return value threaded through every call
+// site. Each callback clears it with conn_takeAborted() on the way out.
+static bool g_conn_aborted;
+
+static bool conn_takeAborted(void) {
+  bool aborted = g_conn_aborted;
+  g_conn_aborted = false;
+  return aborted;
+}
+
 static void conn_close(http_conn_t *c) {
   conn_release_resources(c);
   if (c->pcb != NULL) {
@@ -393,9 +408,13 @@ static void conn_close(http_conn_t *c) {
     tcp_sent(pcb, NULL);
     tcp_poll(pcb, NULL, 0);
     tcp_err(pcb, NULL);
+    // tcp_close only fails on a NULL pcb in this lwIP (ERR_MEM is deferred
+    // through TF_CLOSEPEND), so the abort is unreachable today -- but if it
+    // ever runs, the callback we are inside has to return ERR_ABRT.
     err_t err = tcp_close(pcb);
     if (err != ERR_OK) {
       tcp_abort(pcb);
+      g_conn_aborted = true;
     }
   }
   conn_free(c);
@@ -428,10 +447,14 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
                          err_t err) {
   http_conn_t *c = (http_conn_t *)arg;
   if (c == NULL) {
+    // Nobody owns this pcb. Returning any other error would make lwIP keep
+    // the pbuf we just freed and deliver it again (core/tcp_in.c), so abort
+    // and report the abort, which is the one contract-legal way out.
     if (p != NULL) {
       pbuf_free(p);
     }
-    return ERR_VAL;
+    tcp_abort(pcb);
+    return ERR_ABRT;
   }
   if (err != ERR_OK || p == NULL) {
     // Peer closed or error; either way the connection is done.
@@ -439,15 +462,20 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
       pbuf_free(p);
     }
     conn_close(c);
-    return ERR_OK;
+    return conn_takeAborted() ? ERR_ABRT : ERR_OK;
   }
   conn_touch(c);
+  // Account for the segment here, once. A response writer can close the
+  // connection (a failed write, a FatFs error, a Runner timeout), and
+  // tcp_recved() on a closed pcb touches one lwIP has already purged and
+  // queued to be freed.
+  tcp_recved(pcb, p->tot_len);
 
   if (c->state == HC_READ_HEADERS) {
     // Only the headers go into c->hdr. Body bytes that shared this
     // segment with them stay in the pbuf and are handed to the
     // dispatcher by offset: copying them into c->hdr would drop
-    // everything past HTTP_HEADER_BUF_BYTES while tcp_recved below
+    // everything past HTTP_HEADER_BUF_BYTES while the tcp_recved above
     // still tells the peer they arrived.
     size_t hdr_before = c->hdr_len;
     size_t to_copy = p->tot_len;
@@ -463,7 +491,6 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
       c->hdr_len += to_copy;
       c->hdr[c->hdr_len] = '\0';
     }
-    tcp_recved(pcb, p->tot_len);
 
     char *eoh = strstr(c->hdr, "\r\n\r\n");
     if (eoh != NULL) {
@@ -483,7 +510,6 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
       pbuf_copy_partial(p, c->body + c->body_received, (u16_t)take, 0);
       c->body_received += take;
     }
-    tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
     if (c->body_received >= c->content_length) {
       route(c);
@@ -495,17 +521,15 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
     size_t want = c->content_length - c->upload_received;
     size_t take = (p->tot_len < want) ? p->tot_len : want;
     FRESULT fr = FR_OK;
-    if (!upload_drain_pbuf(c, p, 0, take, &fr)) {
+    bool written = upload_drain_pbuf(c, p, 0, take, &fr);
+    pbuf_free(p);
+    if (!written) {
       // Surface 500 to the client; conn_close closes the FIL and
       // unlinks the partial file when the response has been drained.
       write_fs_error(c, fr, "f_write failed mid-upload");
-      tcp_recved(pcb, p->tot_len);
-      pbuf_free(p);
-      return ERR_OK;
+      return conn_takeAborted() ? ERR_ABRT : ERR_OK;
     }
     c->upload_received += take;
-    tcp_recved(pcb, p->tot_len);
-    pbuf_free(p);
     if (c->upload_received >= c->content_length) {
       upload_finish_ok(c);
     }
@@ -516,21 +540,22 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
     // client may have sent more than we'll honour.
     size_t want = (size_t)(c->adv_load_total - c->adv_load_received);
     size_t take = (p->tot_len < want) ? p->tot_len : want;
-    if (take > 0) {
-      (void)adv_load_drain_pbuf(c, p, 0, take);
-    }
-    tcp_recved(pcb, p->tot_len);
+    bool drained = (take == 0) || adv_load_drain_pbuf(c, p, 0, take);
     pbuf_free(p);
+    if (!drained) {
+      // A chunk dispatch timed out; the 504 is already written and the
+      // load is over. Finishing it here would re-fire the failed chunk.
+      return conn_takeAborted() ? ERR_ABRT : ERR_OK;
+    }
     if (c->adv_load_received >= c->adv_load_total) {
       adv_load_finish_ok(c);
     }
   } else {
     // Already writing the response (or draining); discard any extra
     // bytes the client sent.
-    tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
   }
-  return ERR_OK;
+  return conn_takeAborted() ? ERR_ABRT : ERR_OK;
 }
 
 static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u16_t len) {
@@ -556,7 +581,7 @@ static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u1
     // ack'd; safe to close.
     conn_close(c);
   }
-  return ERR_OK;
+  return conn_takeAborted() ? ERR_ABRT : ERR_OK;
 }
 
 static err_t srv_poll_cb(void *arg, struct tcp_pcb *pcb) {
@@ -570,7 +595,14 @@ static err_t srv_poll_cb(void *arg, struct tcp_pcb *pcb) {
   // Try to push any bytes that may have arrived since the last drive.
   if (c->state == HC_STREAM_DEBUG) {
     stream_debug_drive(c);
-    return ERR_OK;
+    return conn_takeAborted() ? ERR_ABRT : ERR_OK;
+  }
+  // A response lwIP had no room for is still owed to the client. Retry it
+  // here; if it never goes out, the idle timeout below closes the
+  // connection.
+  if (c->state == HC_WRITE_RESPONSE && !c->resp_queued) {
+    send_buffered_try(c);
+    return conn_takeAborted() ? ERR_ABRT : ERR_OK;
   }
   uint32_t idle_ms =
       (uint32_t)to_ms_since_boot(get_absolute_time()) - c->last_activity_ms;
@@ -583,7 +615,7 @@ static err_t srv_poll_cb(void *arg, struct tcp_pcb *pcb) {
       (unsigned long)idle_ms, (int)c->state, (unsigned long)c->upload_received,
       (unsigned long)c->content_length);
   conn_close(c);
-  return ERR_OK;
+  return conn_takeAborted() ? ERR_ABRT : ERR_OK;
 }
 
 static void srv_err_cb(void *arg, err_t err) {
@@ -3111,6 +3143,11 @@ static err_t __not_in_flash_func(stream_send_chunk)(http_conn_t *c,
   char hdr[16];
   int hn = snprintf(hdr, sizeof(hdr), "%lX\r\n", (unsigned long)body_len);
   if (hn < 0 || hn >= (int)sizeof(hdr)) return ERR_VAL;
+  // A chunk is three writes, and a client cannot make sense of a size line
+  // with no body after it. Only start one the send buffer can hold whole.
+  if (tcp_sndbuf(c->pcb) < (u16_t)hn + body_len + 2) {
+    return ERR_MEM;
+  }
   err_t err = tcp_write(c->pcb, hdr, (u16_t)hn,
                         TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE);
   if (err != ERR_OK) return err;
@@ -3815,6 +3852,10 @@ static void handle_file_download(http_conn_t *c,
       g_body_stream_busy = false;
       c->holds_body_lock = false;
     }
+    // Nothing follows the headers, so the peer's ack of them is the end of
+    // the response. Without this srv_sent_cb's HC_DRAINING branch never
+    // fires and the connection sits on a slot until the idle sweep.
+    c->stream_body_done = true;
     c->state = HC_DRAINING;
     return;
   }
@@ -4479,17 +4520,35 @@ static void route(http_conn_t *c) {
 
 // --- Response writers ---
 
+// Try to hand the buffered response to lwIP. ERR_MEM means it queued
+// nothing (core/tcp_out.c) and the application is expected to wait for the
+// peer to acknowledge what is already in flight and try again -- so leave
+// resp_queued false and let the poll callback come back to it. Dropping the
+// response and closing, as this used to do, loses a reply the client is
+// still waiting for.
+static void __not_in_flash_func(send_buffered_try)(http_conn_t *c) {
+  if (c->pcb == NULL || c->resp_queued) {
+    return;
+  }
+  err_t err =
+      tcp_write(c->pcb, c->resp, (u16_t)c->resp_len, TCP_WRITE_FLAG_COPY);
+  if (err == ERR_OK) {
+    c->resp_queued = true;
+    tcp_output(c->pcb);
+    return;
+  }
+  if (err == ERR_MEM) {
+    return;  // nothing queued; srv_poll_cb retries, the idle sweep gives up
+  }
+  DPRINTF("http_server: tcp_write failed: %d\n", err);
+  conn_close(c);
+}
+
 static void __not_in_flash_func(send_buffered)(http_conn_t *c) {
   c->state = HC_WRITE_RESPONSE;
   c->resp_sent = 0;
-  err_t err = tcp_write(c->pcb, c->resp, (u16_t)c->resp_len,
-                        TCP_WRITE_FLAG_COPY);
-  if (err == ERR_OK) {
-    tcp_output(c->pcb);
-  } else {
-    DPRINTF("http_server: tcp_write failed: %d\n", err);
-    conn_close(c);
-  }
+  c->resp_queued = false;
+  send_buffered_try(c);
 }
 
 // Write a response with optional extra header lines (each must end
