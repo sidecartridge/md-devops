@@ -702,7 +702,9 @@ static void __not_in_flash_func(handleFcreateCall)(uint16_t *payload) {
   if (res != FR_OK) {
     DPRINTF("GEMDRIVE Fcreate: '%s' -> fr=%d\n", sdPath, (int)res);
     releaseFileSlot(slotIdx);
-    writeAppFreeWord(GEMDRIVE_FCREATE_HANDLE_OFFSET, (uint16_t)-34);  // EPTHNF
+    uint16_t err = (res == FR_TOO_MANY_OPEN_FILES) ? (uint16_t)-35   // ENHNDL
+                                                   : (uint16_t)-34;  // EPTHNF
+    writeAppFreeWord(GEMDRIVE_FCREATE_HANDLE_OFFSET, err);
     return;
   }
   // Match source: apply the GEMDOS attrib mode via f_chmod immediately
@@ -976,7 +978,11 @@ static void __not_in_flash_func(handleFopenCall)(uint16_t *payload) {
     DPRINTF("GEMDRIVE Fopen: '%s' (mode=%lu) failed (%d)\n", sdPath,
             (unsigned long)mode, (int)res);
     releaseFileSlot(slotIdx);
-    writeAppFreeLong(GEMDRIVE_FOPEN_HANDLE_OFFSET, (uint32_t)-33);  // EFILNF
+    // FatFs's lock table is shared with the HTTP server; a full one is out of
+    // handles, not a missing file (EPIC-13 STORY-06).
+    uint32_t err = (res == FR_TOO_MANY_OPEN_FILES) ? (uint32_t)-35   // ENHNDL
+                                                   : (uint32_t)-33;  // EFILNF
+    writeAppFreeLong(GEMDRIVE_FOPEN_HANDLE_OFFSET, err);
     return;
   }
   int handle = handleFromSlotIndex(slotIdx);
@@ -1262,8 +1268,11 @@ static void __not_in_flash_func(handleFsfirstCall)(uint16_t *payload) {
             pattern, (int)res);
     releaseDtaSlot(dtaAddr);
     // Match md-drives-emulator: EPTHNF (-34) when path doesn't exist,
-    // EFILNF (-33) when path exists but no entries match.
-    uint16_t err = (res == FR_NO_PATH) ? 0xFFDE : 0xFFDF;
+    // EFILNF (-33) when path exists but no entries match. A full lock table
+    // is neither -- it is out of handles (EPIC-13 STORY-06).
+    uint16_t err = (res == FR_TOO_MANY_OPEN_FILES) ? 0xFFDD  // ENHNDL (-35)
+                   : (res == FR_NO_PATH)           ? 0xFFDE
+                                                   : 0xFFDF;
     clearDtaFound(err);
     return;
   }

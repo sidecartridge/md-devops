@@ -251,7 +251,12 @@ number.
 /  bit1=1: Do not trust last allocated cluster number in the FSINFO.
 */
 
-#define FF_FS_LOCK 8
+/* 28 = the worst case this firmware can reach at once (EPIC-13 STORY-06):
+/  GEMDRIVE_MAX_OPEN_FILES 8 open files, plus GEMDRIVE_MAX_DTAS 16 searches that
+/  each keep a DIR open between Fsfirst and Fsnext, plus the HTTP server's
+/  HTTP_SERVER_MAX_CONNECTIONS 2 connections holding a FIL and a DIR each.
+/  Each entry is a 16-byte FILESEM, so the table costs 448 bytes of .bss. */
+#define FF_FS_LOCK 28
 /* The option FF_FS_LOCK switches file lock function to control duplicated file
 open /  and illegal operation to open objects. This option must be 0 when
 FF_FS_READONLY /  is 1.
