@@ -18,6 +18,37 @@
 static TransmissionProtocol pendingProtocol;
 static bool protocolPending = false;
 
+// Diagnostics for the ST's synchronous handshake, read over SWD by symbol so
+// a release build can be measured (EPIC-12 STORY-08). chandlerDropped counts
+// commands thrown away because another was still pending; chandlerRepeated
+// counts commands carrying the token of the command before them, which is what
+// the ST's retry after a timeout looks like.
+uint32_t chandlerHandled = 0;
+uint32_t chandlerDropped = 0;
+uint32_t chandlerRepeated = 0;
+// Where the time of a command goes: chandlerBusyUs is what this side spends
+// handling one (the SD write included), chandlerGapUs the time from answering
+// one command to seeing the next, which is the ST's turnaround.
+uint32_t chandlerBusyUs = 0;
+uint32_t chandlerGapUs = 0;
+uint32_t chandlerMaxGapUs = 0;
+uint32_t chandlerMaxBusyUs = 0;
+// Of that gap, how long the ST takes to touch the command window at all after
+// being answered: its spin-wait polls the shared block ($FA2804), which is not
+// this space, so no sample arrives until it starts sending the next command.
+uint32_t chandlerQuietUs = 0;
+uint32_t chandlerMaxQuietUs = 0;
+// How many main-loop passes a frame spans between its first sample and its
+// last, and how long this side spends draining the sample ring: tells a slow
+// sender apart from slow polling on our part.
+uint32_t chandlerFramePolls = 0;
+uint32_t chandlerChecksumErrors = 0;
+uint32_t chandlerPollUs = 0;
+static volatile bool chandlerFrameInFlight = false;
+static volatile bool chandlerAwaitingFirstSample = false;
+static uint32_t chandlerLastToken = 0;
+static uint32_t chandlerAnsweredAtUs = 0;
+
 static uint32_t incrementalCmdCount = 0;
 
 // Address of the random-token reply slot (chandler_loop publishes the
@@ -126,6 +157,7 @@ static inline void __not_in_flash_func(handle_protocol_command)(
   uint16_t size = tprotocol_clamp_payload_size(protocol->payload_size);
 
   if (protocolPending) {
+    chandlerDropped++;
     if (!chandler_protocol_matches_pending(protocol, size)) {
       DPRINTF("Ignoring protocol %04x (%u bytes) while %04x is pending\n",
               protocol->command_id, protocol->payload_size,
@@ -159,6 +191,7 @@ bool chandler_injectProtocol(uint16_t commandId, const uint16_t *payload,
 
 static inline void __not_in_flash_func(handle_protocol_checksum_error)(
     const TransmissionProtocol *protocol) {
+  chandlerChecksumErrors++;
   DPRINTF(
       "Checksum error detected (CommandID=%x, Size=%x, Bytes Read=%x, "
       "Chksum=%x, RTOKEN=%x)\n",
@@ -168,6 +201,13 @@ static inline void __not_in_flash_func(handle_protocol_checksum_error)(
 
 static inline void __not_in_flash_func(chandler_consume_rom3_sample)(
     uint16_t sample) {
+  if (chandlerAwaitingFirstSample) {
+    chandlerAwaitingFirstSample = false;
+    chandlerFrameInFlight = true;
+    uint32_t quiet = (uint32_t)time_us_32() - chandlerAnsweredAtUs;
+    chandlerQuietUs += quiet;
+    if (quiet > chandlerMaxQuietUs) chandlerMaxQuietUs = quiet;
+  }
   // Consumer 2: debug-byte filter. External programs
   // emit one byte per cartridge cycle by reading at $FBFF00 + c
   // (where c is the byte). The captured value's high byte is then
@@ -194,11 +234,24 @@ static inline void __not_in_flash_func(chandler_consume_rom3_sample)(
 // Invoke this function to process the commands from the active loop in the
 // main function
 void __not_in_flash_func(chandler_loop)() {
+  uint32_t pollStartUs = (uint32_t)time_us_32();
+  bool frameWasInFlight = chandlerFrameInFlight;
   commemul_poll(chandler_consume_rom3_sample);
+  chandlerPollUs += (uint32_t)time_us_32() - pollStartUs;
+  if (frameWasInFlight || chandlerFrameInFlight) {
+    chandlerFramePolls++;
+  }
 
   if (!protocolPending) {
     // No command to process
     return;
+  }
+
+  uint32_t startedAtUs = (uint32_t)time_us_32();
+  if (chandlerAnsweredAtUs != 0) {
+    uint32_t gap = startedAtUs - chandlerAnsweredAtUs;
+    chandlerGapUs += gap;
+    if (gap > chandlerMaxGapUs) chandlerMaxGapUs = gap;
   }
 
   // Shared by all commands
@@ -221,6 +274,19 @@ void __not_in_flash_func(chandler_loop)() {
   for (CommandCallbackNode *cur = callbackListHead; cur; cur = cur->next) {
     if (cur->cb) cur->cb(&pendingProtocol, payloadPtr);
   }
+
+  chandlerFrameInFlight = false;
+  uint32_t busy = (uint32_t)time_us_32() - startedAtUs;
+  chandlerBusyUs += busy;
+  if (busy > chandlerMaxBusyUs) chandlerMaxBusyUs = busy;
+  chandlerAnsweredAtUs = (uint32_t)time_us_32();
+  chandlerAwaitingFirstSample = true;
+
+  chandlerHandled++;
+  if (randomToken == chandlerLastToken) {
+    chandlerRepeated++;
+  }
+  chandlerLastToken = randomToken;
 
   incrementalCmdCount++;
   TPROTO_SET_RANDOM_TOKEN64(
