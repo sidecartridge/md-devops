@@ -35,7 +35,7 @@ static uint32_t select_getPressDurationMs(void) {
   return (uint32_t)(elapsedUs / 1000);
 }
 
-void __not_in_flash_func(select_waitPush)() {
+void select_waitPush() {
   DPRINTF("Waiting for SELECT button release\n");
 
   if (!select_detectStableState(true)) {

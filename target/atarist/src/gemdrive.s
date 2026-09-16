@@ -37,9 +37,14 @@ RANDOM_TOKEN_SEED_ADDR	equ (SHARED_BLOCK_ADDR + 8)		; $FA2808
 RANDOM_TOKEN_POST_WAIT	equ $1
 ROMCMD_START_ADDR	equ $FB0000
 CMD_MAGIC_NUMBER	equ $ABCD
-CMD_RETRIES_COUNT	equ 3
+CMD_RETRIES_COUNT	equ 5
 CMD_SET_SHARED_VAR	equ 1
-COMMAND_TIMEOUT		equ $0000FFFF
+; The RP answers a command after it has done the work, and an SD write that
+; allocates a cluster and updates the FAT can block for tens of milliseconds
+; (70 ms measured on a 29 GB FAT32 card). $FFFF gave up far too early and the
+; ST then retried the chunk, which the RP had already written. These are the
+; values md-drives-emulator ships for the same protocol: about 800 ms.
+COMMAND_TIMEOUT		equ $0006FFFF
 COMMAND_WRITE_TIMEOUT	equ COMMAND_TIMEOUT
 
 ; --- Macros + GEMDOS sysvar / function constants. ---
@@ -710,11 +715,14 @@ gemdrive_trap:
 	tst.w	d0
 	beq.s	.fwrite_chunk_ok
 	dbf	d7, .fwrite_retry
+.fwrite_failed:
 	moveq.l	#GEMDOS_EIO_WRITE, d0
 	return_rte
 
 .fwrite_chunk_ok:
 	move.l	GEMDRIVE_WRITE_BYTES, d2	; bytes RP actually wrote
+	tst.l	d2				; nothing written: the RP failed
+	ble.s	.fwrite_failed			; (0 would loop here for ever)
 	add.l	d2, a4
 	add.l	d2, d6
 	sub.l	d2, d4

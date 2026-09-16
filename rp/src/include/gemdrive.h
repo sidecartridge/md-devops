@@ -101,6 +101,9 @@
 #define GEMDRIVE_WRITE_BYTES_OFFSET 0x10F0      // 4 bytes (bytes written)
 #define GEMDRIVE_WRITE_BUFFER_OFFSET 0x10F4     // 1024 bytes
 #define GEMDRIVE_WRITE_BUFFER_SIZE 1024
+// Report a write that took longer than this (debug builds only): the ST waits
+// about 300 ms for its answer before retrying the chunk.
+#define GEMDRIVE_SLOW_WRITE_US 20000
 
 // Pexec / DTA state.
 #define GEMDRIVE_PEXEC_MODE_OFFSET 0x14F4       // 4 bytes (mode word at +2)

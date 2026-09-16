@@ -45,7 +45,11 @@ while [ $# -gt 0 ]; do
 done
 
 NAME="$TYPE"
-[ "$SRC" = "$REPO/rp/src" ] || NAME="$TYPE-$(basename "$SRC")"
+# A source outside the repo gets its own build folder, keyed by its path: two
+# checkouts are both called rp/src, and sharing a folder confuses CMake's cache.
+if [ "$SRC" != "$REPO/rp/src" ]; then
+  NAME="$TYPE-$(basename "$(dirname "$(dirname "$SRC")")")-$(printf '%s' "$SRC" | shasum | cut -c1-6)"
+fi
 OUT="$HERE/builds/$NAME"
 mkdir -p "$OUT" "$HERE/builds/elf"
 

@@ -209,7 +209,12 @@ function needs to implement /  GET_SECTOR_SIZE command. */
 
 /* The same value for every build type: a debug build must differ from a
 /  release build only by its traces, not by the size of every FIL object. */
-#define FF_FS_TINY 0
+#define FF_FS_TINY 1
+/* 1 (EPIC-12 STORY-03): each open FIL keeps its own 512-byte sector buffer at
+/  0, which is 6 KB of RAM across the file slots this app opens. Measured with
+/  both settings: an 8 x 512 KB copy from the ST, which interleaves a read and
+/  a write through the shared buffer, took 47 s at 0 and 48 s at 1, and the
+/  HTTP round trips were within their run-to-run spread. */
 /* This option switches tiny buffer configuration. (0:Normal or 1:Tiny)
 /  At the tiny configuration, size of file object (FIL) is shrinked FF_MAX_SS
 bytes. /  Instead of private sector buffer eliminated from the file object,

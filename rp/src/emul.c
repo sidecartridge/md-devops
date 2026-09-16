@@ -538,7 +538,7 @@ static absolute_time_t lastCountdownTick;
 
 // Polling tick used as the network poll callback so command handling stays
 // alive during multi-second WiFi operations.
-static void __not_in_flash_func(emul_pollTick)(void) {
+static void emul_pollTick(void) {
   health_feed();
   chandler_loop();
   usbcdc_drain();
@@ -553,7 +553,7 @@ static bool resetDeviceAtBoot = true;
 
 // Returns the last n chars of str, prefixed with ".." if truncated.
 // Caller frees. NULL on bad input.
-static char *__not_in_flash_func(right)(const char *str, int n) {
+static char *right(const char *str, int n) {
   if (str == NULL || n < 0) return NULL;
   int len = (int)strlen(str);
   if (n == 0) return strdup("");
@@ -568,7 +568,7 @@ static char *__not_in_flash_func(right)(const char *str, int n) {
 }
 
 // "C".."Z" only; identical predicate to source's GEMDRIVE drive validator.
-static bool __not_in_flash_func(isValidDrive)(const char *drive) {
+static bool isValidDrive(const char *drive) {
   if (drive == NULL || drive[0] == '\0') {
     return false;
   }
@@ -597,7 +597,7 @@ static void showTitle(void) {
       "DevOps Microfirmware - " RELEASE_VERSION "\n\x1Bq");
 }
 
-static void __not_in_flash_func(showCounter)(int cdown);
+static void showCounter(int cdown);
 
 // Bottom-of-OLED info strip rendered with the smaller squeezed font —
 // this is the "second font size" referenced by the source. Inverts a 1px
@@ -1001,12 +1001,29 @@ typedef struct {
   char topDir[MAX_FILENAME_LENGTH + 1];
 } DirNavigation;
 
-static DirNavigation navStateStorage;
-static DirNavigation *navState = &navStateStorage;
+// 24.8 KB, so it exists only while the folder picker is open (upstream's
+// pattern): allocated when [o] opens the picker, freed when it closes.
+static DirNavigation *navState = NULL;
+
+static bool navStateOpen(void) {
+  if (navState != NULL) return true;
+  navState = calloc(1, sizeof(DirNavigation));
+  if (navState == NULL) {
+    DPRINTF("Folder picker: cannot allocate %u bytes\n",
+            (unsigned)sizeof(DirNavigation));
+    return false;
+  }
+  return true;
+}
+
+static void navStateClose(void) {
+  free(navState);
+  navState = NULL;
+}
 
 // Filter: directories only — we list folders, never files. Hidden dotfiles
 // are skipped. Mirrors the spirit of source's floppiesFilter for our case.
-static bool __not_in_flash_func(foldersOnlyFilter)(const char *name,
+static bool foldersOnlyFilter(const char *name,
                                                    BYTE attr) {
   if (name[0] == '.') {
     return false;
@@ -1015,9 +1032,12 @@ static bool __not_in_flash_func(foldersOnlyFilter)(const char *name,
 }
 
 // Remove last path component (".." navigation).
-static void __not_in_flash_func(pathUp)(void) {
+static void pathUp(void) {
   char temp[MAX_FILENAME_LENGTH + 1];
-  char *segments[MAX_ENTRIES_DIR];
+  // One segment needs at least a separator and a character, so a path of
+  // MAX_FILENAME_LENGTH cannot have more than half that many (EPIC-12
+  // STORY-03; this array held 256 pointers, 1 KB of stack).
+  char *segments[(MAX_FILENAME_LENGTH / 2) + 1];
   int sp = 0;
 
   strncpy(temp, navState->folderPath, sizeof(temp));
@@ -1078,7 +1098,7 @@ static void drawPage(uint16_t top_offset) {
   term_printString("SPACE to confirm selection. ESC to exit");
 }
 
-static enum navStatus __not_in_flash_func(navigate_directory)(
+static enum navStatus navigate_directory(
     bool first_time, bool dirs_only, char key, EntryFilterFn filter_fn,
     char top_folder[MAX_FILENAME_LENGTH + 1]) {
   enum navStatus status = NAV_DIR_ERROR;
@@ -1188,7 +1208,7 @@ static enum navStatus __not_in_flash_func(navigate_directory)(
 // Builds the menu — single GEMDRIVE block + bottom navigation strip.
 // Layout follows the source's menu(): vt52Cursor positions, the F[o]lder/
 // [D]rive labels, and the bottom "[G]EMDRIVE / [X] Return to Booster" line.
-static void __not_in_flash_func(menu)(void) {
+static void menu(void) {
   term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
   menuScreenActive = true;
 
@@ -1373,7 +1393,7 @@ static void __not_in_flash_func(menu)(void) {
   refreshSetupInfoLine();
 }
 
-static void __not_in_flash_func(showCounter)(int cdown) {
+static void showCounter(int cdown) {
   if (cdown > 0) {
     // animated progress bar on the bottom strip
     // instead of plain text. Visual + textual at once.
@@ -1462,12 +1482,17 @@ void cmdBooster(const char *arg) {
 // the currently configured folder; subsequent keystrokes (arrows / RETURN
 // / SPACE) come back through TERM_COMMAND_LEVEL_COMMAND_SINGLE_KEY_REENTRY
 // and drive navigate_directory.
-void __not_in_flash_func(cmdGemdriveFolder)(const char *arg) {
+void cmdGemdriveFolder(const char *arg) {
   haltCountdown = true;
   enum navStatus status = NAV_DIR_ERROR;
   switch (term_getCommandLevel()) {
     case TERM_COMMAND_LEVEL_SINGLE_KEY: {
       DPRINTF("Folder picker entering reentry mode.\n");
+      if (!navStateOpen()) {
+        drawSetupInfoLine("Not enough memory to open the folder picker.");
+        display_refresh();
+        return;
+      }
       SettingsConfigEntry *gemDriveFolder = settings_find_entry(
           aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER);
       const char *seed =
@@ -1485,6 +1510,12 @@ void __not_in_flash_func(cmdGemdriveFolder)(const char *arg) {
       char key = arg[0];
       // ESC cancels the picker and returns to the menu.
       if (key == 27) {
+        navStateClose();
+        term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
+        menu();
+        return;
+      }
+      if (navState == NULL) {
         term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
         menu();
         return;
@@ -1508,8 +1539,17 @@ void __not_in_flash_func(cmdGemdriveFolder)(const char *arg) {
       settings_put_string(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER,
                           navState->folderPath);
       (void)saveAppSettings();
+      navStateClose();
       term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
       menu();
+      break;
+    }
+    case NAV_DIR_ERROR: {
+      navStateClose();
+      term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
+      menu();
+      drawSetupInfoLine("Could not read the folder from the SD card.");
+      display_refresh();
       break;
     }
     default:
@@ -1854,7 +1894,8 @@ void emul_start() {
   // files are stored. The folder name is defined in the configuration.
   // If there is no folder in the micro SD card, the app will create it.
 
-  FATFS fsys;
+  // Static: it lives for the whole run and FATFS carries a sector buffer.
+  static FATFS fsys;
   SettingsConfigEntry *folder =
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_FOLDER);
   char *folderName = "/devops";
@@ -1962,10 +2003,11 @@ void emul_start() {
         // Earlier builds deferred this to firmware launch because of
         // an ST-side crash; that turned out to be RAM pressure (the
         // per-conn pool was 47 KB of BSS, pushing the heap into the
-        // ROM-in-RAM region). After shrinking the pool to ~5 KB and
-        // moving every http_server function to RAM via
-        // __not_in_flash_func, running the server during the menu
-        // is safe. Idempotent — safe even if Wi-Fi connect timed out.
+        // ROM-in-RAM region). Shrinking the pool to ~5 KB fixed it;
+        // the handlers were also moved to RAM at the time, which only
+        // added pressure and is undone in EPIC-12 STORY-01 (the
+        // download data path stays in RAM for speed). Idempotent —
+        // safe even if Wi-Fi connect timed out.
         http_server_init();
       }
     } else {
@@ -2010,13 +2052,18 @@ void emul_start() {
   while (getKeepActive()) {
     health_feed();
     health_setPhase(HEALTH_PHASE_MAIN_LOOP);
+    // Drain the ROM3 command ring → dispatch to registered callbacks. First,
+    // before the wait below: the ST blocks on its answer, and nothing here
+    // wakes the wait early for a cartridge command, so a command that arrived
+    // during the wait would otherwise sit for the whole SLEEP_LOOP_MS.
+    chandler_loop();
+
 #if PICO_CYW43_ARCH_POLL
     network_safePoll();
     cyw43_arch_wait_for_work_until(make_timeout_time_ms(SLEEP_LOOP_MS));
 #else
     sleep_ms(SLEEP_LOOP_MS);
 #endif
-    // Drain the ROM3 command ring → dispatch to registered callbacks.
     chandler_loop();
 
     // Pump pending debug bytes out the USB CDC interface.

@@ -81,28 +81,28 @@ static bool gemdrivePhystopMismatch = false;
 // aconfig helpers
 // ---------------------------------------------------------------------------
 
-static uint32_t aconfigInt(const char *key) {
+static uint32_t __not_in_flash_func(aconfigInt)(const char *key) {
   SettingsConfigEntry *entry =
       settings_find_entry(aconfig_getContext(), key);
   if (entry == NULL) return 0;
   return (uint32_t)strtoul(entry->value, NULL, 0);
 }
 
-static bool aconfigBool(const char *key, bool defaultValue) {
+static bool __not_in_flash_func(aconfigBool)(const char *key, bool defaultValue) {
   SettingsConfigEntry *entry =
       settings_find_entry(aconfig_getContext(), key);
   if (entry == NULL) return defaultValue;
   return strcmp(entry->value, "true") == 0;
 }
 
-static const char *aconfigString(const char *key, const char *defaultValue) {
+static const char *__not_in_flash_func(aconfigString)(const char *key, const char *defaultValue) {
   SettingsConfigEntry *entry =
       settings_find_entry(aconfig_getContext(), key);
   if (entry == NULL) return defaultValue;
   return entry->value;
 }
 
-static char resolveDriveLetter(void) {
+static char __not_in_flash_func(resolveDriveLetter)(void) {
   const char *value = aconfigString(ACONFIG_PARAM_GEMDRIVE_DRIVE, "C");
   if (value == NULL || value[0] == '\0') return 'C';
   char letter = (char)toupper((unsigned char)value[0]);
@@ -120,29 +120,29 @@ static char resolveDriveLetter(void) {
 // (filename) use memcpy + CHANGE_ENDIANESS_BLOCK16.
 // ---------------------------------------------------------------------------
 
-static uint32_t sharedBaseAddress(void) {
+static uint32_t __not_in_flash_func(sharedBaseAddress)(void) {
   return (uint32_t)&__rom_in_ram_start__;
 }
 
-static uint32_t appFreeAddress(void) {
+static uint32_t __not_in_flash_func(appFreeAddress)(void) {
   return sharedBaseAddress() + CHANDLER_APP_FREE_OFFSET;
 }
 
-static void writeAppFreeLong(uint32_t offsetFromAppFree, uint32_t value) {
+static void __not_in_flash_func(writeAppFreeLong)(uint32_t offsetFromAppFree, uint32_t value) {
   WRITE_AND_SWAP_LONGWORD(appFreeAddress(), offsetFromAppFree, value);
 }
 
-static void writeAppFreeWord(uint32_t offsetFromAppFree, uint16_t value) {
+static void __not_in_flash_func(writeAppFreeWord)(uint32_t offsetFromAppFree, uint16_t value) {
   WRITE_WORD(appFreeAddress(), offsetFromAppFree, value);
 }
 
-static void writeAppFreeBytes(uint32_t offsetFromAppFree, const void *data,
+static void __not_in_flash_func(writeAppFreeBytes)(uint32_t offsetFromAppFree, const void *data,
                               size_t length) {
   uint8_t *dst = (uint8_t *)(appFreeAddress() + offsetFromAppFree);
   memcpy(dst, data, length);
 }
 
-static void writeAppFreeBytesSwapped(uint32_t offsetFromAppFree,
+static void __not_in_flash_func(writeAppFreeBytesSwapped)(uint32_t offsetFromAppFree,
                                      const void *data, size_t length) {
   uint8_t *dst = (uint8_t *)(appFreeAddress() + offsetFromAppFree);
   memcpy(dst, data, length);
@@ -165,7 +165,7 @@ static void writeAppFreeBytesSwapped(uint32_t offsetFromAppFree,
 //   2. "\foo"  → absolute on the emulated drive, take verbatim under
 //      hdFolder (ignore dpathStr).
 //   3. "foo"   → relative, prepend hdFolder + dpathStr.
-static void getLocalFullPathname(const char *atariPath, char *out,
+static void __not_in_flash_func(getLocalFullPathname)(const char *atariPath, char *out,
                                  size_t outSize) {
   const char *folder =
       aconfigString(ACONFIG_PARAM_GEMDRIVE_FOLDER, "/devops");
@@ -223,7 +223,7 @@ static void getLocalFullPathname(const char *atariPath, char *out,
 // volumes the short name is what the Atari sees.
 // ---------------------------------------------------------------------------
 
-static bool wildcardMatch(const char *pat, const char *name) {
+static bool __not_in_flash_func(wildcardMatch)(const char *pat, const char *name) {
   while (*pat) {
     if (*pat == '*') {
       pat++;
@@ -249,7 +249,7 @@ static bool wildcardMatch(const char *pat, const char *name) {
 // File-handle table
 // ---------------------------------------------------------------------------
 
-static int allocFileSlot(void) {
+static int __not_in_flash_func(allocFileSlot)(void) {
   for (int i = 0; i < GEMDRIVE_MAX_OPEN_FILES; i++) {
     if (!fileTable[i].inUse) {
       fileTable[i].inUse = true;
@@ -260,7 +260,7 @@ static int allocFileSlot(void) {
   return -1;
 }
 
-static GemFileSlot *fileSlotByHandle(uint16_t handle) {
+static GemFileSlot *__not_in_flash_func(fileSlotByHandle)(uint16_t handle) {
   if (handle < GEMDRIVE_FIRST_FD) return NULL;
   int idx = handle - GEMDRIVE_FIRST_FD;
   if (idx < 0 || idx >= GEMDRIVE_MAX_OPEN_FILES) return NULL;
@@ -268,9 +268,9 @@ static GemFileSlot *fileSlotByHandle(uint16_t handle) {
   return &fileTable[idx];
 }
 
-static int handleFromSlotIndex(int idx) { return GEMDRIVE_FIRST_FD + idx; }
+static int __not_in_flash_func(handleFromSlotIndex)(int idx) { return GEMDRIVE_FIRST_FD + idx; }
 
-static void releaseFileSlot(int idx) {
+static void __not_in_flash_func(releaseFileSlot)(int idx) {
   if (idx < 0 || idx >= GEMDRIVE_MAX_OPEN_FILES) return;
   fileTable[idx].inUse = false;
 }
@@ -279,7 +279,7 @@ static void releaseFileSlot(int idx) {
 // DTA tracking
 // ---------------------------------------------------------------------------
 
-static GemDtaSlot *findDtaSlot(uint32_t dtaAddr) {
+static GemDtaSlot *__not_in_flash_func(findDtaSlot)(uint32_t dtaAddr) {
   for (int i = 0; i < GEMDRIVE_MAX_DTAS; i++) {
     if (dtaTable[i].inUse && dtaTable[i].dtaAddr == dtaAddr) {
       dtaTable[i].lruStamp = ++dtaLruCounter;
@@ -293,7 +293,7 @@ static GemDtaSlot *findDtaSlot(uint32_t dtaAddr) {
 // we approximate with a fixed table + LRU eviction so the table can
 // never refuse an Fsfirst (which would crash the desktop's directory
 // walk). The slot least-recently-touched wins eviction.
-static GemDtaSlot *allocDtaSlot(uint32_t dtaAddr) {
+static GemDtaSlot *__not_in_flash_func(allocDtaSlot)(uint32_t dtaAddr) {
   GemDtaSlot *existing = findDtaSlot(dtaAddr);
   if (existing != NULL) {
     if (existing->hasDir) {
@@ -331,7 +331,7 @@ static GemDtaSlot *allocDtaSlot(uint32_t dtaAddr) {
   return &dtaTable[victim];
 }
 
-static void releaseDtaSlot(uint32_t dtaAddr) {
+static void __not_in_flash_func(releaseDtaSlot)(uint32_t dtaAddr) {
   GemDtaSlot *slot = findDtaSlot(dtaAddr);
   if (slot == NULL) return;
   if (slot->hasDir) {
@@ -347,9 +347,9 @@ static void releaseDtaSlot(uint32_t dtaAddr) {
 // 22-23=DOS time, 24-25=DOS date, 26-29=size, 30-43=8.3 filename.
 // ---------------------------------------------------------------------------
 
-static void normalizeShort83(const char *src, char out[14]);
+static void __not_in_flash_func(normalizeShort83)(const char *src, char out[14]);
 
-static void writeDtaFromFilinfo(const FILINFO *info) {
+static void __not_in_flash_func(writeDtaFromFilinfo)(const FILINFO *info) {
   // Drive number at offset 12 so m68k Fsnext can verify it.
   WRITE_AND_SWAP_LONGWORD(appFreeAddress(),
                           GEMDRIVE_DTA_TRANSFER_OFFSET + 12,
@@ -376,7 +376,7 @@ static void writeDtaFromFilinfo(const FILINFO *info) {
   writeAppFreeWord(GEMDRIVE_DTA_F_FOUND_OFFSET, 0);  // 0 = found
 }
 
-static void clearDtaFound(uint16_t errorCode) {
+static void __not_in_flash_func(clearDtaFound)(uint16_t errorCode) {
   writeAppFreeWord(GEMDRIVE_DTA_F_FOUND_OFFSET, errorCode);
 }
 
@@ -384,7 +384,7 @@ static void clearDtaFound(uint16_t errorCode) {
 // Handlers
 // ---------------------------------------------------------------------------
 
-static void publishDriveAndReentry(uint8_t driveNumber, char driveLetter) {
+static void __not_in_flash_func(publishDriveAndReentry)(uint8_t driveNumber, char driveLetter) {
   uint32_t base = sharedBaseAddress();
   SET_SHARED_VAR(GEMDRIVE_SVAR_DRIVE_NUMBER, driveNumber, base,
                  CHANDLER_SHARED_VARIABLES_OFFSET);
@@ -396,7 +396,7 @@ static void publishDriveAndReentry(uint8_t driveNumber, char driveLetter) {
                  base, CHANDLER_SHARED_VARIABLES_OFFSET);
 }
 
-static void handleSaveVectors(uint16_t *payload) {
+static void __not_in_flash_func(handleSaveVectors)(uint16_t *payload) {
   uint32_t oldVec = TPROTO_GET_PAYLOAD_PARAM32(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   uint32_t cellAddr = TPROTO_GET_PAYLOAD_PARAM32(payload);
@@ -413,7 +413,7 @@ static void handleSaveVectors(uint16_t *payload) {
       (unsigned long)oldVec, (unsigned long)cellAddr);
 }
 
-static void handleResetGem(void) {
+static void __not_in_flash_func(handleResetGem)(void) {
   for (int i = 0; i < GEMDRIVE_MAX_OPEN_FILES; i++) {
     if (fileTable[i].inUse) {
       f_close(&fileTable[i].fp);
@@ -436,17 +436,17 @@ static void handleResetGem(void) {
   DPRINTF("GEMDRIVE RESET_GEM: cleared file/DTA state.\n");
 }
 
-static void handleReentryLock(void) {
+static void __not_in_flash_func(handleReentryLock)(void) {
   SET_SHARED_VAR(GEMDRIVE_SVAR_REENTRY_TRAP, 1, sharedBaseAddress(),
                  CHANDLER_SHARED_VARIABLES_OFFSET);
 }
 
-static void handleReentryUnlock(void) {
+static void __not_in_flash_func(handleReentryUnlock)(void) {
   SET_SHARED_VAR(GEMDRIVE_SVAR_REENTRY_TRAP, 0, sharedBaseAddress(),
                  CHANDLER_SHARED_VARIABLES_OFFSET);
 }
 
-static void handleDfreeCall(void) {
+static void __not_in_flash_func(handleDfreeCall)(void) {
   FATFS *fs = NULL;
   DWORD freeClusters = 0;
   uint32_t status = 0, totalFree = 0, totalClusters = 0;
@@ -478,7 +478,7 @@ static void handleDfreeCall(void) {
 // Receives a 256-byte path buffer; concatenates with existing dpathStr
 // if relative, replaces it if absolute. Validates with f_stat under
 // hdFolder. Writes status to GEMDRIVE_SET_DPATH_STATUS.
-static void handleDsetpathCall(uint16_t *payload) {
+static void __not_in_flash_func(handleDsetpathCall)(uint16_t *payload) {
   TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d3
   TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d4
   TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d5
@@ -548,13 +548,13 @@ static void handleDsetpathCall(uint16_t *payload) {
 }
 
 // Forward declarations: definitions live further down.
-static void readPayloadAtariPath(uint16_t *payload, char *out, size_t outSize);
-static void normalizeShort83(const char *src, char out[14]);
-static uint8_t attribsStToFat(uint8_t stAttribs);
+static void __not_in_flash_func(readPayloadAtariPath)(uint16_t *payload, char *out, size_t outSize);
+static void __not_in_flash_func(normalizeShort83)(const char *src, char out[14]);
+static uint8_t __not_in_flash_func(attribsStToFat)(uint8_t stAttribs);
 
 // ---- S5: Fsetdta / DTA exist / Pexec / SAVE_BASEPAGE / SAVE_EXEC_HEADER ----
 
-static void handleFsetdtaCall(uint16_t *payload) {
+static void __not_in_flash_func(handleFsetdtaCall)(uint16_t *payload) {
   uint32_t dtaAddr = TPROTO_GET_PAYLOAD_PARAM32(payload);
   // Match md-drives-emulator's insertDTA: if a slot for this address
   // already exists, leave its iterator state alone — Fsetdta is just
@@ -576,7 +576,7 @@ static void handleFsetdtaCall(uint16_t *payload) {
           (unsigned long)dtaAddr);
 }
 
-static void handleDtaExistCall(uint16_t *payload) {
+static void __not_in_flash_func(handleDtaExistCall)(uint16_t *payload) {
   uint32_t dtaAddr = TPROTO_GET_PAYLOAD_PARAM32(payload);
   GemDtaSlot *slot = findDtaSlot(dtaAddr);
   uint32_t result = (slot != NULL) ? dtaAddr : 0;
@@ -588,7 +588,7 @@ static void handleDtaExistCall(uint16_t *payload) {
 // to skip past the frame's leading 6 bytes (PC.l + SR.w + funcCode.w =
 // 8 bytes, but the protocol layout starts the buffer 8 words into
 // payload — see md-drives-emulator/rp/src/gemdrive.c line 2170).
-static void handlePexecCall(uint16_t *payload) {
+static void __not_in_flash_func(handlePexecCall)(uint16_t *payload) {
   uint32_t stackAddr = TPROTO_GET_PAYLOAD_PARAM32(payload);
 
   // Source skips 6 words to reach the buffer start (4 d-regs + framing),
@@ -618,7 +618,7 @@ static void handlePexecCall(uint16_t *payload) {
 }
 
 // SAVE_EXEC_HEADER: m68k just shipped 28 bytes of PRG header, copy as-is.
-static void handleSaveExecHeader(uint16_t *payload) {
+static void __not_in_flash_func(handleSaveExecHeader)(uint16_t *payload) {
   TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d3
   TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d4
   TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d5
@@ -629,7 +629,7 @@ static void handleSaveExecHeader(uint16_t *payload) {
 }
 
 // SAVE_BASEPAGE: 256 bytes of basepage.
-static void handleSaveBasepage(uint16_t *payload) {
+static void __not_in_flash_func(handleSaveBasepage)(uint16_t *payload) {
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
@@ -640,7 +640,7 @@ static void handleSaveBasepage(uint16_t *payload) {
 
 // ---- Write-side handlers (direct ports of md-drives-emulator) ----
 
-static void handleDcreateCall(uint16_t *payload) {
+static void __not_in_flash_func(handleDcreateCall)(uint16_t *payload) {
   TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d3
   TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d4
   TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d5
@@ -657,7 +657,7 @@ static void handleDcreateCall(uint16_t *payload) {
   writeAppFreeWord(GEMDRIVE_DCREATE_STATUS_OFFSET, status);
 }
 
-static void handleDdeleteCall(uint16_t *payload) {
+static void __not_in_flash_func(handleDdeleteCall)(uint16_t *payload) {
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
@@ -682,7 +682,7 @@ static void handleDdeleteCall(uint16_t *payload) {
   writeAppFreeWord(GEMDRIVE_DDELETE_STATUS_OFFSET, status);
 }
 
-static void handleFcreateCall(uint16_t *payload) {
+static void __not_in_flash_func(handleFcreateCall)(uint16_t *payload) {
   uint16_t mode = TPROTO_GET_PAYLOAD_PARAM16(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
@@ -725,7 +725,7 @@ static void handleFcreateCall(uint16_t *payload) {
   writeAppFreeWord(GEMDRIVE_FCREATE_HANDLE_OFFSET, (uint16_t)handle);
 }
 
-static void handleFdeleteCall(uint16_t *payload) {
+static void __not_in_flash_func(handleFdeleteCall)(uint16_t *payload) {
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
@@ -750,7 +750,7 @@ static void handleFdeleteCall(uint16_t *payload) {
   writeAppFreeLong(GEMDRIVE_FDELETE_STATUS_OFFSET, status);
 }
 
-static void handleFattribCall(uint16_t *payload) {
+static void __not_in_flash_func(handleFattribCall)(uint16_t *payload) {
   uint16_t flag = TPROTO_GET_PAYLOAD_PARAM16(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   uint16_t newAttribs = TPROTO_GET_PAYLOAD_PARAM16(payload);
@@ -785,7 +785,7 @@ static void handleFattribCall(uint16_t *payload) {
           (unsigned)flag, (unsigned)newAttribs, (int)res);
 }
 
-static void handleFrenameCall(uint16_t *payload) {
+static void __not_in_flash_func(handleFrenameCall)(uint16_t *payload) {
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
@@ -824,7 +824,7 @@ static void handleFrenameCall(uint16_t *payload) {
 // d4=handle, d5=DOS time word in low half, d6=DOS date word in low half.
 // On get: read fattrib's date/time from f_stat by looking up the open
 // file's path (we keep one in the slot for tracking — see below).
-static void handleFdatetimeCall(uint16_t *payload) {
+static void __not_in_flash_func(handleFdatetimeCall)(uint16_t *payload) {
   uint16_t flag = TPROTO_GET_PAYLOAD_PARAM16(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   uint16_t handle = TPROTO_GET_PAYLOAD_PARAM16(payload);
@@ -854,7 +854,7 @@ static void handleFdatetimeCall(uint16_t *payload) {
   writeAppFreeLong(GEMDRIVE_FDATETIME_STATUS_OFFSET, 0);
 }
 
-static void handleWriteBuffCall(uint16_t *payload) {
+static void __not_in_flash_func(handleWriteBuffCall)(uint16_t *payload) {
   uint16_t handle = TPROTO_GET_PAYLOAD_PARAM16(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   uint32_t bytes = TPROTO_GET_PAYLOAD_PARAM32(payload);
@@ -869,13 +869,33 @@ static void handleWriteBuffCall(uint16_t *payload) {
     return;
   }
 
-  // Pull the chunk out of the wire buffer (byte-swapped per word).
-  uint8_t tmp[GEMDRIVE_WRITE_BUFFER_SIZE];
-  COPY_AND_CHANGE_ENDIANESS_BLOCK16(payload, tmp, (bytes + 1) & ~1);
+  // Swap the chunk where it already sits, in the parser's payload buffer: a
+  // 1 KB copy on the stack for every chunk (EPIC-12 STORY-03).
+  uint8_t *tmp = (uint8_t *)payload;
+  CHANGE_ENDIANESS_BLOCK16(tmp, (bytes + 1) & ~1u);
 
   UINT bw = 0;
+  // An SD write can block for tens of milliseconds, and much longer on a card
+  // that stalls; the dispatcher already set the GEMDRIVE phase, so just keep
+  // the watchdog fed either side of it (CLAUDE.md).
+  health_feed();
+#if defined(_DEBUG) && (_DEBUG != 0)
+  // A write that blocks longer than the ST is willing to wait breaks its
+  // synchronous handshake, so report only the slow ones.
+  uint32_t writeStartUs = (uint32_t)time_us_32();
+#endif
   FRESULT res = f_write(&slot->fp, tmp, (UINT)bytes, &bw);
+#if defined(_DEBUG) && (_DEBUG != 0)
+  uint32_t writeUs = (uint32_t)time_us_32() - writeStartUs;
+  if (writeUs > GEMDRIVE_SLOW_WRITE_US) {
+    DPRINTF("GEMDRIVE Fwrite: slow, %lu us for %u bytes\n",
+            (unsigned long)writeUs, (unsigned)bytes);
+  }
+#endif
+  health_feed();
   if (res != FR_OK) {
+    // Zero tells the ST the write failed; its loop returns EIO rather than
+    // retrying a chunk this side may already have written.
     DPRINTF("GEMDRIVE Fwrite: handle=%u fr=%d\n", (unsigned)handle, (int)res);
     writeAppFreeLong(GEMDRIVE_WRITE_BYTES_OFFSET, 0);
     return;
@@ -883,7 +903,7 @@ static void handleWriteBuffCall(uint16_t *payload) {
   writeAppFreeLong(GEMDRIVE_WRITE_BYTES_OFFSET, (uint32_t)bw);
 }
 
-static void handleDgetpathCall(void) {
+static void __not_in_flash_func(handleDgetpathCall)(void) {
   size_t len = strlen(dpathStr);
   if (len >= GEMDRIVE_DEFAULT_PATH_LEN) len = GEMDRIVE_DEFAULT_PATH_LEN - 1;
   writeAppFreeBytes(GEMDRIVE_DEFAULT_PATH_OFFSET, dpathStr, len);
@@ -897,7 +917,7 @@ static void handleDgetpathCall(void) {
 // with every pair swapped (e.g. "DESKTOP.INF" → "EDKSOT.PNI"). Use the
 // shared CHANGE_ENDIANESS helper to undo that, matching what
 // md-drives-emulator's getLocalFullPathname does.
-static void readPayloadAtariPath(uint16_t *payload, char *out,
+static void __not_in_flash_func(readPayloadAtariPath)(uint16_t *payload, char *out,
                                  size_t outSize) {
   if (outSize == 0) return;
   size_t copy = outSize - 1;
@@ -910,7 +930,7 @@ static void readPayloadAtariPath(uint16_t *payload, char *out,
   }
 }
 
-static void handleFopenCall(uint16_t *payload) {
+static void __not_in_flash_func(handleFopenCall)(uint16_t *payload) {
   // The send_write_sync_far macro sent: d0=cmd, d1=size, d3=mode,
   // d4 unused, d5 unused, d6=size. Then the buffer (256 bytes from a4 =
   // pattern address) follows. Chandler's ring captures both the args
@@ -965,7 +985,7 @@ static void handleFopenCall(uint16_t *payload) {
   writeAppFreeLong(GEMDRIVE_FOPEN_HANDLE_OFFSET, (uint32_t)handle);
 }
 
-static void handleFcloseCall(uint16_t *payload) {
+static void __not_in_flash_func(handleFcloseCall)(uint16_t *payload) {
   uint16_t handle = (uint16_t)TPROTO_GET_PAYLOAD_PARAM32(payload);
   GemFileSlot *slot = fileSlotByHandle(handle);
   if (slot == NULL) {
@@ -978,7 +998,7 @@ static void handleFcloseCall(uint16_t *payload) {
                    (res == FR_OK) ? 0 : (uint32_t)-37);
 }
 
-static void handleFseekCall(uint16_t *payload) {
+static void __not_in_flash_func(handleFseekCall)(uint16_t *payload) {
   uint32_t offset = TPROTO_GET_PAYLOAD_PARAM32(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   uint16_t handle = (uint16_t)TPROTO_GET_PAYLOAD_PARAM32(payload);
@@ -1014,7 +1034,7 @@ static void handleFseekCall(uint16_t *payload) {
   writeAppFreeLong(GEMDRIVE_FSEEK_STATUS_OFFSET, (uint32_t)f_tell(&slot->fp));
 }
 
-static void handleReadBuffCall(uint16_t *payload) {
+static void __not_in_flash_func(handleReadBuffCall)(uint16_t *payload) {
   uint16_t handle = (uint16_t)TPROTO_GET_PAYLOAD_PARAM32(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   uint32_t bytesThisChunk = TPROTO_GET_PAYLOAD_PARAM32(payload);
@@ -1031,19 +1051,21 @@ static void handleReadBuffCall(uint16_t *payload) {
     bytesThisChunk = GEMDRIVE_READ_BUFFER_SIZE;
   }
 
-  uint8_t tmp[GEMDRIVE_READ_BUFFER_SIZE];
+  // Read into the window the ST reads from and swap there: a 4 KB copy on the
+  // stack was the deepest frame in the firmware (EPIC-12 STORY-03).
+  uint8_t *dst = (uint8_t *)(appFreeAddress() + GEMDRIVE_READ_BUFFER_OFFSET);
   UINT bytesRead = 0;
-  FRESULT res = f_read(&slot->fp, tmp, (UINT)bytesThisChunk, &bytesRead);
+  FRESULT res = f_read(&slot->fp, dst, (UINT)bytesThisChunk, &bytesRead);
   if (res != FR_OK) {
     writeAppFreeLong(GEMDRIVE_READ_BYTES_OFFSET, (uint32_t)-93);  // EIO_READ
     return;
   }
-  // Copy into shared region; m68k reads byte-by-byte so swap pairs.
-  writeAppFreeBytesSwapped(GEMDRIVE_READ_BUFFER_OFFSET, tmp, bytesRead);
+  // m68k reads byte-pairs in BE order.
+  CHANGE_ENDIANESS_BLOCK16(dst, bytesRead & ~1u);
   writeAppFreeLong(GEMDRIVE_READ_BYTES_OFFSET, (uint32_t)bytesRead);
 }
 
-static void splitDirAndPattern(const char *atariSpec, char *outDir,
+static void __not_in_flash_func(splitDirAndPattern)(const char *atariSpec, char *outDir,
                                size_t outDirSize, char *outPattern,
                                size_t outPatSize) {
   // Find the last separator. Atari uses '\\'; tolerate '/' too.
@@ -1082,14 +1104,14 @@ static void splitDirAndPattern(const char *atariSpec, char *outDir,
 
 // Skip noise that desktops shouldn't see and that md-drives-emulator
 // also filters: dotfiles ("._foo" macOS metadata, "." / ".." entries).
-static bool isHiddenEntry(const FILINFO *info) {
+static bool __not_in_flash_func(isHiddenEntry)(const FILINFO *info) {
   if (info->fname[0] == '.') return true;
   if (info->fname[0] == '\0') return true;
   return false;
 }
 
 // FAT→ST attribute mask — direct port of source's sdcard_attribsFAT2ST.
-static uint8_t attribsFatToSt(uint8_t fatAttribs) {
+static uint8_t __not_in_flash_func(attribsFatToSt)(uint8_t fatAttribs) {
   return fatAttribs & (AM_RDO | AM_HID | AM_SYS | AM_DIR | AM_ARC);
 }
 
@@ -1097,14 +1119,14 @@ static uint8_t attribsFatToSt(uint8_t fatAttribs) {
 // FS_ST_* bit positions match AM_* exactly for read-only/hidden/system/
 // directory/archive, so masking on those bits gives the right FatFs
 // attribute byte.
-static uint8_t attribsStToFat(uint8_t stAttribs) {
+static uint8_t __not_in_flash_func(attribsStToFat)(uint8_t stAttribs) {
   return stAttribs & (AM_RDO | AM_HID | AM_SYS | AM_DIR | AM_ARC);
 }
 
 // Returns true when this entry should be visible per the caller's
 // `attribs` mask. Source: `(attribs & sdcard_attribsFAT2ST(fattrib))`,
 // with FS_ST_ARCH OR'd into attribs unless FS_ST_LABEL was already set.
-static bool entryMatchesAttribs(const FILINFO *info, uint8_t attribs) {
+static bool __not_in_flash_func(entryMatchesAttribs)(const FILINFO *info, uint8_t attribs) {
   uint8_t st = attribsFatToSt(info->fattrib);
   uint8_t want = attribs;
   // Normal files always have ARCH set in FAT — match source's "OR ARCH
@@ -1118,7 +1140,7 @@ static bool entryMatchesAttribs(const FILINFO *info, uint8_t attribs) {
 
 // Skip dot-prefixed entries AND entries that don't match the caller's
 // attribs mask. Mirrors the source's combined while-loop.
-static FRESULT advancePastFiltered(DIR *dir, FILINFO *info, uint8_t attribs) {
+static FRESULT __not_in_flash_func(advancePastFiltered)(DIR *dir, FILINFO *info, uint8_t attribs) {
   FRESULT res = FR_OK;
   while (res == FR_OK && info->fname[0] &&
          (isHiddenEntry(info) || !entryMatchesAttribs(info, attribs))) {
@@ -1132,7 +1154,7 @@ static FRESULT advancePastFiltered(DIR *dir, FILINFO *info, uint8_t attribs) {
 // Up to 8 chars before '.', up to 3 after; if base too long, suffix
 // "~1" before truncating; uppercase; strip everything that isn't an
 // alphanumeric or one of the DOS-friendly punctuation characters.
-static int isDosNameChar(int c) {
+static int __not_in_flash_func(isDosNameChar)(int c) {
   static const char allowed[] = "_!@#$%^&()+=-~`;'<,>.|[]{}";
   if (c >= '0' && c <= '9') return 1;
   if (c >= 'A' && c <= 'Z') return 1;
@@ -1143,7 +1165,7 @@ static int isDosNameChar(int c) {
   return 0;
 }
 
-static void normalizeShort83(const char *src, char out[14]) {
+static void __not_in_flash_func(normalizeShort83)(const char *src, char out[14]) {
   // Filter + upper-case in one pass.
   char filtered[14] = {0};
   size_t fi = 0;
@@ -1185,7 +1207,7 @@ static void normalizeShort83(const char *src, char out[14]) {
   }
 }
 
-static void handleFsfirstCall(uint16_t *payload) {
+static void __not_in_flash_func(handleFsfirstCall)(uint16_t *payload) {
   // Match md-drives-emulator's payload-walk: 1 PARAM32 + 2 NEXT32_PARAM32
   // + 1 NEXT32 advances `payload` to the start of the pattern buffer.
   uint32_t dtaAddr = TPROTO_GET_PAYLOAD_PARAM32(payload);
@@ -1249,7 +1271,7 @@ static void handleFsfirstCall(uint16_t *payload) {
   writeDtaFromFilinfo(&info);
 }
 
-static void handleFsnextCall(uint16_t *payload) {
+static void __not_in_flash_func(handleFsnextCall)(uint16_t *payload) {
   uint32_t dtaAddr = TPROTO_GET_PAYLOAD_PARAM32(payload);
   GemDtaSlot *slot = findDtaSlot(dtaAddr);
   if (slot == NULL) {
@@ -1273,7 +1295,7 @@ static void handleFsnextCall(uint16_t *payload) {
   writeDtaFromFilinfo(&info);
 }
 
-static void handleDtaReleaseCall(uint16_t *payload) {
+static void __not_in_flash_func(handleDtaReleaseCall)(uint16_t *payload) {
   uint32_t dtaAddr = TPROTO_GET_PAYLOAD_PARAM32(payload);
   releaseDtaSlot(dtaAddr);
 }
@@ -1466,21 +1488,21 @@ void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
   emul_onGemdriveHello();
 }
 
-void gemdrive_init(void) {
+void __not_in_flash_func(gemdrive_init)(void) {
   for (int i = 0; i < GEMDRIVE_MAX_OPEN_FILES; i++) fileTable[i].inUse = false;
   for (int i = 0; i < GEMDRIVE_MAX_DTAS; i++) dtaTable[i].inUse = false;
   chandler_addCB(gemdrive_command_cb);
   DPRINTF("GEMDRIVE callback registered.\n");
 }
 
-bool gemdrive_getPhystop(uint32_t *out_phystop, bool *out_mismatch) {
+bool __not_in_flash_func(gemdrive_getPhystop)(uint32_t *out_phystop, bool *out_mismatch) {
   if (!gemdriveHelloLanded) return false;
   if (out_phystop != NULL) *out_phystop = gemdrivePhystop;
   if (out_mismatch != NULL) *out_mismatch = gemdrivePhystopMismatch;
   return true;
 }
 
-bool gemdrive_getScreenmem(uint32_t *out_screenmem) {
+bool __not_in_flash_func(gemdrive_getScreenmem)(uint32_t *out_screenmem) {
   if (!gemdriveHelloLanded) return false;
   if (out_screenmem != NULL) *out_screenmem = gemdriveScreenmem;
   return true;

@@ -45,6 +45,14 @@
 #define STACK_PAINT 0x57AC57ACu
 // Words left unpainted below the current SP when painting.
 #define STACK_PAINT_MARGIN_WORDS 16u
+// The SDK's MPU stack guard (PICO_USE_STACK_GUARDS) protects the lowest 32
+// bytes of the stack, rounded up to a 32-byte boundary. Painting or scanning
+// them would fault, so the paint starts above the guard.
+#if PICO_USE_STACK_GUARDS
+#define STACK_GUARD_BYTES 32u
+#else
+#define STACK_GUARD_BYTES 0u
+#endif
 
 #define HEAP_SAMPLE_INTERVAL_MS 100u
 #define WINDOW_UPDATE_INTERVAL_MS 1000u
@@ -65,9 +73,6 @@ extern char end;
 extern char __StackLimit;
 extern char __StackTop;
 extern char __StackBottom;
-extern char __scratch_x_end__;
-extern char __scratch_y_start__;
-extern char __scratch_y_end__;
 extern char __data_start__;
 extern char __data_end__;
 
@@ -108,28 +113,24 @@ static void health_paintRange(uint32_t from, uint32_t to) {
   }
 }
 
-// Everything the core-0 stack can reach before it leaves the scratch
-// regions: SCRATCH_X after its code, then SCRATCH_Y after its code, up
-// to just below the current stack pointer.
+// The core-0 stack is a plain region at the top of main RAM now (D-02), so
+// paint all of it below the current stack pointer. No code lives in it, unlike
+// the scratch banks it used to share.
+static uint32_t health_stackPaintFloor(void) {
+  return (((uint32_t)&__StackBottom + STACK_GUARD_BYTES) + 31u) & ~31u;
+}
+
 static __attribute__((noinline)) void health_paintStack(void) {
   uint32_t here = 0;
   uint32_t sp = (uint32_t)&here - STACK_PAINT_MARGIN_WORDS * 4u;
-  health_paintRange((uint32_t)&__scratch_x_end__,
-                    (uint32_t)&__scratch_y_start__);
-  health_paintRange((uint32_t)&__scratch_y_end__, sp);
-}
-
-static bool health_isCode(uint32_t a) {
-  return a >= (uint32_t)&__scratch_y_start__ &&
-         a < (uint32_t)&__scratch_y_end__;
+  health_paintRange(health_stackPaintFloor(), sp);
 }
 
 // Lowest address below __StackTop that no longer holds the pattern.
 static uint32_t health_stackLowestTouched(void) {
-  uint32_t a = ((uint32_t)&__scratch_x_end__ + 3u) & ~3u;
+  uint32_t a = health_stackPaintFloor();
   uint32_t top = (uint32_t)&__StackTop;
   for (; a < top; a += 4u) {
-    if (health_isCode(a)) continue;
     if (*(uint32_t *)a != STACK_PAINT) return a;
   }
   return top;
@@ -394,6 +395,27 @@ void health_requestTest(health_test_t test) {
   pendingTest = test;
 }
 
+// Recurse with a frame big enough to reach the guard quickly. The frame has to
+// escape into a volatile sink and be used again after the call, or GCC turns
+// this accumulator recursion into a plain loop and the stack never grows (it
+// did: the first version ran to completion with a 2,136-byte high-water).
+// The POINTER must be volatile, not what it points at: with `volatile uint32_t
+// *sink` the stores were dead code, the call became a tail call and GCC
+// rewrote the recursion as a loop over one frame.
+static volatile uint32_t *volatile healthBurnSink;
+
+static __attribute__((noinline)) void health_burnStack(uint32_t depth) {
+  volatile uint32_t block[64];
+  for (size_t i = 0; i < sizeof(block) / sizeof(block[0]); i++) {
+    block[i] = depth + (uint32_t)i;
+  }
+  healthBurnSink = block;
+  if (depth < 100000u) {
+    health_burnStack(depth + 1u);
+  }
+  healthBurnSink = block;
+}
+
 static void health_runPendingTest(uint32_t now) {
   if (pendingTest == HEALTH_TEST_NONE || now < pendingTestAtMs) return;
   health_test_t test = pendingTest;
@@ -417,6 +439,11 @@ static void health_runPendingTest(uint32_t now) {
     case HEALTH_TEST_STALL:
       DPRINTF("health: test stall %u ms\n", (unsigned)TEST_STALL_MS);
       busy_wait_ms(TEST_STALL_MS);
+      break;
+    case HEALTH_TEST_STACK_OVERFLOW:
+      DPRINTF("health: test stack overflow, stack bottom 0x%08lx\n",
+              (unsigned long)(uint32_t)&__StackBottom);
+      health_burnStack(0);
       break;
     default:
       break;
@@ -473,7 +500,7 @@ void health_getReport(health_report_t *out) {
   out->sbrk_high_water = sbrkHighWater;
 
   uint32_t top = (uint32_t)&__StackTop;
-  uint32_t lowestPainted = ((uint32_t)&__scratch_x_end__ + 3u) & ~3u;
+  uint32_t lowestPainted = health_stackPaintFloor();
   uint32_t lowest = health_stackLowestTouched();
   out->stack_reserved = top - (uint32_t)&__StackBottom;
   out->stack_high_water = top - lowest;

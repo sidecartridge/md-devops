@@ -622,14 +622,15 @@ void term_init(void) {
 // Invoke this function to process the commands from the active loop in the
 // main function
 void __not_in_flash_func(term_loop)() {
-  TransmissionProtocol protocolSnapshot = {0};
+  // Read the published slot in place. Copying it cost 4,184 bytes of stack,
+  // the deepest frame in the firmware; the double buffer already keeps the
+  // producer off this slot, and both run on core 0 (C-09, EPIC-12 STORY-03).
+  const TransmissionProtocol *snapshot = NULL;
   bool protocolReady = false;
   uint32_t overwriteCountSnapshot = 0;
 
-  // Snapshot the latest published slot. Producer and consumer are both
-  // on core 0 and never re-enter, so no critical section is needed.
   if (protocolBufferReady) {
-    protocolSnapshot = protocolBuffers[protocolReadIndex];
+    snapshot = &protocolBuffers[protocolReadIndex];
     protocolBufferReady = false;
     protocolReady = true;
   }
@@ -639,14 +640,20 @@ void __not_in_flash_func(term_loop)() {
     // Shared by all commands
     // Read the random token from the command and increment the payload
     // pointer to the first parameter available in the payload
-    uint32_t randomToken = TPROTO_GET_RANDOM_TOKEN(protocolSnapshot.payload);
-    uint16_t *payloadPtr = ((uint16_t *)(protocolSnapshot).payload);
-    uint16_t commandId = protocolSnapshot.command_id;
+    uint32_t randomToken = TPROTO_GET_RANDOM_TOKEN(snapshot->payload);
+    uint16_t *payloadPtr = ((uint16_t *)(*snapshot).payload);
+    uint16_t commandId = snapshot->command_id;
+    // One line per command floods the console during a GEMDRIVE transfer (two
+    // per 1 KB chunk) and the traffic itself breaks the ST's synchronous
+    // handshake, so the commands term handles trace below instead. Set
+    // TERM_TRACE_EVERY_COMMAND to 1 when studying the command stream.
+#if defined(TERM_TRACE_EVERY_COMMAND) && (TERM_TRACE_EVERY_COMMAND != 0)
     DPRINTF(
         "Command ID: %d. Size: %d. Random token: 0x%08X, Checksum: 0x%04X, "
         "Overwrites: %lu\n",
-        protocolSnapshot.command_id, protocolSnapshot.payload_size, randomToken,
-        protocolSnapshot.final_checksum, (unsigned long)overwriteCountSnapshot);
+        snapshot->command_id, snapshot->payload_size, randomToken,
+        snapshot->final_checksum, (unsigned long)overwriteCountSnapshot);
+#endif
 
 #if defined(_DEBUG) && (_DEBUG != 0)
     // Jump the random token
@@ -654,33 +661,33 @@ void __not_in_flash_func(term_loop)() {
 
     // Read the payload parameters
     uint16_t payloadSizeTmp = 4;
-    if ((protocolSnapshot.payload_size > payloadSizeTmp) &&
-        (protocolSnapshot.payload_size <= TERM_PARAMETERS_MAX_SIZE)) {
+    if ((snapshot->payload_size > payloadSizeTmp) &&
+        (snapshot->payload_size <= TERM_PARAMETERS_MAX_SIZE)) {
       DPRINTF("Payload D3: 0x%04X\n", TPROTO_GET_PAYLOAD_PARAM32(payloadPtr));
       TPROTO_NEXT32_PAYLOAD_PTR(payloadPtr);
     }
     payloadSizeTmp += 4;
-    if ((protocolSnapshot.payload_size > payloadSizeTmp) &&
-        (protocolSnapshot.payload_size <= TERM_PARAMETERS_MAX_SIZE)) {
+    if ((snapshot->payload_size > payloadSizeTmp) &&
+        (snapshot->payload_size <= TERM_PARAMETERS_MAX_SIZE)) {
       DPRINTF("Payload D4: 0x%04X\n", TPROTO_GET_PAYLOAD_PARAM32(payloadPtr));
       TPROTO_NEXT32_PAYLOAD_PTR(payloadPtr);
     }
     payloadSizeTmp += 4;
-    if ((protocolSnapshot.payload_size > payloadSizeTmp) &&
-        (protocolSnapshot.payload_size <= TERM_PARAMETERS_MAX_SIZE)) {
+    if ((snapshot->payload_size > payloadSizeTmp) &&
+        (snapshot->payload_size <= TERM_PARAMETERS_MAX_SIZE)) {
       DPRINTF("Payload D5: 0x%04X\n", TPROTO_GET_PAYLOAD_PARAM32(payloadPtr));
       TPROTO_NEXT32_PAYLOAD_PTR(payloadPtr);
     }
     payloadSizeTmp += 4;
-    if ((protocolSnapshot.payload_size > payloadSizeTmp) &&
-        (protocolSnapshot.payload_size <= TERM_PARAMETERS_MAX_SIZE)) {
+    if ((snapshot->payload_size > payloadSizeTmp) &&
+        (snapshot->payload_size <= TERM_PARAMETERS_MAX_SIZE)) {
       DPRINTF("Payload D6: 0x%04X\n", TPROTO_GET_PAYLOAD_PARAM32(payloadPtr));
       TPROTO_NEXT32_PAYLOAD_PTR(payloadPtr);
     }
 #endif
 
     // Handle the command
-    switch (protocolSnapshot.command_id) {
+    switch (snapshot->command_id) {
       case APP_TERMINAL_START: {
         display_termStart(DISPLAY_TILES_WIDTH, DISPLAY_TILES_HEIGHT);
         commandLevel = TERM_COMMAND_LEVEL_SINGLE_KEY;
@@ -693,7 +700,7 @@ void __not_in_flash_func(term_loop)() {
         DPRINTF("Send command to display: DISPLAY_COMMAND_TERM\n");
       } break;
       case APP_TERMINAL_KEYSTROKE: {
-        uint16_t *payload = ((uint16_t *)(protocolSnapshot).payload);
+        uint16_t *payload = ((uint16_t *)(*snapshot).payload);
         // Jump the random token
         TPROTO_NEXT32_PAYLOAD_PTR(payload);
         // Extract the 32 bit payload
@@ -738,8 +745,8 @@ void __not_in_flash_func(term_loop)() {
         break;
       }
       default:
-        // Unknown command
-        DPRINTF("Unknown command\n");
+        // Not a terminal command: GEMDRIVE and the Runner have their own
+        // callbacks. Silent, for the reason above.
         break;
     }
     // Random-token publish is owned by chandler_loop; nothing more to do here.

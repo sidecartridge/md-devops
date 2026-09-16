@@ -13,7 +13,7 @@
 # assemble.
 set -Eeo pipefail
 
-REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
+REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${1:-$(mktemp -d)}"
 mkdir -p "$OUT"
 

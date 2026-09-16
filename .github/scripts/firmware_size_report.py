@@ -3,9 +3,10 @@
 
 Usage: firmware_size_report.py <rp.elf> <rp.elf.map> <title>
 
-Used by the CI workflows to fill the job summary. Section sizes come from
-arm-none-eabi-size; the heap, the code copied to RAM and the flash use come
-from the linker map, so they follow memmap_rp.ld if it changes.
+Used by the CI workflows to fill the job summary and printed after every local
+link (EPIC-12 STORY-06). Section sizes come from arm-none-eabi-size; the heap,
+the stack, the code copied to RAM and the flash use come from the linker map,
+so they follow memmap_rp.ld if it changes.
 """
 import re
 import subprocess
@@ -73,8 +74,9 @@ def main():
         (".data (copied to RAM)", sizes.get(".data", 0)),
         ("Code copied to RAM", code_in_ram(map_text, stack_limit)),
         (".bss", sizes.get(".bss", 0)),
-        ("Heap (end of .bss to __StackLimit)", stack_limit - map_symbol(map_text, "__bss_end__")),
-        ("Core-0 stack reserved", sizes.get(".stack_dummy", 0)),
+        ("Heap (__end__ to __StackLimit)", stack_limit - map_symbol(map_text, "__end__")),
+        ("Core-0 stack reserved",
+         map_symbol(map_text, "__StackTop") - map_symbol(map_text, "__StackBottom")),
         ("Flash used", map_symbol(map_text, "__flash_binary_end") - FLASH_ORIGIN),
     ]
     print(f"### Firmware size: {title}\n")
