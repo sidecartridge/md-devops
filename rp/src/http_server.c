@@ -190,7 +190,7 @@ static void conn_close(http_conn_t *c);
 
 static void parse_and_dispatch(http_conn_t *c);
 static void route(http_conn_t *c);
-static void send_buffered(http_conn_t *c);
+static void __not_in_flash_func(send_buffered)(http_conn_t *c);
 
 static void write_response(http_conn_t *c, int status, const char *reason,
                            const char *content_type, const char *body,
@@ -205,19 +205,19 @@ static void write_fs_error(http_conn_t *c, FRESULT fr, const char *message);
 static void write_405(http_conn_t *c, const char *allow);
 
 static err_t srv_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err);
-static err_t srv_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p,
+static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, struct pbuf *p,
                          err_t err);
-static err_t srv_sent_cb(void *arg, struct tcp_pcb *pcb, u16_t len);
+static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u16_t len);
 static err_t srv_poll_cb(void *arg, struct tcp_pcb *pcb);
 static void srv_err_cb(void *arg, err_t err);
 
 // Streaming-handler forward decls; bodies live alongside the
 // download / listing / upload route handlers further down.
 static void stream_listing_drive(http_conn_t *c);
-static void stream_download_drive(http_conn_t *c);
+static void __not_in_flash_func(stream_download_drive)(http_conn_t *c);
 static void stream_debug_drive(http_conn_t *c);
 // Chunked-encoding helpers (definitions further down).
-static err_t stream_send_chunk(http_conn_t *c, const char *body,
+static err_t __not_in_flash_func(stream_send_chunk)(http_conn_t *c, const char *body,
                                size_t body_len);
 static err_t stream_send_terminator(http_conn_t *c);
 static bool handle_file_upload_init(http_conn_t *c, const char *body_start,
@@ -232,7 +232,7 @@ static void adv_load_finish_ok(http_conn_t *c);
 
 // --- Public API ---
 
-void __not_in_flash_func(http_server_init)(void) {
+void http_server_init(void) {
   DPRINTF("http_server: init entered (g_listen_pcb=%p)\n",
           (void *)g_listen_pcb);
   if (g_listen_pcb != NULL) {
@@ -266,7 +266,7 @@ void __not_in_flash_func(http_server_init)(void) {
   DPRINTF("http_server: listening on :%d\n", HTTP_SERVER_PORT);
 }
 
-void __not_in_flash_func(http_server_deinit)(void) {
+void http_server_deinit(void) {
   if (g_listen_pcb != NULL) {
     tcp_close(g_listen_pcb);
     g_listen_pcb = NULL;
@@ -280,7 +280,7 @@ void __not_in_flash_func(http_server_deinit)(void) {
 
 // --- Connection lifecycle ---
 
-static http_conn_t *__not_in_flash_func(conn_alloc)(void) {
+static http_conn_t *conn_alloc(void) {
   for (int i = 0; i < HTTP_SERVER_MAX_CONNECTIONS; i++) {
     if (g_conns[i].state == HC_FREE) {
       memset(&g_conns[i], 0, sizeof(g_conns[i]));
@@ -291,12 +291,12 @@ static http_conn_t *__not_in_flash_func(conn_alloc)(void) {
   return NULL;
 }
 
-static void __not_in_flash_func(conn_free)(http_conn_t *c) {
+static void conn_free(http_conn_t *c) {
   c->pcb = NULL;
   c->state = HC_FREE;
 }
 
-static void __not_in_flash_func(conn_close)(http_conn_t *c) {
+static void conn_close(http_conn_t *c) {
   if (c->stream_dir_open) {
     f_closedir(&c->stream_dir);
     c->stream_dir_open = false;
@@ -338,7 +338,7 @@ static void __not_in_flash_func(conn_close)(http_conn_t *c) {
 
 // --- TCP callbacks ---
 
-static err_t __not_in_flash_func(srv_accept_cb)(void *arg, struct tcp_pcb *newpcb, err_t err) {
+static err_t srv_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
   (void)arg;
   if (err != ERR_OK || newpcb == NULL) {
     return ERR_VAL;
@@ -491,7 +491,7 @@ static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u1
   return ERR_OK;
 }
 
-static err_t __not_in_flash_func(srv_poll_cb)(void *arg, struct tcp_pcb *pcb) {
+static err_t srv_poll_cb(void *arg, struct tcp_pcb *pcb) {
   (void)pcb;
   http_conn_t *c = (http_conn_t *)arg;
   if (c == NULL) {
@@ -509,7 +509,7 @@ static err_t __not_in_flash_func(srv_poll_cb)(void *arg, struct tcp_pcb *pcb) {
   return ERR_OK;
 }
 
-static void __not_in_flash_func(srv_err_cb)(void *arg, err_t err) {
+static void srv_err_cb(void *arg, err_t err) {
   (void)err;
   http_conn_t *c = (http_conn_t *)arg;
   if (c != NULL) {
@@ -521,7 +521,7 @@ static void __not_in_flash_func(srv_err_cb)(void *arg, err_t err) {
 
 // --- Request parsing ---
 
-static int __not_in_flash_func(strncasecmp_n)(const char *a, const char *b, size_t n) {
+static int strncasecmp_n(const char *a, const char *b, size_t n) {
   for (size_t i = 0; i < n; i++) {
     char ca = a[i];
     char cb = b[i];
@@ -541,7 +541,7 @@ static int __not_in_flash_func(strncasecmp_n)(const char *a, const char *b, size
   return 0;
 }
 
-static hc_method_t __not_in_flash_func(parse_method)(const char *s, size_t n) {
+static hc_method_t parse_method(const char *s, size_t n) {
   if (n == 3 && memcmp(s, "GET", 3) == 0) return HM_GET;
   if (n == 4 && memcmp(s, "HEAD", 4) == 0) return HM_HEAD;
   if (n == 4 && memcmp(s, "POST", 4) == 0) return HM_POST;
@@ -550,7 +550,7 @@ static hc_method_t __not_in_flash_func(parse_method)(const char *s, size_t n) {
   return HM_UNKNOWN;
 }
 
-static void __not_in_flash_func(parse_and_dispatch)(http_conn_t *c) {
+static void parse_and_dispatch(http_conn_t *c) {
   // Request line
   char *eol = strstr(c->hdr, "\r\n");
   if (eol == NULL) {
@@ -768,7 +768,7 @@ static void __not_in_flash_func(parse_and_dispatch)(http_conn_t *c) {
 
 // --- URL decoding + query parsing ---
 
-static int __not_in_flash_func(hex_digit)(int c) {
+static int hex_digit(int c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
@@ -779,7 +779,7 @@ static int __not_in_flash_func(hex_digit)(int c) {
 // (we don't accept form-encoded query strings as space-encoded).
 // Returns false on bad encoding, NUL byte in result, or buffer
 // overflow.
-static bool __not_in_flash_func(url_decode)(const char *src, char *dst, size_t dst_cap) {
+static bool url_decode(const char *src, char *dst, size_t dst_cap) {
   size_t out = 0;
   while (*src != '\0') {
     if (out + 1 >= dst_cap) return false;
@@ -805,7 +805,7 @@ static bool __not_in_flash_func(url_decode)(const char *src, char *dst, size_t d
 // Find `key` in a URL-encoded query string `?a=1&b=2&...`. Writes the
 // URL-decoded value into `out`. Returns true on hit (even when value
 // is empty), false if key not present or buffer would overflow.
-static bool __not_in_flash_func(query_get)(const char *query, const char *key, char *out,
+static bool query_get(const char *query, const char *key, char *out,
                       size_t out_cap) {
   size_t key_len = strlen(key);
   const char *p = query;
@@ -834,7 +834,7 @@ static bool __not_in_flash_func(query_get)(const char *query, const char *key, c
 // Reads gconfig PARAM_HOSTNAME (used for the API's mDNS name); we
 // don't actually need it here but the GEMDRIVE_FOLDER lookup is the
 // real prize.
-static const char *__not_in_flash_func(get_gemdrive_folder)(void) {
+static const char *get_gemdrive_folder(void) {
   SettingsConfigEntry *entry =
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER);
   if (entry == NULL || entry->value[0] == '\0') return "/devops";
@@ -851,7 +851,7 @@ typedef enum {
   NORM_TOO_LONG,
 } norm_status_t;
 
-static norm_status_t __not_in_flash_func(normalize_rel)(const char *rel, char *out,
+static norm_status_t normalize_rel(const char *rel, char *out,
                                    size_t out_cap) {
   if (out_cap < 2) return NORM_TOO_LONG;
   out[0] = '/';
@@ -913,7 +913,7 @@ static norm_status_t __not_in_flash_func(normalize_rel)(const char *rel, char *o
 
 // Build absolute on-disk path: GEMDRIVE_FOLDER + normalised rel.
 // rel can be NULL/empty (treated as "/").
-static norm_status_t __not_in_flash_func(resolve_jail)(const char *rel, char *out,
+static norm_status_t resolve_jail(const char *rel, char *out,
                                   size_t out_cap) {
   char norm[HTTP_PATH_BUF_BYTES];
   norm_status_t s = normalize_rel(rel, norm, sizeof(norm));
@@ -945,7 +945,7 @@ static norm_status_t __not_in_flash_func(resolve_jail)(const char *rel, char *ou
 // historically rejected ('+', ',', ';', '=', '[', ']'). Lower-case
 // letters are allowed at validation time and case-folded by FatFs;
 // our jail returns the canonical uppercase form to clients.
-static bool __not_in_flash_func(fat_illegal_char)(unsigned char ch) {
+static bool fat_illegal_char(unsigned char ch) {
   if (ch < 0x20) return true;
   if (ch >= 0x80) return true;
   static const char banned[] = "\"*/:<>?\\|+,;=[]";
@@ -964,7 +964,7 @@ static bool __not_in_flash_func(fat_illegal_char)(unsigned char ch) {
 // `norm` is the leading-slash form produced by normalize_rel (e.g.
 // "/foo/bar.txt"). This function only inspects the segment after the
 // last '/'.
-static norm_status_t __not_in_flash_func(validate_8_3_last)(const char *norm) {
+static norm_status_t validate_8_3_last(const char *norm) {
   const char *last_slash = strrchr(norm, '/');
   const char *seg = (last_slash != NULL) ? last_slash + 1 : norm;
   size_t seg_len = strlen(seg);
@@ -1012,14 +1012,14 @@ typedef enum {
   JSON_KEY_MISSING,   // syntactically valid but key absent / not a string
 } json_status_t;
 
-static const char *__not_in_flash_func(skip_ws)(const char *p, const char *end) {
+static const char *skip_ws(const char *p, const char *end) {
   while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) {
     p++;
   }
   return p;
 }
 
-static json_status_t __not_in_flash_func(json_extract_string)(const char *body, size_t body_len,
+static json_status_t json_extract_string(const char *body, size_t body_len,
                                          const char *key, char *out,
                                          size_t out_cap) {
   const char *p = body;
@@ -1128,7 +1128,7 @@ static json_status_t __not_in_flash_func(json_extract_string)(const char *body, 
 // FAT date+time → ISO-8601 "YYYY-MM-DDTHH:MM:SS". Returns false if
 // the date field is zero (FatFs uses 0 for "no date set") so the
 // caller can emit `null`.
-static bool __not_in_flash_func(fat_to_iso8601)(WORD fdate, WORD ftime, char *out,
+static bool fat_to_iso8601(WORD fdate, WORD ftime, char *out,
                            size_t out_cap) {
   if (fdate == 0) return false;
   unsigned year = 1980u + ((fdate >> 9) & 0x7F);
@@ -1144,7 +1144,7 @@ static bool __not_in_flash_func(fat_to_iso8601)(WORD fdate, WORD ftime, char *ou
 
 // --- Route handlers ---
 
-static void __not_in_flash_func(handle_ping)(http_conn_t *c) {
+static void handle_ping(http_conn_t *c) {
   uint64_t uptime_us =
       (uint64_t)absolute_time_diff_us(g_boot_time, get_absolute_time());
   uint64_t uptime_s = uptime_us / 1000000ULL;
@@ -1156,7 +1156,7 @@ static void __not_in_flash_func(handle_ping)(http_conn_t *c) {
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
-static const char *__not_in_flash_func(fat_type_name)(BYTE fs_type) {
+static const char *fat_type_name(BYTE fs_type) {
   switch (fs_type) {
     case FS_FAT12: return "FAT12";
     case FS_FAT16: return "FAT16";
@@ -1166,7 +1166,7 @@ static const char *__not_in_flash_func(fat_type_name)(BYTE fs_type) {
   }
 }
 
-static void __not_in_flash_func(handle_volume)(http_conn_t *c) {
+static void handle_volume(http_conn_t *c) {
   FATFS *fs = NULL;
   DWORD free_clusters = 0;
   FRESULT res = f_getfree("", &free_clusters, &fs);
@@ -1224,7 +1224,7 @@ static const char *runner_last_command_str(runner_last_command_t cmd) {
 //
 // busy / cwd / exit-code fields are populated as RUNNER_EXECUTE / CD
 // commands land.
-static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
+static void handle_runner_status(http_conn_t *c) {
   bool active = emul_isRunnerActive();
   bool busy = emul_isRunnerBusy();
   const char *last_cmd = runner_last_command_str(emul_getRunnerLastCommand());
@@ -1344,7 +1344,7 @@ static bool finfo_is_dir(const FILINFO *info);
 // into `out`. Absolute paths and paths with no cwd in effect are
 // copied verbatim. Returns true on success, false if the resolved
 // string would overflow `out_cap`.
-static bool __not_in_flash_func(runner_resolve_relative)(const char *input,
+static bool runner_resolve_relative(const char *input,
                                                           char *out,
                                                           size_t out_cap) {
   if (input == NULL || out == NULL || out_cap == 0) return false;
@@ -1376,7 +1376,7 @@ static bool __not_in_flash_func(runner_resolve_relative)(const char *input,
 // Runner sub-region writers. m68k can only READ the cartridge area;
 // the RP populates path / cmdline buffers in APP_FREE so the m68k
 // Runner can dereference them directly when it runs Pexec.
-static uint32_t __not_in_flash_func(runner_app_free_address)(void) {
+static uint32_t runner_app_free_address(void) {
   return (uint32_t)&__rom_in_ram_start__ + CHANDLER_APP_FREE_OFFSET;
 }
 
@@ -1386,7 +1386,7 @@ static uint32_t __not_in_flash_func(runner_app_free_address)(void) {
 // for byte reads. We pre-swap each pair so the m68k's byte reads
 // land in the right order. Same idea as writeAppFreeBytesSwapped in
 // gemdrive.c.
-static void __not_in_flash_func(runner_memcpy_swapped)(uint8_t *dst,
+static void runner_memcpy_swapped(uint8_t *dst,
                                                        const char *src,
                                                        size_t n) {
   for (size_t i = 0; i < n; i++) {
@@ -1394,7 +1394,7 @@ static void __not_in_flash_func(runner_memcpy_swapped)(uint8_t *dst,
   }
 }
 
-static void __not_in_flash_func(runner_write_path)(const char *path) {
+static void runner_write_path(const char *path) {
   uint8_t *dst = (uint8_t *)(runner_app_free_address() + RUNNER_PATH_OFFSET);
   size_t n = strlen(path);
   if (n >= RUNNER_PATH_LEN - 1) n = RUNNER_PATH_LEN - 2;
@@ -1408,7 +1408,7 @@ static void __not_in_flash_func(runner_write_path)(const char *path) {
 // TOS Pexec cmdline format: <u8 length><bytes...>, no NUL. The
 // length byte is BYTE 0; the m68k passes a pointer to this buffer
 // straight to GEMDOS Pexec. Same byte-pair swap as the path.
-static void __not_in_flash_func(runner_write_cmdline)(const char *cmdline) {
+static void runner_write_cmdline(const char *cmdline) {
   uint8_t *dst =
       (uint8_t *)(runner_app_free_address() + RUNNER_CMDLINE_OFFSET);
   size_t n = strlen(cmdline);
@@ -1431,7 +1431,7 @@ static void __not_in_flash_func(runner_write_cmdline)(const char *cmdline) {
 // the Runner busy, fires RUNNER_CMD_EXECUTE on the cartridge
 // sentinel. The m68k's Pexec result is reported asynchronously via
 // the chandler RUNNER_CMD_DONE_EXECUTE callback (runner.c).
-static void __not_in_flash_func(handle_runner_run)(http_conn_t *c) {
+static void handle_runner_run(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -1573,7 +1573,7 @@ static void __not_in_flash_func(handle_runner_run)(http_conn_t *c) {
 // under 1 s for normal-sized TOS programs; uses the same 10 s
 // outer timeout as a generous worst-case.
 #define RUNNER_LOAD_TIMEOUT_US 10000000
-static void __not_in_flash_func(handle_runner_load)(http_conn_t *c) {
+static void handle_runner_load(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -1741,7 +1741,7 @@ static void __not_in_flash_func(handle_runner_load)(http_conn_t *c) {
 // soon as RUNNER_CMD_EXEC is on the sentinel. The exit code
 // arrives asynchronously via DONE_EXEC and surfaces on the
 // next /runner/status as last_exit_code.
-static void __not_in_flash_func(handle_runner_exec)(http_conn_t *c) {
+static void handle_runner_exec(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -1794,7 +1794,7 @@ static void __not_in_flash_func(handle_runner_exec)(http_conn_t *c) {
 // usually means the basepage was never allocated). 409
 // no_program_loaded if nothing to free.
 #define RUNNER_UNLOAD_TIMEOUT_US 5000000
-static void __not_in_flash_func(handle_runner_unload)(http_conn_t *c) {
+static void handle_runner_unload(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -1869,7 +1869,7 @@ static void __not_in_flash_func(handle_runner_unload)(http_conn_t *c) {
 // Runner busy and fires RUNNER_CMD_CD on the cartridge sentinel; the
 // m68k's Dsetpath result lands asynchronously via the chandler
 // RUNNER_CMD_DONE_CD callback (runner.c).
-static void __not_in_flash_func(handle_runner_cd)(http_conn_t *c) {
+static void handle_runner_cd(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -1980,7 +1980,7 @@ static void __not_in_flash_func(handle_runner_cd)(http_conn_t *c) {
 // m68k-readable cartridge slot. Byte-pair-swapped so the m68k's
 // `move.l RUNNER_BASEPAGE, ...` lands the right value, same
 // cartridge-bus quirk as runner_write_path.
-static void __not_in_flash_func(runner_write_u32)(uint32_t offset,
+static void runner_write_u32(uint32_t offset,
                                                    uint32_t value) {
   uint8_t *dst = (uint8_t *)(runner_app_free_address() + offset);
   uint8_t b0 = (uint8_t)((value >> 24) & 0xFF);
@@ -1996,7 +1996,7 @@ static void __not_in_flash_func(runner_write_u32)(uint32_t offset,
 // APP_FREE so the m68k handler can read it. u16 in the low half of
 // the longword. Byte-pair-swapped so the m68k's word-load lands
 // the right value (cartridge-bus quirk — same as runner_write_path).
-static void __not_in_flash_func(runner_write_rez)(uint16_t rez) {
+static void runner_write_rez(uint16_t rez) {
   uint8_t *dst = (uint8_t *)(runner_app_free_address() + RUNNER_REZ_OFFSET);
   // Zero the 4-byte slot, then write the u16 swapped.
   uint8_t hi = (uint8_t)((rez >> 8) & 0xFF);
@@ -2014,7 +2014,7 @@ static void __not_in_flash_func(runner_write_rez)(uint16_t rez) {
 // detect monochrome (rez == 2) and refuse, otherwise XBIOS Setscreen
 // with the requested rez. Errno (i32) returns via RUNNER_CMD_DONE_RES
 // and surfaces as `last_res_errno` in the status envelope.
-static void __not_in_flash_func(handle_runner_res)(http_conn_t *c) {
+static void handle_runner_res(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -2105,7 +2105,7 @@ static void __not_in_flash_func(handle_runner_res)(http_conn_t *c) {
 // to the patched PC.
 //
 // No busy-lock gate — escaping wedged state is the whole point.
-static void __not_in_flash_func(handle_runner_adv_jump)(http_conn_t *c) {
+static void handle_runner_adv_jump(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -2207,7 +2207,7 @@ static void __not_in_flash_func(handle_runner_adv_jump)(http_conn_t *c) {
 #define ADV_LOAD_CHUNK_SIZE   8192u
 #define ADV_LOAD_TIMEOUT_US   1000000
 
-static uint8_t *__not_in_flash_func(adv_load_buf_base)(void) {
+static uint8_t *adv_load_buf_base(void) {
   // RUNNER_ADV_LOAD_BUF_OFFSET in runner.s. Mirrors at APP_FREE +
   // 0x4000; APP_FREE is 46 KB so 0x4000..0x6000 (8 KB) is comfortably
   // inside the arena and clear of the GEMDRIVE / Runner-meta block
@@ -2221,7 +2221,7 @@ static uint8_t *__not_in_flash_func(adv_load_buf_base)(void) {
 // dispatch the chunk and reset the cursor for the next one. The
 // final partial chunk (chunk_pos > 0 at end-of-content) is flushed
 // by adv_load_finish_ok().
-static void __not_in_flash_func(adv_load_drain_pbuf)(http_conn_t *c,
+static void adv_load_drain_pbuf(http_conn_t *c,
                                                      struct pbuf *p,
                                                      size_t off, size_t n) {
   uint8_t *base = adv_load_buf_base();
@@ -2258,7 +2258,7 @@ static void __not_in_flash_func(adv_load_drain_pbuf)(http_conn_t *c,
 // runner_command_cb -> emul_recordRunnerAdvLoadAck), then advance
 // the destination cursor and reset the chunk cursor. Returns false
 // on per-chunk timeout (1 s).
-static bool __not_in_flash_func(adv_load_dispatch_chunk)(http_conn_t *c) {
+static bool adv_load_dispatch_chunk(http_conn_t *c) {
   uint32_t base = (uint32_t)&__rom_in_ram_start__;
   uint32_t len = c->adv_load_chunk_pos;
   if (len == 0) return true;
@@ -2289,7 +2289,7 @@ static bool __not_in_flash_func(adv_load_dispatch_chunk)(http_conn_t *c) {
 
 // End of body — flush the final partial chunk (if any) and send
 // the success envelope.
-static void __not_in_flash_func(adv_load_finish_ok)(http_conn_t *c) {
+static void adv_load_finish_ok(http_conn_t *c) {
   if (c->adv_load_chunk_pos > 0) {
     if (!adv_load_dispatch_chunk(c)) {
       return;
@@ -2312,7 +2312,7 @@ static void __not_in_flash_func(adv_load_finish_ok)(http_conn_t *c) {
 // body bytes that arrived in the same TCP segment as the headers.
 // Returns false if any validation failed (an error response was
 // already written).
-static bool __not_in_flash_func(handle_runner_adv_load_init)(
+static bool handle_runner_adv_load_init(
     http_conn_t *c, const char *body_start, size_t leftover) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
@@ -2461,7 +2461,7 @@ static bool __not_in_flash_func(handle_runner_adv_load_init)(
 //
 // Intentionally skips the busy-lock gate — the busy state is what
 // we want to escape (a wedged Pexec'd program holds it set forever).
-static void __not_in_flash_func(handle_runner_adv_meminfo)(http_conn_t *c) {
+static void handle_runner_adv_meminfo(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -2519,7 +2519,7 @@ static void __not_in_flash_func(handle_runner_adv_meminfo)(http_conn_t *c) {
 // at $400 — chosen via the ACONFIG_PARAM_ADV_HOOK_VECTOR setting in
 // the setup menu). The flag and vector ID arrive together in the
 // HELLO payload; both clear on emul_resetRunnerSession.
-static void __not_in_flash_func(handle_runner_adv_status)(http_conn_t *c) {
+static void handle_runner_adv_status(http_conn_t *c) {
   bool active = emul_isRunnerActive();
   bool installed = active && emul_isRunnerAdvancedInstalled();
   uint8_t vec = installed ? emul_getRunnerAdvHookVector()
@@ -2562,7 +2562,7 @@ static void __not_in_flash_func(handle_runner_adv_status)(http_conn_t *c) {
 //                       wrapped past the cursor while the host's
 //                       TX FIFO stalled. Cumulative since boot.>
 //   }
-static void __not_in_flash_func(handle_debug_status)(http_conn_t *c) {
+static void handle_debug_status(http_conn_t *c) {
   uint32_t ring_used = 0;
   uint32_t ring_capacity = 0;
   uint32_t bytes_dropped = 0;
@@ -2603,7 +2603,7 @@ static void __not_in_flash_func(handle_debug_status)(http_conn_t *c) {
 // us to encode binary or non-printable bytes; the contract for
 // the public ABI is "you get exactly what was emitted", so
 // octet-stream is honest.
-static void __not_in_flash_func(stream_debug_drive)(http_conn_t *c) {
+static void stream_debug_drive(http_conn_t *c) {
   // Pull as many bytes as we can fit in c->resp (re-used as a
   // scratch buffer for the chunk body).
   uint8_t *buf = (uint8_t *)c->resp;
@@ -2626,7 +2626,7 @@ static void __not_in_flash_func(stream_debug_drive)(http_conn_t *c) {
   }
 }
 
-static void __not_in_flash_func(handle_debug_log)(http_conn_t *c) {
+static void handle_debug_log(http_conn_t *c) {
   // Send status line + headers (chunked encoding, no Content-Length).
   int hn = snprintf(c->resp, sizeof(c->resp),
                     "HTTP/1.1 200 OK\r\n"
@@ -2680,7 +2680,7 @@ static void __not_in_flash_func(handle_debug_log)(http_conn_t *c) {
 // addresses, the two decoded bank sizes (0/0 = unrecognised MMU
 // config), and a simple "decoded" boolean derived from the banks.
 #define RUNNER_MEMINFO_TIMEOUT_US 1000000
-static void __not_in_flash_func(handle_runner_meminfo)(http_conn_t *c) {
+static void handle_runner_meminfo(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -2754,7 +2754,7 @@ static void __not_in_flash_func(handle_runner_meminfo)(http_conn_t *c) {
 // Intentionally no busy-lock gate — the busy state is exactly what
 // we want to escape. 409 runner_inactive when the user hasn't
 // picked [U] at boot.
-static void __not_in_flash_func(handle_runner_reset)(http_conn_t *c) {
+static void handle_runner_reset(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -2783,7 +2783,7 @@ static void __not_in_flash_func(handle_runner_reset)(http_conn_t *c) {
 static bool body_appendf(char *body, size_t cap, size_t *len,
                          const char *fmt, ...) __attribute__((format(printf, 4, 5)));
 
-static bool __not_in_flash_func(body_appendf)(char *body, size_t cap, size_t *len,
+static bool body_appendf(char *body, size_t cap, size_t *len,
                          const char *fmt, ...) {
   if (*len >= cap) return false;
   va_list args;
@@ -2942,7 +2942,7 @@ static void handle_debug_test(http_conn_t *c) {
 
 // Append one entry (with its leading comma when needed) to `out`.
 // Returns false if the formatted entry didn't fit.
-static bool __not_in_flash_func(stream_append_entry)(http_conn_t *c,
+static bool stream_append_entry(http_conn_t *c,
                                                      char *out,
                                                      size_t out_cap,
                                                      size_t *out_len,
@@ -2992,7 +2992,7 @@ static bool __not_in_flash_func(stream_append_entry)(http_conn_t *c,
 // envelope opener for the first chunk; NULL for subsequent chunks).
 // Returns the body length. Side effects: may set
 // c->stream_truncated and c->stream_body_done.
-static size_t __not_in_flash_func(stream_build_body)(http_conn_t *c,
+static size_t stream_build_body(http_conn_t *c,
                                                      const char *prefix,
                                                      char *out,
                                                      size_t out_cap) {
@@ -3059,7 +3059,7 @@ static err_t __not_in_flash_func(stream_send_chunk)(http_conn_t *c,
 }
 
 // Send the chunked-encoding terminator (zero-length chunk).
-static err_t __not_in_flash_func(stream_send_terminator)(http_conn_t *c) {
+static err_t stream_send_terminator(http_conn_t *c) {
   err_t err = tcp_write(c->pcb, "0\r\n\r\n", 5, TCP_WRITE_FLAG_COPY);
   if (err != ERR_OK) return err;
   tcp_output(c->pcb);
@@ -3070,7 +3070,7 @@ static err_t __not_in_flash_func(stream_send_terminator)(http_conn_t *c) {
 // chunk, decide whether to also send the terminator and close.
 // Called both from handle_files_list (initial round) and from
 // srv_sent_cb (subsequent rounds, driven by peer acks).
-static void __not_in_flash_func(stream_listing_drive)(http_conn_t *c) {
+static void stream_listing_drive(http_conn_t *c) {
   // Worst-case bytes we'd queue this round: chunk header + body +
   // CRLF + terminator. Need send buffer headroom for it.
   size_t needed = HTTP_RESPONSE_BUF_BYTES + 16 + 8;
@@ -3104,7 +3104,7 @@ static void __not_in_flash_func(stream_listing_drive)(http_conn_t *c) {
   }
 }
 
-static void __not_in_flash_func(handle_files_list)(http_conn_t *c) {
+static void handle_files_list(http_conn_t *c) {
   // Extract ?path=, default to "/".
   char rel[HTTP_PATH_BUF_BYTES];
   rel[0] = '\0';
@@ -3223,7 +3223,7 @@ static void __not_in_flash_func(handle_files_list)(http_conn_t *c) {
 // still containing percent-encoded bytes. The handlers URL-decode,
 // normalise, jail, validate 8.3 on the last segment, then call FatFs.
 
-static void __not_in_flash_func(write_path_error)(http_conn_t *c, norm_status_t s) {
+static void write_path_error(http_conn_t *c, norm_status_t s) {
   if (s == NORM_TOO_LONG) {
     write_error(c, 400, "Bad Request", "name_too_long",
                 "Path or name exceeds FAT 8.3 limits");
@@ -3235,7 +3235,7 @@ static void __not_in_flash_func(write_path_error)(http_conn_t *c, norm_status_t 
 // Resolve a URL-decoded relative path into normalised form (norm) and
 // FatFs absolute form (abs). Returns NORM_OK on success or a status
 // the caller maps to the right HTTP error.
-static norm_status_t __not_in_flash_func(resolve_pair)(const char *url_rel, char *norm,
+static norm_status_t resolve_pair(const char *url_rel, char *norm,
                                   size_t norm_cap, char *abs,
                                   size_t abs_cap) {
   char decoded[HTTP_PATH_BUF_BYTES];
@@ -3248,11 +3248,11 @@ static norm_status_t __not_in_flash_func(resolve_pair)(const char *url_rel, char
 
 // Test whether the FILINFO returned by f_stat indicates a directory.
 // Only valid when f_stat returned FR_OK.
-static bool __not_in_flash_func(finfo_is_dir)(const FILINFO *info) {
+static bool finfo_is_dir(const FILINFO *info) {
   return (info->fattrib & AM_DIR) != 0;
 }
 
-static void __not_in_flash_func(handle_folder_create)(http_conn_t *c, const char *url_rel) {
+static void handle_folder_create(http_conn_t *c, const char *url_rel) {
   char norm[HTTP_PATH_BUF_BYTES];
   char abs_path[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(url_rel, norm, sizeof(norm), abs_path,
@@ -3317,7 +3317,7 @@ static void __not_in_flash_func(handle_folder_create)(http_conn_t *c, const char
                     (extra[0] != '\0') ? extra : NULL, body, (size_t)n);
 }
 
-static void __not_in_flash_func(handle_folder_delete)(http_conn_t *c, const char *url_rel) {
+static void handle_folder_delete(http_conn_t *c, const char *url_rel) {
   char norm[HTTP_PATH_BUF_BYTES];
   char abs_path[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(url_rel, norm, sizeof(norm), abs_path,
@@ -3362,7 +3362,7 @@ static void __not_in_flash_func(handle_folder_delete)(http_conn_t *c, const char
   write_response(c, 204, "No Content", "application/json", NULL, 0);
 }
 
-static void __not_in_flash_func(handle_folder_rename)(http_conn_t *c, const char *url_rel) {
+static void handle_folder_rename(http_conn_t *c, const char *url_rel) {
   if (c->content_length == 0) {
     write_error(c, 411, "Length Required", "length_required",
                 "JSON body required");
@@ -3555,7 +3555,7 @@ static void __not_in_flash_func(stream_download_drive)(http_conn_t *c) {
   }
 }
 
-static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
+static void handle_file_download(http_conn_t *c,
                                                       const char *url_rel) {
   // Body-stream lock. A streaming GET counts as a body request; if
   // another download or upload is already in flight, return 503.
@@ -3774,7 +3774,7 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
 // the partial file — leaving the upload's lock entry in FatFs's
 // lock table (FF_FS_LOCK in ffconf.h) would block any future delete
 // or overwrite of the same name until the next power cycle.
-static void __not_in_flash_func(upload_finish_ok)(http_conn_t *c) {
+static void upload_finish_ok(http_conn_t *c) {
   FRESULT close_fr = FR_OK;
   if (c->upload_file_open) {
     close_fr = f_close(&c->upload_file);
@@ -3817,7 +3817,7 @@ static void __not_in_flash_func(upload_finish_ok)(http_conn_t *c) {
 // upload was already complete after the leftover write, calls
 // upload_finish_ok); false means upload_init wrote the error response
 // itself and the caller should just return.
-static bool __not_in_flash_func(handle_file_upload_init)(
+static bool handle_file_upload_init(
     http_conn_t *c, const char *body_start, size_t leftover) {
   // Single-streamer lock.
   if (g_body_stream_busy) {
@@ -3969,7 +3969,7 @@ static bool __not_in_flash_func(handle_file_upload_init)(
 // return 404 with an `is_directory` code so the client can detect it
 // and switch namespace.
 
-static void __not_in_flash_func(handle_file_delete)(http_conn_t *c,
+static void handle_file_delete(http_conn_t *c,
                                                     const char *url_rel) {
   char norm[HTTP_PATH_BUF_BYTES];
   char abs_path[HTTP_FAT_PATH_BUF_BYTES];
@@ -4017,7 +4017,7 @@ static void __not_in_flash_func(handle_file_delete)(http_conn_t *c,
   write_response(c, 204, "No Content", "application/json", NULL, 0);
 }
 
-static void __not_in_flash_func(handle_file_rename)(http_conn_t *c,
+static void handle_file_rename(http_conn_t *c,
                                                     const char *url_rel) {
   if (c->content_length == 0) {
     write_error(c, 411, "Length Required", "length_required",
@@ -4181,7 +4181,7 @@ static const route_t g_routes[] = {
 #define ROUTES_COUNT (sizeof(g_routes) / sizeof(g_routes[0]))
 
 // Build an "Allow:" header value string from a methods mask.
-static void __not_in_flash_func(format_allow)(uint8_t mask, char *out, size_t out_cap) {
+static void format_allow(uint8_t mask, char *out, size_t out_cap) {
   out[0] = '\0';
   size_t off = 0;
   const struct {
@@ -4204,7 +4204,7 @@ static void __not_in_flash_func(format_allow)(uint8_t mask, char *out, size_t ou
 // Detect a trailing "/rename" action suffix and (if present) chop it
 // off in place by NUL-terminating before the slash. Returns true if
 // the action was chopped.
-static bool __not_in_flash_func(strip_rename_action)(char *rel) {
+static bool strip_rename_action(char *rel) {
   size_t len = strlen(rel);
   static const char suffix[] = "/rename";
   static const size_t suffix_len = sizeof(suffix) - 1;
@@ -4215,7 +4215,7 @@ static bool __not_in_flash_func(strip_rename_action)(char *rel) {
   return false;
 }
 
-static void __not_in_flash_func(route)(http_conn_t *c) {
+static void route(http_conn_t *c) {
   health_setPhase(HEALTH_PHASE_HTTP_REQUEST);
 
   // HEAD is treated as GET for matching purposes (the dispatcher
@@ -4431,7 +4431,7 @@ static void __not_in_flash_func(send_buffered)(http_conn_t *c) {
 // Write a response with optional extra header lines (each must end
 // with "\r\n"). Pass NULL for no extras. Used for 201 Created (which
 // also emits a Location header) and 405 (which emits Allow:).
-static void __not_in_flash_func(write_response_ex)(http_conn_t *c, int status, const char *reason,
+static void write_response_ex(http_conn_t *c, int status, const char *reason,
                               const char *content_type,
                               const char *extra_headers, const char *body,
                               size_t body_len) {
@@ -4466,13 +4466,13 @@ static void __not_in_flash_func(write_response_ex)(http_conn_t *c, int status, c
   send_buffered(c);
 }
 
-static void __not_in_flash_func(write_response)(http_conn_t *c, int status, const char *reason,
+static void write_response(http_conn_t *c, int status, const char *reason,
                            const char *content_type, const char *body,
                            size_t body_len) {
   write_response_ex(c, status, reason, content_type, NULL, body, body_len);
 }
 
-static void __not_in_flash_func(write_error)(http_conn_t *c, int status, const char *reason,
+static void write_error(http_conn_t *c, int status, const char *reason,
                         const char *code_symbol, const char *message) {
   char body[256];
   int n = snprintf(body, sizeof(body),
@@ -4495,7 +4495,7 @@ static void write_fs_error(http_conn_t *c, FRESULT fr, const char *message) {
   write_error(c, 500, "Internal Server Error", "disk_error", message);
 }
 
-static void __not_in_flash_func(write_405)(http_conn_t *c, const char *allow) {
+static void write_405(http_conn_t *c, const char *allow) {
   char body[160];
   int bn = snprintf(body, sizeof(body),
                     "{\"ok\":false,\"code\":\"method_not_allowed\","
