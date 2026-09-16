@@ -236,6 +236,8 @@ static void srv_err_cb(void *arg, err_t err);
 static void stream_listing_drive(http_conn_t *c);
 static void __not_in_flash_func(stream_download_drive)(http_conn_t *c);
 static void stream_debug_drive(http_conn_t *c);
+static void __not_in_flash_func(stream_download_drive)(http_conn_t *c);
+static void stream_listing_drive(http_conn_t *c);
 // Chunked-encoding helpers (definitions further down).
 static err_t __not_in_flash_func(stream_send_chunk)(http_conn_t *c, const char *body,
                                size_t body_len);
@@ -597,12 +599,20 @@ static err_t srv_poll_cb(void *arg, struct tcp_pcb *pcb) {
     stream_debug_drive(c);
     return conn_takeAborted() ? ERR_ABRT : ERR_OK;
   }
-  // A response lwIP had no room for is still owed to the client. Retry it
-  // here; if it never goes out, the idle timeout below closes the
-  // connection.
+  // Anything lwIP had no room for is still owed to the client, and a writer
+  // that stopped on ERR_MEM with nothing unacknowledged never gets a sent
+  // callback to wake it -- poll is the only thing that can retry. Falls
+  // through to the idle check below, so a peer that has really gone away is
+  // still swept.
   if (c->state == HC_WRITE_RESPONSE && !c->resp_queued) {
     send_buffered_try(c);
-    return conn_takeAborted() ? ERR_ABRT : ERR_OK;
+  } else if (c->state == HC_STREAM_DOWNLOAD) {
+    stream_download_drive(c);
+  } else if (c->state == HC_STREAM_LISTING) {
+    stream_listing_drive(c);
+  }
+  if (c->state == HC_FREE) {
+    return conn_takeAborted() ? ERR_ABRT : ERR_OK;  // the retry closed it
   }
   uint32_t idle_ms =
       (uint32_t)to_ms_since_boot(get_absolute_time()) - c->last_activity_ms;
