@@ -127,6 +127,7 @@ typedef enum {
   HEALTH_TEST_HARDFAULT,
   HEALTH_TEST_HANG,   // hang in the main loop
   HEALTH_TEST_STALL,  // stop the main loop for 500 ms
+  HEALTH_TEST_STACK_OVERFLOW,  // recurse until the stack guard faults
 } health_test_t;
 
 // Runs the test from the main loop after a short delay, so the HTTP

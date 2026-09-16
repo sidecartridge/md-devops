@@ -296,6 +296,15 @@ endif()
 # Pass the _DEBUG flag to the C compiler
 add_definitions(-D_DEBUG=${_DEBUG})
 
+# Guard the bottom of core 0's stack with the MPU (EPIC-12 STORY-05): an
+# overflow faults at the guard instead of writing down through the heap and,
+# past it, the cartridge window the ST reads. Both build types on purpose: in a
+# shipping build the alternative is silent corruption that surfaces later as a
+# mystery, while a fault reboots with a breadcrumb (D-03). Costs one of the
+# eight MPU regions (nothing else here uses the MPU), the lowest 32 bytes of
+# the stack, and a few instructions per core at boot.
+add_definitions(-DPICO_USE_STACK_GUARDS=1)
+
 # lwIP statistics are opt-in and debug-only (lwipopts.h). Set
 # DEVOPS_LWIP_STATS=1 in the environment of a debug build to report the
 # lwIP pool counters in GET /api/v1/system/health.

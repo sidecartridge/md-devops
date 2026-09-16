@@ -1185,6 +1185,7 @@ that the firmware recovers from a crash or a hang and reports it.
 | `/api/v1/debug/test/panic` | Calls `panic()` from the main loop. The RP reboots with reason `panic`. |
 | `/api/v1/debug/test/hardfault` | Reads an unmapped address from the main loop. The RP reboots with reason `hardfault`. |
 | `/api/v1/debug/test/hang` | Spins forever in the main loop. After 8 s the watchdog reboots the RP with reason `hang`, phase `main_loop`. |
+| `/api/v1/debug/test/stack-overflow` | Recurses until the stack reaches its guard. The MPU faults on the guarded 32 bytes at the stack bottom, so the RP reboots with reason `hardfault` and an `sp` just below `__StackBottom`, instead of writing down through the heap. |
 | `/api/v1/debug/test/http-hang` | Spins forever inside the request handler and never answers. Reason `hang`, phase `http_request`. |
 | `/api/v1/debug/test/stall` | Blocks the main loop for 500 ms without reading the ROM3 ring. With the ST streaming debug bytes, `rom3_overruns` goes up. |
 

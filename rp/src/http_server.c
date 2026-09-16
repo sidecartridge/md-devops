@@ -2895,7 +2895,7 @@ static void handle_system_health(http_conn_t *c) {
 }
 
 #if defined(_DEBUG) && (_DEBUG != 0)
-// POST /api/v1/debug/test/<panic|hardfault|hang|stall|http-hang> —
+// POST /api/v1/debug/test/<panic|hardfault|hang|stall|stack-overflow|http-hang> —
 // debug builds only. Injects a fault to verify crash and hang recovery.
 // All but http-hang answer 202 and fire from the main loop shortly
 // after; http-hang never answers and hangs inside this handler.
@@ -2911,6 +2911,8 @@ static void handle_debug_test(http_conn_t *c) {
     test = HEALTH_TEST_HANG;
   } else if (strcmp(what, "stall") == 0) {
     test = HEALTH_TEST_STALL;
+  } else if (strcmp(what, "stack-overflow") == 0) {
+    test = HEALTH_TEST_STACK_OVERFLOW;
   } else if (strcmp(what, "http-hang") == 0) {
     DPRINTF("health: test hang inside an HTTP handler\n");
     for (;;) tight_loop_contents();
@@ -4180,6 +4182,7 @@ static const route_t g_routes[] = {
     {"/api/v1/debug/test/hardfault", M_POST, handle_debug_test},
     {"/api/v1/debug/test/hang", M_POST, handle_debug_test},
     {"/api/v1/debug/test/stall", M_POST, handle_debug_test},
+    {"/api/v1/debug/test/stack-overflow", M_POST, handle_debug_test},
     {"/api/v1/debug/test/http-hang", M_POST, handle_debug_test},
 #endif
 };
