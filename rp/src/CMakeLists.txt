@@ -331,6 +331,20 @@ add_definitions(-DPICO_FLASH_ASSUME_CORE0_SAFE=1)
 # undefined behaviour.
 add_definitions(-DCFG_TUD_CDC_TX_BUFSIZE=1024)
 
+# Print the RAM and flash budget after every link (EPIC-12 STORY-06), with the
+# same script that fills the CI job summary, so a local build and a CI build
+# report the same numbers. Skipped when no python3 is around.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_LIST_DIR}/../../.github/scripts/firmware_size_report.py
+                $<TARGET_FILE:${PROJECT_NAME}>
+                $<TARGET_FILE:${PROJECT_NAME}>.map
+                "$<IF:$<STREQUAL:${_DEBUG},0>,release,debug>"
+        VERBATIM)
+endif()
+
 # Remove unused data
 # Symbols stay in rp.elf: they are not part of the flashed image, and crash
 # addresses and debug probes need them.

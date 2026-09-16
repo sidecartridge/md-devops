@@ -334,8 +334,25 @@ SECTIONS
     __StackLimit = __StackBottom;
     PROVIDE(__stack = __StackTop);
 
+    /* Budgets, so a change that eats the heap or the stack fails the link
+     * instead of failing on a desk (EPIC-12 STORY-06).
+     *
+     * The floor is what this firmware measured after EPIC-12: 51,316 bytes of
+     * heap on release and 47,164 on debug, with 15 KB the most ever claimed
+     * and roughly 31 KB free at the worst moment of a smoke run. 40 KB leaves
+     * both build types several KB of room to grow and still catches anything
+     * that swallows the heap wholesale. Raise the floor when the measurements
+     * allow it; lowering it is a decision, not a fix. */
+    __MinHeapSize = 40K;
+
     /* Check if data + heap + stack exceeds RAM limit */
     ASSERT(__StackLimit >= __HeapLimit, "region RAM overflowed")
+    ASSERT(__StackBottom >= __HeapLimit,
+        "the core-0 stack overlaps the heap: see __Core0StackSize in memmap_rp.ld")
+    ASSERT(__StackLimit - __end__ >= __MinHeapSize,
+        "heap is below __MinHeapSize: something new is eating RAM, see EPIC-12 STORY-06")
+    ASSERT(__Core0StackSize >= 16K,
+        "the core-0 stack is below the 16K floor of D-02")
 
     ASSERT( __binary_info_header_end - __logical_binary_start <= 256, "Binary info must be in first 256 bytes of the binary")
     /* todo assert on extra code */
