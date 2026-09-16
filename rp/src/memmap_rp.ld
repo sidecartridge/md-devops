@@ -237,8 +237,8 @@ SECTIONS
      *
      * stack1 section may be empty/missing if platform_launch_core1 is not used */
 
-    /* by default we put core 0 stack at the end of scratch Y, so that if core 1
-     * stack is not used then all of SCRATCH_X is free.
+    /* Core 1 keeps its SCRATCH_X stack; core 0's now lives at the top of main
+     * RAM (see __Core0StackSize below), so SCRATCH_Y is left unused.
      */
     .stack1_dummy (NOLOAD):
     {
@@ -311,11 +311,27 @@ SECTIONS
      * ASSERT below) or an out-of-memory failure at runtime — both of
      * which are loud and easy to diagnose, instead of a mystery
      * cartridge boot failure later. */
-    __StackLimit = ORIGIN(RAM) + LENGTH(RAM);
+    /* Core 0's stack lives at the top of main RAM, not in SCRATCH_Y (D-02,
+     * porting Booster D-03). The SDK default put it at the end of the 4 KB
+     * SCRATCH_Y bank with PICO_STACK_SIZE reserving 2 KB of it, and this
+     * firmware's measured peak was already 2,564 bytes: it was running into
+     * the rest of SCRATCH_Y and, past that, into core 1's SCRATCH_X.
+     *
+     * Size is D-02's rule: largest measured peak on release and debug x 2 +
+     * 1 KB of interrupt headroom, rounded up to 4 KB, never below 16 KB.
+     * 2,564 x 2 + 1,024 = 6,152 -> 8 KB, so the 16 KB floor applies.
+     *
+     * Set only here, never with -DPICO_STACK_SIZE: that macro also feeds
+     * PICO_CORE1_STACK_SIZE and would move core 1's stack too. */
+    __Core0StackSize = 16K;
     __StackOneTop = ORIGIN(SCRATCH_X) + LENGTH(SCRATCH_X);
-    __StackTop = ORIGIN(SCRATCH_Y) + LENGTH(SCRATCH_Y);
+    __StackTop = ORIGIN(RAM) + LENGTH(RAM);
     __StackOneBottom = __StackOneTop - SIZEOF(.stack1_dummy);
-    __StackBottom = __StackTop - SIZEOF(.stack_dummy);
+    __StackBottom = __StackTop - __Core0StackSize;
+    /* The heap cap, per the comment above: it must now stop at the stack's
+     * bottom rather than at the start of ROM_IN_RAM, or the heap would grow
+     * up into the stack. */
+    __StackLimit = __StackBottom;
     PROVIDE(__stack = __StackTop);
 
     /* Check if data + heap + stack exceeds RAM limit */

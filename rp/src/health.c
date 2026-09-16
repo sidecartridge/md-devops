@@ -65,9 +65,6 @@ extern char end;
 extern char __StackLimit;
 extern char __StackTop;
 extern char __StackBottom;
-extern char __scratch_x_end__;
-extern char __scratch_y_start__;
-extern char __scratch_y_end__;
 extern char __data_start__;
 extern char __data_end__;
 
@@ -108,28 +105,20 @@ static void health_paintRange(uint32_t from, uint32_t to) {
   }
 }
 
-// Everything the core-0 stack can reach before it leaves the scratch
-// regions: SCRATCH_X after its code, then SCRATCH_Y after its code, up
-// to just below the current stack pointer.
+// The core-0 stack is a plain region at the top of main RAM now (D-02), so
+// paint all of it below the current stack pointer. No code lives in it, unlike
+// the scratch banks it used to share.
 static __attribute__((noinline)) void health_paintStack(void) {
   uint32_t here = 0;
   uint32_t sp = (uint32_t)&here - STACK_PAINT_MARGIN_WORDS * 4u;
-  health_paintRange((uint32_t)&__scratch_x_end__,
-                    (uint32_t)&__scratch_y_start__);
-  health_paintRange((uint32_t)&__scratch_y_end__, sp);
-}
-
-static bool health_isCode(uint32_t a) {
-  return a >= (uint32_t)&__scratch_y_start__ &&
-         a < (uint32_t)&__scratch_y_end__;
+  health_paintRange((uint32_t)&__StackBottom, sp);
 }
 
 // Lowest address below __StackTop that no longer holds the pattern.
 static uint32_t health_stackLowestTouched(void) {
-  uint32_t a = ((uint32_t)&__scratch_x_end__ + 3u) & ~3u;
+  uint32_t a = ((uint32_t)&__StackBottom + 3u) & ~3u;
   uint32_t top = (uint32_t)&__StackTop;
   for (; a < top; a += 4u) {
-    if (health_isCode(a)) continue;
     if (*(uint32_t *)a != STACK_PAINT) return a;
   }
   return top;
@@ -473,7 +462,7 @@ void health_getReport(health_report_t *out) {
   out->sbrk_high_water = sbrkHighWater;
 
   uint32_t top = (uint32_t)&__StackTop;
-  uint32_t lowestPainted = ((uint32_t)&__scratch_x_end__ + 3u) & ~3u;
+  uint32_t lowestPainted = ((uint32_t)&__StackBottom + 3u) & ~3u;
   uint32_t lowest = health_stackLowestTouched();
   out->stack_reserved = top - (uint32_t)&__StackBottom;
   out->stack_high_water = top - lowest;
