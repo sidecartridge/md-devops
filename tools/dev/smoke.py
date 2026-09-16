@@ -23,7 +23,8 @@ need nobody at the ST. A debug build is needed for the mailbox commands; on a
 release build they fall back to prompts.
 
 Limits that follow known bugs, raise them when those epics land:
-    uploads stay at 256 KB  (EPIC-13 STORY-02: the idle sweeper closes longer uploads)
+    uploads stay at 256 KB  (for run time, not a bug: EPIC-13 STORY-02 fixed
+                             uploads up to the 4 MB cap)
     no folder creation      (EPIC-11 STORY-03: mkdir panics on big-cluster cards)
     downloads stay at 256 KB (uploads are how the test file gets onto the card)
 """

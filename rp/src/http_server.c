@@ -69,11 +69,21 @@ extern unsigned char __rom_in_ram_start__[];
 // Hard cap on a single upload (PUT) body. Per the locked spec.
 #define HTTP_MAX_UPLOAD_BYTES (4u * 1024u * 1024u)
 
-// Idle-connection sweeper: tcp_poll fires every (4 × tcp_poll_interval) /
-// 2 seconds. With interval 8, that's 16 seconds per tick; we close on
-// the first tick, so a connection that never sends a complete request
-// is closed in ~16 s.
+// Idle-connection sweeper. tcp_poll fires every HTTP_POLL_INTERVAL slow
+// ticks, and a slow tick is 500 ms, so interval 8 is one call every 4 s --
+// not the 16 s an earlier comment here claimed.
+//
+// A poll is not evidence of an idle connection. lwIP restarts a pcb's poll
+// timer only when the peer acknowledges data the server sent
+// (core/tcp_in.c), and during an upload or a Runner advanced-load body the
+// server sends nothing, so the timer keeps running however fast the data
+// arrives. Closing on the first tick therefore killed every transfer that
+// lasted more than about 4 s: a 4 MB upload, a slow client, or a fast one
+// whose burst outran a reply. The sweeper now closes a connection only
+// after HTTP_IDLE_TIMEOUT_MS with no traffic in either direction, which is
+// what "idle" was meant to mean.
 #define HTTP_POLL_INTERVAL 8
+#define HTTP_IDLE_TIMEOUT_MS 20000u
 
 typedef enum {
   HC_FREE = 0,
@@ -143,6 +153,7 @@ typedef struct http_conn {
   uint32_t stream_end;       // one-past-last byte to send (file size or
                              // Range slice end)
   bool holds_body_lock;      // this conn holds the body-stream lock
+  uint32_t last_activity_ms;  // last traffic either way; the sweeper's clock
 
   // Streaming file upload state. Active while state == HC_STREAM_UPLOAD;
   // FIL handle released by conn_close (and the partial file unlinked
@@ -194,7 +205,8 @@ static http_conn_t *conn_alloc(void);
 static void conn_free(http_conn_t *c);
 static void conn_close(http_conn_t *c);
 
-static void parse_and_dispatch(http_conn_t *c);
+static void parse_and_dispatch(http_conn_t *c, struct pbuf *seg,
+                               size_t body_off);
 static void route(http_conn_t *c);
 static void __not_in_flash_func(send_buffered)(http_conn_t *c);
 
@@ -226,12 +238,14 @@ static void stream_debug_drive(http_conn_t *c);
 static err_t __not_in_flash_func(stream_send_chunk)(http_conn_t *c, const char *body,
                                size_t body_len);
 static err_t stream_send_terminator(http_conn_t *c);
-static bool handle_file_upload_init(http_conn_t *c, const char *body_start,
-                                    size_t leftover);
+static bool upload_drain_pbuf(http_conn_t *c, struct pbuf *seg, size_t off,
+                              size_t n, FRESULT *fr_out);
+static bool handle_file_upload_init(http_conn_t *c, struct pbuf *seg,
+                                    size_t body_off, size_t leftover);
 static void upload_finish_ok(http_conn_t *c);
-static bool handle_runner_adv_load_init(http_conn_t *c, const char *body_start,
-                                        size_t leftover);
-static void adv_load_drain_pbuf(http_conn_t *c, struct pbuf *p, size_t off,
+static bool handle_runner_adv_load_init(http_conn_t *c, struct pbuf *seg,
+                                        size_t body_off, size_t leftover);
+static bool adv_load_drain_pbuf(http_conn_t *c, struct pbuf *p, size_t off,
                                 size_t n);
 static bool adv_load_dispatch_chunk(http_conn_t *c);
 static void adv_load_finish_ok(http_conn_t *c);
@@ -302,7 +316,48 @@ static void conn_free(http_conn_t *c) {
   c->state = HC_FREE;
 }
 
-static void conn_close(http_conn_t *c) {
+// Copy n body bytes out of seg (starting at off) into the upload file,
+// in chunks of the response buffer. Returns false and the FatFs error on
+// a short or failed write.
+static bool upload_drain_pbuf(http_conn_t *c, struct pbuf *seg, size_t off,
+                              size_t n, FRESULT *fr_out) {
+  size_t done = 0;
+  while (done < n) {
+    size_t chunk = n - done;
+    if (chunk > sizeof(c->resp)) chunk = sizeof(c->resp);
+    pbuf_copy_partial(seg, c->resp, (u16_t)chunk, (u16_t)(off + done));
+    UINT written = 0;
+    // Extending a multi-megabyte file makes FatFs walk the cluster chain, so
+    // a single write can outlast the watchdog. Feed it either side, the way
+    // the GEMDRIVE write path does, and name the phase so a real hang here
+    // is still reported as one (CLAUDE.md).
+    health_setPhase(HEALTH_PHASE_HTTP_REQUEST);
+    health_feed();
+    FRESULT fr = f_write(&c->upload_file, c->resp, (UINT)chunk, &written);
+    health_feed();
+    if (fr != FR_OK || written != chunk) {
+      DPRINTF("http_server: upload f_write failed (%d, %u/%zu)\n", (int)fr,
+              (unsigned)written, chunk);
+      *fr_out = fr;
+      return false;
+    }
+    done += chunk;
+  }
+  return true;
+}
+
+// Traffic in either direction keeps a connection alive for the sweeper.
+static void conn_touch(http_conn_t *c) {
+  c->last_activity_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+}
+
+// Everything this connection holds that is not the pcb. Split out of
+// conn_close so the error path can release it too: lwIP frees the pcb itself
+// and calls srv_err_cb, which used to drop the slot and leak the rest -- the
+// body-stream lock (every later transfer answering 503 busy until a reset),
+// FatFs handles counted against FF_FS_LOCK and shared with GEMDRIVE, and a
+// half-written upload left on the card.
+static void conn_release_resources(http_conn_t *c) {
   if (c->stream_dir_open) {
     f_closedir(&c->stream_dir);
     c->stream_dir_open = false;
@@ -327,6 +382,10 @@ static void conn_close(http_conn_t *c) {
     g_body_stream_busy = false;
     c->holds_body_lock = false;
   }
+}
+
+static void conn_close(http_conn_t *c) {
+  conn_release_resources(c);
   if (c->pcb != NULL) {
     struct tcp_pcb *pcb = c->pcb;
     tcp_arg(pcb, NULL);
@@ -356,6 +415,7 @@ static err_t srv_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
     return ERR_ABRT;
   }
   c->pcb = newpcb;
+  conn_touch(c);
   tcp_arg(newpcb, c);
   tcp_recv(newpcb, srv_recv_cb);
   tcp_sent(newpcb, srv_sent_cb);
@@ -381,8 +441,15 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
     conn_close(c);
     return ERR_OK;
   }
+  conn_touch(c);
 
   if (c->state == HC_READ_HEADERS) {
+    // Only the headers go into c->hdr. Body bytes that shared this
+    // segment with them stay in the pbuf and are handed to the
+    // dispatcher by offset: copying them into c->hdr would drop
+    // everything past HTTP_HEADER_BUF_BYTES while tcp_recved below
+    // still tells the peer they arrived.
+    size_t hdr_before = c->hdr_len;
     size_t to_copy = p->tot_len;
     size_t remaining =
         (c->hdr_len < HTTP_HEADER_BUF_BYTES - 1)
@@ -397,13 +464,18 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
       c->hdr[c->hdr_len] = '\0';
     }
     tcp_recved(pcb, p->tot_len);
-    pbuf_free(p);
 
-    if (strstr(c->hdr, "\r\n\r\n") != NULL) {
-      parse_and_dispatch(c);
+    char *eoh = strstr(c->hdr, "\r\n\r\n");
+    if (eoh != NULL) {
+      // The terminator completed in this segment, so the first body
+      // byte is that many bytes into it.
+      size_t header_bytes = (size_t)(eoh + 4 - c->hdr);
+      size_t body_off = header_bytes - hdr_before;
+      parse_and_dispatch(c, p, body_off);
     } else if (c->hdr_len >= HTTP_HEADER_BUF_BYTES - 1) {
       write_error(c, 400, "Bad Request", "bad_request", "Headers too large");
     }
+    pbuf_free(p);
   } else if (c->state == HC_READ_BODY) {
     size_t need = c->content_length - c->body_received;
     size_t take = (p->tot_len < need) ? p->tot_len : need;
@@ -422,25 +494,14 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
     // success response and close.
     size_t want = c->content_length - c->upload_received;
     size_t take = (p->tot_len < want) ? p->tot_len : want;
-    size_t off = 0;
-    while (off < take) {
-      size_t chunk = take - off;
-      if (chunk > sizeof(c->resp)) chunk = sizeof(c->resp);
-      pbuf_copy_partial(p, c->resp, (u16_t)chunk, (u16_t)off);
-      UINT written = 0;
-      FRESULT fr =
-          f_write(&c->upload_file, c->resp, (UINT)chunk, &written);
-      if (fr != FR_OK || written != chunk) {
-        DPRINTF("http_server: upload f_write failed (%d, %u/%zu)\n",
-                (int)fr, (unsigned)written, chunk);
-        // Surface 500 to the client; conn_close closes the FIL and
-        // unlinks the partial file when the response has been drained.
-        write_fs_error(c, fr, "f_write failed mid-upload");
-        tcp_recved(pcb, p->tot_len);
-        pbuf_free(p);
-        return ERR_OK;
-      }
-      off += chunk;
+    FRESULT fr = FR_OK;
+    if (!upload_drain_pbuf(c, p, 0, take, &fr)) {
+      // Surface 500 to the client; conn_close closes the FIL and
+      // unlinks the partial file when the response has been drained.
+      write_fs_error(c, fr, "f_write failed mid-upload");
+      tcp_recved(pcb, p->tot_len);
+      pbuf_free(p);
+      return ERR_OK;
     }
     c->upload_received += take;
     tcp_recved(pcb, p->tot_len);
@@ -456,7 +517,7 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
     size_t want = (size_t)(c->adv_load_total - c->adv_load_received);
     size_t take = (p->tot_len < want) ? p->tot_len : want;
     if (take > 0) {
-      adv_load_drain_pbuf(c, p, 0, take);
+      (void)adv_load_drain_pbuf(c, p, 0, take);
     }
     tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
@@ -478,6 +539,7 @@ static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u1
   if (c == NULL) {
     return ERR_OK;
   }
+  conn_touch(c);
   c->resp_sent += len;
   if (c->state == HC_WRITE_RESPONSE && c->resp_sent >= c->resp_len) {
     c->state = HC_DRAINING;
@@ -510,17 +572,29 @@ static err_t srv_poll_cb(void *arg, struct tcp_pcb *pcb) {
     stream_debug_drive(c);
     return ERR_OK;
   }
-  DPRINTF("http_server: idle timeout, closing connection\n");
+  uint32_t idle_ms =
+      (uint32_t)to_ms_since_boot(get_absolute_time()) - c->last_activity_ms;
+  if (idle_ms < HTTP_IDLE_TIMEOUT_MS) {
+    return ERR_OK;
+  }
+  DPRINTF(
+      "http_server: idle for %lu ms, closing connection (state %d, "
+      "upload %lu/%lu)\n",
+      (unsigned long)idle_ms, (int)c->state, (unsigned long)c->upload_received,
+      (unsigned long)c->content_length);
   conn_close(c);
   return ERR_OK;
 }
 
 static void srv_err_cb(void *arg, err_t err) {
-  (void)err;
   http_conn_t *c = (http_conn_t *)arg;
   if (c != NULL) {
-    // pcb is already gone per lwIP contract; just release the slot.
+    // The pcb is already gone per lwIP's contract, but everything else this
+    // connection holds is ours to release.
+    DPRINTF("http_server: connection killed by lwIP (err %d), releasing\n",
+            (int)err);
     c->pcb = NULL;
+    conn_release_resources(c);
     conn_free(c);
   }
 }
@@ -556,7 +630,8 @@ static hc_method_t parse_method(const char *s, size_t n) {
   return HM_UNKNOWN;
 }
 
-static void parse_and_dispatch(http_conn_t *c) {
+static void parse_and_dispatch(http_conn_t *c, struct pbuf *seg,
+                               size_t body_off) {
   // Request line
   char *eol = strstr(c->hdr, "\r\n");
   if (eol == NULL) {
@@ -689,15 +764,12 @@ static void parse_and_dispatch(http_conn_t *c) {
 
   c->is_head = (c->method == HM_HEAD);
 
-  // Compute the body-segment bytes that fell after the headers in the
-  // same TCP segment. Used both by the upload streaming path (which
-  // writes them straight to the file) and by the generic JSON-body
-  // path (which buffers them into c->body).
-  char *body_start = p + 2;
-  size_t header_consumed_total = (size_t)(body_start - c->hdr);
-  size_t body_leftover = (c->hdr_len > header_consumed_total)
-                             ? c->hdr_len - header_consumed_total
-                             : 0;
+  // Body bytes that fell after the headers in the same TCP segment are
+  // still in the pbuf at body_off. Used both by the streaming paths
+  // (which drain them straight to their destination) and by the
+  // generic JSON-body path (which buffers them into c->body).
+  size_t body_leftover =
+      (seg != NULL && seg->tot_len > body_off) ? seg->tot_len - body_off : 0;
 
   // Special-case PUT-on-/api/v1/gemdrive/files/ for streaming upload — it
   // bypasses the small JSON-body buffer (which has a 256-byte cap)
@@ -708,7 +780,7 @@ static void parse_and_dispatch(http_conn_t *c) {
       strncmp(c->path, files_prefix, files_prefix_len) == 0) {
     size_t leftover = body_leftover;
     if (leftover > c->content_length) leftover = c->content_length;
-    if (!handle_file_upload_init(c, body_start, leftover)) {
+    if (!handle_file_upload_init(c, seg, body_off, leftover)) {
       return;  // upload_init already wrote the error response
     }
     if (c->upload_received >= c->content_length) {
@@ -728,7 +800,7 @@ static void parse_and_dispatch(http_conn_t *c) {
       strcmp(c->path, "/api/v1/runner/adv/load") == 0) {
     size_t leftover = body_leftover;
     if (leftover > c->content_length) leftover = c->content_length;
-    if (!handle_runner_adv_load_init(c, body_start, leftover)) {
+    if (!handle_runner_adv_load_init(c, seg, body_off, leftover)) {
       return;  // init wrote the error response
     }
     if (c->adv_load_received >= c->adv_load_total) {
@@ -751,14 +823,10 @@ static void parse_and_dispatch(http_conn_t *c) {
                   "Body too large for this route");
       return;
     }
-    // body_start / body_leftover were computed above. The header
-    // parser nul-terminated each header it walked but c->hdr_len is
-    // the original byte count copied off the wire, so anything past
-    // body_start is body that arrived in the same segment.
     size_t leftover = body_leftover;
     if (leftover > c->content_length) leftover = c->content_length;
     if (leftover > 0) {
-      memcpy(c->body, body_start, leftover);
+      pbuf_copy_partial(seg, c->body, (u16_t)leftover, (u16_t)body_off);
       c->body_received = leftover;
     }
     if (c->body_received >= c->content_length) {
@@ -2227,9 +2295,8 @@ static uint8_t *adv_load_buf_base(void) {
 // dispatch the chunk and reset the cursor for the next one. The
 // final partial chunk (chunk_pos > 0 at end-of-content) is flushed
 // by adv_load_finish_ok().
-static void adv_load_drain_pbuf(http_conn_t *c,
-                                                     struct pbuf *p,
-                                                     size_t off, size_t n) {
+static bool adv_load_drain_pbuf(http_conn_t *c, struct pbuf *p, size_t off,
+                                size_t n) {
   uint8_t *base = adv_load_buf_base();
   // Walk pbuf segments to avoid an O(n) intermediate copy through
   // pbuf_copy_partial. Same shape as pbuf_get_at, but we can't use
@@ -2252,10 +2319,11 @@ static void adv_load_drain_pbuf(http_conn_t *c,
       // will keep draining bytes into nowhere; the response is
       // already a 504 so the client sees the failure.
       if (!adv_load_dispatch_chunk(c)) {
-        return;
+        return false;
       }
     }
   }
+  return true;
 }
 
 // Publish (target, len) in shared-var slots 18/19, fire
@@ -2318,8 +2386,8 @@ static void adv_load_finish_ok(http_conn_t *c) {
 // body bytes that arrived in the same TCP segment as the headers.
 // Returns false if any validation failed (an error response was
 // already written).
-static bool handle_runner_adv_load_init(
-    http_conn_t *c, const char *body_start, size_t leftover) {
+static bool handle_runner_adv_load_init(http_conn_t *c, struct pbuf *seg,
+                                        size_t body_off, size_t leftover) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -2437,20 +2505,11 @@ static bool handle_runner_adv_load_init(
   c->adv_load_chunk_pos = 0;
 
   // Pump the leftover bytes that arrived in the same TCP segment as
-  // the headers directly into the chunk buffer. pbuf-free isn't
-  // available here (no pbuf to walk); instead loop byte-by-byte.
+  // the headers directly into the chunk buffer.
   size_t pump = leftover;
   if (pump > c->adv_load_total) pump = c->adv_load_total;
-  uint8_t *base = adv_load_buf_base();
-  for (size_t i = 0; i < pump; i++) {
-    base[c->adv_load_chunk_pos ^ 1u] = (uint8_t)body_start[i];
-    c->adv_load_chunk_pos++;
-    c->adv_load_received++;
-    if (c->adv_load_chunk_pos >= ADV_LOAD_CHUNK_SIZE) {
-      if (!adv_load_dispatch_chunk(c)) {
-        return false;
-      }
-    }
+  if (pump > 0 && !adv_load_drain_pbuf(c, seg, body_off, pump)) {
+    return false;  // dispatch timed out; the 504 is already written
   }
   return true;
 }
@@ -3825,8 +3884,8 @@ static void upload_finish_ok(http_conn_t *c) {
 // upload was already complete after the leftover write, calls
 // upload_finish_ok); false means upload_init wrote the error response
 // itself and the caller should just return.
-static bool handle_file_upload_init(
-    http_conn_t *c, const char *body_start, size_t leftover) {
+static bool handle_file_upload_init(http_conn_t *c, struct pbuf *seg,
+                                    size_t body_off, size_t leftover) {
   // Single-streamer lock.
   if (g_body_stream_busy) {
     char body[160];
@@ -3955,11 +4014,7 @@ static bool handle_file_upload_init(
   // Write any leftover bytes that arrived in the same TCP segment as
   // the headers.
   if (leftover > 0) {
-    UINT written = 0;
-    fr = f_write(&c->upload_file, body_start, (UINT)leftover, &written);
-    if (fr != FR_OK || written != leftover) {
-      DPRINTF("http_server: upload leftover f_write failed (%d, %u/%zu)\n",
-              (int)fr, (unsigned)written, leftover);
+    if (!upload_drain_pbuf(c, seg, body_off, leftover, &fr)) {
       // Close + unlink happens in conn_close. Surface the error to
       // the client first.
       write_fs_error(c, fr, "f_write failed");
