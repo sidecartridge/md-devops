@@ -2048,13 +2048,18 @@ void emul_start() {
   while (getKeepActive()) {
     health_feed();
     health_setPhase(HEALTH_PHASE_MAIN_LOOP);
+    // Drain the ROM3 command ring → dispatch to registered callbacks. First,
+    // before the wait below: the ST blocks on its answer, and nothing here
+    // wakes the wait early for a cartridge command, so a command that arrived
+    // during the wait would otherwise sit for the whole SLEEP_LOOP_MS.
+    chandler_loop();
+
 #if PICO_CYW43_ARCH_POLL
     network_safePoll();
     cyw43_arch_wait_for_work_until(make_timeout_time_ms(SLEEP_LOOP_MS));
 #else
     sleep_ms(SLEEP_LOOP_MS);
 #endif
-    // Drain the ROM3 command ring → dispatch to registered callbacks.
     chandler_loop();
 
     // Pump pending debug bytes out the USB CDC interface.

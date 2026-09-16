@@ -642,11 +642,17 @@ void __not_in_flash_func(term_loop)() {
     uint32_t randomToken = TPROTO_GET_RANDOM_TOKEN(protocolSnapshot.payload);
     uint16_t *payloadPtr = ((uint16_t *)(protocolSnapshot).payload);
     uint16_t commandId = protocolSnapshot.command_id;
+    // One line per command floods the console during a GEMDRIVE transfer (two
+    // per 1 KB chunk) and the traffic itself breaks the ST's synchronous
+    // handshake, so the commands term handles trace below instead. Set
+    // TERM_TRACE_EVERY_COMMAND to 1 when studying the command stream.
+#if defined(TERM_TRACE_EVERY_COMMAND) && (TERM_TRACE_EVERY_COMMAND != 0)
     DPRINTF(
         "Command ID: %d. Size: %d. Random token: 0x%08X, Checksum: 0x%04X, "
         "Overwrites: %lu\n",
         protocolSnapshot.command_id, protocolSnapshot.payload_size, randomToken,
         protocolSnapshot.final_checksum, (unsigned long)overwriteCountSnapshot);
+#endif
 
 #if defined(_DEBUG) && (_DEBUG != 0)
     // Jump the random token
@@ -738,8 +744,8 @@ void __not_in_flash_func(term_loop)() {
         break;
       }
       default:
-        // Unknown command
-        DPRINTF("Unknown command\n");
+        // Not a terminal command: GEMDRIVE and the Runner have their own
+        // callbacks. Silent, for the reason above.
         break;
     }
     // Random-token publish is owned by chandler_loop; nothing more to do here.
