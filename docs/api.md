@@ -89,7 +89,7 @@ python3 cli/sidecart.py gemdrive rm SWITCHER.TOS
 | `416 Range Not Satisfiable` | Range outside file bounds. Carries `Content-Range: bytes */<size>`. |
 | `422 Unprocessable Entity` | Malformed JSON body, missing required field, listing-on-file, rename-into-own-descendant. |
 | `500 Internal Server Error` | FatFs disk error. |
-| `503 Service Unavailable` | Body-stream lock held, SD not mounted, or Runner busy with another command. Always carries `Retry-After: 1`. |
+| `503 Service Unavailable` | Body-stream lock held, SD not mounted, Runner busy with another command, or `insufficient_memory`: FatFs could not allocate its working buffer, so the operation can be retried when memory frees up. Always carries `Retry-After: 1`. |
 | `504 Gateway Timeout` | Synchronous Runner endpoint exceeded its server-side spin-wait deadline (`gateway_timeout`). Per-endpoint deadlines: `runner load` 10 s; `runner unload` 5 s; `runner meminfo`, `runner adv/meminfo`, and each `runner adv/load` chunk 1 s. |
 
 ## Error code vocabulary
@@ -100,7 +100,7 @@ Clients can switch on `code` reliably. All defined symbols:
 `is_directory`, `is_file`, `conflict`, `length_required`,
 `payload_too_large`, `range_invalid`, `bad_json`, `unprocessable`,
 `unsupported_media`, `method_not_allowed`, `busy`, `disk_error`,
-`internal_error`, `runner_inactive`, `gateway_timeout`, `no_snapshot`,
+`insufficient_memory`, `internal_error`, `runner_inactive`, `gateway_timeout`, `no_snapshot`,
 `wrong_hook`, `ram_overflow`, `pexec_failed`, `mfree_failed`,
 `program_already_loaded`, `no_program_loaded`.
 

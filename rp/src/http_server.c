@@ -201,6 +201,7 @@ static void write_response_ex(http_conn_t *c, int status, const char *reason,
                               size_t body_len);
 static void write_error(http_conn_t *c, int status, const char *reason,
                         const char *code_symbol, const char *message);
+static void write_fs_error(http_conn_t *c, FRESULT fr, const char *message);
 static void write_405(http_conn_t *c, const char *allow);
 
 static err_t srv_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err);
@@ -428,8 +429,7 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
                 (int)fr, (unsigned)written, chunk);
         // Surface 500 to the client; conn_close closes the FIL and
         // unlinks the partial file when the response has been drained.
-        write_error(c, 500, "Internal Server Error", "disk_error",
-                    "f_write failed mid-upload");
+        write_fs_error(c, fr, "f_write failed mid-upload");
         tcp_recved(pcb, p->tot_len);
         pbuf_free(p);
         return ERR_OK;
@@ -1520,8 +1520,7 @@ static void __not_in_flash_func(handle_runner_run)(http_conn_t *c) {
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   }
   if (finfo_is_dir(&info)) {
@@ -1662,8 +1661,7 @@ static void __not_in_flash_func(handle_runner_load)(http_conn_t *c) {
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   }
   if (finfo_is_dir(&info)) {
@@ -1935,8 +1933,7 @@ static void __not_in_flash_func(handle_runner_cd)(http_conn_t *c) {
       return;
     }
     if (fr != FR_OK) {
-      write_error(c, 500, "Internal Server Error", "disk_error",
-                  "f_stat failed");
+      write_fs_error(c, fr, "f_stat failed");
       return;
     }
     if (!finfo_is_dir(&info)) {
@@ -3141,8 +3138,7 @@ static void __not_in_flash_func(handle_files_list)(http_conn_t *c) {
       return;
     }
   } else if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   } else if (!(info.fattrib & AM_DIR)) {
     write_error(c, 422, "Unprocessable Entity", "is_file",
@@ -3153,8 +3149,7 @@ static void __not_in_flash_func(handle_files_list)(http_conn_t *c) {
   // Open the directory for streaming. conn_close releases it.
   fr = f_opendir(&c->stream_dir, abs_path);
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_opendir failed");
+    write_fs_error(c, fr, "f_opendir failed");
     return;
   }
   c->stream_dir_open = true;
@@ -3292,8 +3287,7 @@ static void __not_in_flash_func(handle_folder_create)(http_conn_t *c, const char
     return;
   }
   if (fr != FR_NO_FILE && fr != FR_NO_PATH) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   }
   fr = f_mkdir(abs_path);
@@ -3307,7 +3301,7 @@ static void __not_in_flash_func(handle_folder_create)(http_conn_t *c, const char
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error", "f_mkdir failed");
+    write_fs_error(c, fr, "f_mkdir failed");
     return;
   }
 
@@ -3344,8 +3338,7 @@ static void __not_in_flash_func(handle_folder_delete)(http_conn_t *c, const char
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   }
   if (!finfo_is_dir(&info)) {
@@ -3362,8 +3355,7 @@ static void __not_in_flash_func(handle_folder_delete)(http_conn_t *c, const char
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_unlink failed");
+    write_fs_error(c, fr, "f_unlink failed");
     return;
   }
   // 204 No Content — body intentionally empty.
@@ -3465,8 +3457,7 @@ static void __not_in_flash_func(handle_folder_rename)(http_conn_t *c, const char
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   }
   if (!finfo_is_dir(&info)) {
@@ -3482,8 +3473,7 @@ static void __not_in_flash_func(handle_folder_rename)(http_conn_t *c, const char
     return;
   }
   if (fr != FR_NO_FILE && fr != FR_NO_PATH) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed (target)");
+    write_fs_error(c, fr, "f_stat failed (target)");
     return;
   }
 
@@ -3498,8 +3488,7 @@ static void __not_in_flash_func(handle_folder_rename)(http_conn_t *c, const char
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_rename failed");
+    write_fs_error(c, fr, "f_rename failed");
     return;
   }
 
@@ -3601,8 +3590,7 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   }
   if (finfo_is_dir(&info)) {
@@ -3680,8 +3668,7 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
   // Open the file. Released on close (normal or aborted).
   fr = f_open(&c->stream_file, abs_path, FA_READ);
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_open failed");
+    write_fs_error(c, fr, "f_open failed");
     return;
   }
   c->stream_file_open = true;
@@ -3690,8 +3677,7 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
     if (fr != FR_OK) {
       f_close(&c->stream_file);
       c->stream_file_open = false;
-      write_error(c, 500, "Internal Server Error", "disk_error",
-                  "f_lseek failed");
+      write_fs_error(c, fr, "f_lseek failed");
       return;
     }
   }
@@ -3924,8 +3910,7 @@ static bool __not_in_flash_func(handle_file_upload_init)(
     return false;
   }
   if (fr != FR_OK && fr != FR_NO_FILE && fr != FR_NO_PATH) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return false;
   }
 
@@ -3937,8 +3922,7 @@ static bool __not_in_flash_func(handle_file_upload_init)(
     return false;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_open failed");
+    write_fs_error(c, fr, "f_open failed");
     return false;
   }
   c->upload_file_open = true;
@@ -3970,8 +3954,7 @@ static bool __not_in_flash_func(handle_file_upload_init)(
               (int)fr, (unsigned)written, leftover);
       // Close + unlink happens in conn_close. Surface the error to
       // the client first.
-      write_error(c, 500, "Internal Server Error", "disk_error",
-                  "f_write failed");
+      write_fs_error(c, fr, "f_write failed");
       return false;
     }
     c->upload_received = (uint32_t)leftover;
@@ -4007,8 +3990,7 @@ static void __not_in_flash_func(handle_file_delete)(http_conn_t *c,
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   }
   if (finfo_is_dir(&info)) {
@@ -4028,8 +4010,7 @@ static void __not_in_flash_func(handle_file_delete)(http_conn_t *c,
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_unlink failed");
+    write_fs_error(c, fr, "f_unlink failed");
     return;
   }
   // 204 No Content.
@@ -4110,8 +4091,7 @@ static void __not_in_flash_func(handle_file_rename)(http_conn_t *c,
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   }
   if (finfo_is_dir(&info)) {
@@ -4138,8 +4118,7 @@ static void __not_in_flash_func(handle_file_rename)(http_conn_t *c,
     return;
   }
   if (fr != FR_NO_FILE && fr != FR_NO_PATH) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed (target)");
+    write_fs_error(c, fr, "f_stat failed (target)");
     return;
   }
 
@@ -4154,8 +4133,7 @@ static void __not_in_flash_func(handle_file_rename)(http_conn_t *c,
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_rename failed");
+    write_fs_error(c, fr, "f_rename failed");
     return;
   }
 
@@ -4504,6 +4482,17 @@ static void __not_in_flash_func(write_error)(http_conn_t *c, int status, const c
     n = 0;
   }
   write_response(c, status, reason, "application/json", body, (size_t)n);
+}
+
+// A FatFs call failed. With the malloc panic off (EPIC-11 STORY-01) FatFs can
+// report FR_NOT_ENOUGH_CORE instead of the device dying, so report that apart
+// from a disk fault: the caller can retry when memory frees up.
+static void write_fs_error(http_conn_t *c, FRESULT fr, const char *message) {
+  if (fr == FR_NOT_ENOUGH_CORE) {
+    write_error(c, 503, "Service Unavailable", "insufficient_memory", message);
+    return;
+  }
+  write_error(c, 500, "Internal Server Error", "disk_error", message);
 }
 
 static void __not_in_flash_func(write_405)(http_conn_t *c, const char *allow) {

@@ -623,11 +623,31 @@ static bool launchNeedsStReset = false;
 static bool countdownLaunching = false;
 static bool restartCountdownOnHello = false;
 
+// Set when settings_save fails, which it can now that a failed allocation
+// returns NULL instead of panicking (EPIC-11). Cleared by the next save that
+// works.
+static bool settingsSaveFailed = false;
+
 static void drawHaltedInfoLine(void) {
   drawSetupInfoLine(
-      launchNeedsStReset
+      settingsSaveFailed
+          ? "Saving the settings failed: the change was not stored."
+      : launchNeedsStReset
           ? "Reset the Atari ST first: no HELLO since RP boot."
           : "Countdown stopped. Press [G], [U] or [X] to continue.");
+}
+
+// Save the app settings and report a failure on the menu. The countdown stops
+// so the message stays on screen; the caller's own redraw happens first, so
+// the line survives it.
+static bool saveAppSettings(void) {
+  bool saved = settings_save(aconfig_getContext(), true) == 0;
+  settingsSaveFailed = !saved;
+  if (!saved) {
+    DPRINTF("Saving the app settings failed\n");
+    haltCountdown = true;
+  }
+  return saved;
 }
 
 static void refreshSetupInfoLine(void);
@@ -1461,7 +1481,7 @@ void __not_in_flash_func(cmdGemdriveFolder)(const char *arg) {
     case NAV_DIR_SELECTED: {
       settings_put_string(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER,
                           navState->folderPath);
-      settings_save(aconfig_getContext(), true);
+      (void)saveAppSettings();
       term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
       menu();
       break;
@@ -1490,7 +1510,7 @@ void cmdGemdriveDrive(const char *arg) {
   char driveBuffer[2] = {(char)toupper((unsigned char)input[0]), '\0'};
   settings_put_string(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_DRIVE,
                       driveBuffer);
-  settings_save(aconfig_getContext(), true);
+  (void)saveAppSettings();
   menu();
 }
 
@@ -1525,7 +1545,7 @@ void cmdGemdriveRelocAddr(const char *arg) {
   }
   settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR,
                        (int)value);
-  settings_save(aconfig_getContext(), true);
+  (void)saveAppSettings();
   menu();
 }
 
@@ -1558,7 +1578,7 @@ void cmdGemdriveMemtop(const char *arg) {
   }
   settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_DEVOPS_MEMTOP,
                        (int)value);
-  settings_save(aconfig_getContext(), true);
+  (void)saveAppSettings();
   menu();
 }
 
@@ -1580,7 +1600,7 @@ void cmdAdvHookVector(const char *arg) {
       (strcmp(current, "etv_timer") == 0) ? "vbl" : "etv_timer";
   settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ADV_HOOK_VECTOR,
                       next);
-  settings_save(aconfig_getContext(), true);
+  (void)saveAppSettings();
   menu();
 }
 
@@ -1820,7 +1840,7 @@ void emul_start() {
     // below if it does not exist.
     DPRINTF("FOLDER was /test; changing it to /devops\n");
     settings_put_string(aconfig_getContext(), ACONFIG_PARAM_FOLDER, "/devops");
-    settings_save(aconfig_getContext(), true);
+    (void)saveAppSettings();
   } else {
     DPRINTF("FOLDER: %s\n", folder->value);
     folderName = folder->value;
@@ -2078,7 +2098,7 @@ void emul_start() {
     // Set emulation mode to 255 (setup menu)
     settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_MODE,
                          APP_MODE_SETUP);
-    settings_save(aconfig_getContext(), true);
+    (void)saveAppSettings();
 
     // Jump to the booster app
     DPRINTF("Jumping to the booster app...\n");
