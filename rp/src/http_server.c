@@ -4625,6 +4625,13 @@ static void write_fs_error(http_conn_t *c, FRESULT fr, const char *message) {
     write_error(c, 503, "Service Unavailable", "insufficient_memory", message);
     return;
   }
+  // FatFs's lock table is shared with GEMDRIVE (FF_FS_LOCK in ffconf.h). A
+  // full table means the ST is holding its share right now, so this is also
+  // worth retrying rather than a disk fault (EPIC-13 STORY-06).
+  if (fr == FR_TOO_MANY_OPEN_FILES) {
+    write_error(c, 503, "Service Unavailable", "too_many_open_files", message);
+    return;
+  }
   write_error(c, 500, "Internal Server Error", "disk_error", message);
 }
 
