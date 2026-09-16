@@ -206,6 +206,7 @@ static bool g_body_stream_busy = false;
 static http_conn_t *conn_alloc(void);
 static void conn_free(http_conn_t *c);
 static void conn_close(http_conn_t *c);
+static bool conn_takeAborted(void);
 
 static void parse_and_dispatch(http_conn_t *c, struct pbuf *seg,
                                size_t body_off);
@@ -301,6 +302,9 @@ void http_server_deinit(void) {
       conn_close(&g_conns[i]);
     }
   }
+  // Not inside a callback, so there is nobody to return ERR_ABRT: drop the
+  // flag rather than leave it for the next one.
+  (void)conn_takeAborted();
 }
 
 // --- Connection lifecycle ---
