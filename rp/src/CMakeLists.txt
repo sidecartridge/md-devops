@@ -81,6 +81,30 @@ include(${PICO_EXTRAS_PATH}/external/pico_extras_import.cmake)
 # Set name of project (as PROJECT_NAME) and C/C   standards
 project(rp C CXX)
 set(CMAKE_C_STANDARD 11)
+# malloc must return NULL on failure instead of panicking.
+#
+# MUST be set before pico_sdk_init(): check_alloc() lives in the SDK's own
+# malloc.c, and pico_sdk_init() pulls the SDK in as a subdirectory, which
+# inherits compile definitions as they stand at that moment. Setting this
+# further down the file compiles OUR sources with it and leaves the SDK's
+# malloc.c untouched, which looks right and does nothing.
+#
+# The SDK default (PICO_MALLOC_PANIC 1) turns a failed allocation into
+# panic("Out of memory"), which defeats libraries written to handle NULL and
+# recover. FatFs's dir_clear() is the case that bit us: creating a directory
+# asks for up to 32KB and HALVES the request until it fits, falling back to
+# single-sector writes if nothing can be allocated. With the panic enabled the
+# first oversized request killed the device, so booting with an SD card that
+# has no app folder was fatal. mbedTLS is written the same way and fails a
+# handshake on a failed allocation rather than taking the device down.
+#
+# Every malloc in this firmware checks its result, and sbrk still refuses to
+# grow the heap past __StackLimit, so the guard this removes was redundant.
+if (NOT DEFINED ENV{PICO_MALLOC_PANIC})
+    set(ENV{PICO_MALLOC_PANIC} "0")
+endif()
+add_compile_definitions(PICO_MALLOC_PANIC=$ENV{PICO_MALLOC_PANIC})
+
 # Creates a pico-sdk subdirectory in our project for the libraries
 pico_sdk_init()
 

@@ -623,11 +623,31 @@ static bool launchNeedsStReset = false;
 static bool countdownLaunching = false;
 static bool restartCountdownOnHello = false;
 
+// Set when settings_save fails, which it can now that a failed allocation
+// returns NULL instead of panicking (EPIC-11). Cleared by the next save that
+// works.
+static bool settingsSaveFailed = false;
+
 static void drawHaltedInfoLine(void) {
   drawSetupInfoLine(
-      launchNeedsStReset
+      settingsSaveFailed
+          ? "Saving the settings failed: the change was not stored."
+      : launchNeedsStReset
           ? "Reset the Atari ST first: no HELLO since RP boot."
           : "Countdown stopped. Press [G], [U] or [X] to continue.");
+}
+
+// Save the app settings and report a failure on the menu. The countdown stops
+// so the message stays on screen; the caller's own redraw happens first, so
+// the line survives it.
+static bool saveAppSettings(void) {
+  bool saved = settings_save(aconfig_getContext(), true) == 0;
+  settingsSaveFailed = !saved;
+  if (!saved) {
+    DPRINTF("Saving the app settings failed\n");
+    haltCountdown = true;
+  }
+  return saved;
 }
 
 static void refreshSetupInfoLine(void);
@@ -663,11 +683,37 @@ static void refreshSetupInfoLine(void) {
 #if defined(_DEBUG) && (_DEBUG != 0)
 // Debug mailbox app commands (devhooks.h): stop or restart the boot countdown
 // from a host tool. Returns 1 when done, 0 for an unknown command.
+// Blocks held by DEVHOOKS_APP_HEAP_HOLD, so a test can squeeze the heap in
+// steps; holding 0 KB frees them all.
+typedef struct DevhooksHeldBlock {
+  struct DevhooksHeldBlock *next;
+} DevhooksHeldBlock;
+static DevhooksHeldBlock *devhooksHeldHeap = NULL;
+
 static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
                                  uint16_t payloadSize) {
-  (void)payload;
-  (void)payloadSize;
   switch (commandId) {
+    case DEVHOOKS_APP_HEAP_HOLD: {
+      uint32_t kb = (payloadSize >= 2u) ? payload[0] : 0u;
+      if (kb == 0u) {
+        while (devhooksHeldHeap != NULL) {
+          DevhooksHeldBlock *next = devhooksHeldHeap->next;
+          free(devhooksHeldHeap);
+          devhooksHeldHeap = next;
+        }
+        DPRINTF("devhooks: heap hold released\n");
+        return 1;
+      }
+      DevhooksHeldBlock *block =
+          malloc(sizeof(DevhooksHeldBlock) + kb * 1024u);
+      if (block != NULL) {
+        block->next = devhooksHeldHeap;
+        devhooksHeldHeap = block;
+      }
+      DPRINTF("devhooks: holding %lu KB more heap: %s\n", (unsigned long)kb,
+              (block != NULL) ? "ok" : "refused");
+      return (block != NULL) ? 1u : 0u;
+    }
     case DEVHOOKS_APP_COUNTDOWN_STOP:
       haltCountdown = true;
       return 1;
@@ -1461,7 +1507,7 @@ void __not_in_flash_func(cmdGemdriveFolder)(const char *arg) {
     case NAV_DIR_SELECTED: {
       settings_put_string(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER,
                           navState->folderPath);
-      settings_save(aconfig_getContext(), true);
+      (void)saveAppSettings();
       term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
       menu();
       break;
@@ -1490,7 +1536,7 @@ void cmdGemdriveDrive(const char *arg) {
   char driveBuffer[2] = {(char)toupper((unsigned char)input[0]), '\0'};
   settings_put_string(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_DRIVE,
                       driveBuffer);
-  settings_save(aconfig_getContext(), true);
+  (void)saveAppSettings();
   menu();
 }
 
@@ -1525,7 +1571,7 @@ void cmdGemdriveRelocAddr(const char *arg) {
   }
   settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR,
                        (int)value);
-  settings_save(aconfig_getContext(), true);
+  (void)saveAppSettings();
   menu();
 }
 
@@ -1558,7 +1604,7 @@ void cmdGemdriveMemtop(const char *arg) {
   }
   settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_DEVOPS_MEMTOP,
                        (int)value);
-  settings_save(aconfig_getContext(), true);
+  (void)saveAppSettings();
   menu();
 }
 
@@ -1580,7 +1626,7 @@ void cmdAdvHookVector(const char *arg) {
       (strcmp(current, "etv_timer") == 0) ? "vbl" : "etv_timer";
   settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ADV_HOOK_VECTOR,
                       next);
-  settings_save(aconfig_getContext(), true);
+  (void)saveAppSettings();
   menu();
 }
 
@@ -1820,7 +1866,7 @@ void emul_start() {
     // below if it does not exist.
     DPRINTF("FOLDER was /test; changing it to /devops\n");
     settings_put_string(aconfig_getContext(), ACONFIG_PARAM_FOLDER, "/devops");
-    settings_save(aconfig_getContext(), true);
+    (void)saveAppSettings();
   } else {
     DPRINTF("FOLDER: %s\n", folder->value);
     folderName = folder->value;
@@ -2078,7 +2124,7 @@ void emul_start() {
     // Set emulation mode to 255 (setup menu)
     settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_MODE,
                          APP_MODE_SETUP);
-    settings_save(aconfig_getContext(), true);
+    (void)saveAppSettings();
 
     // Jump to the booster app
     DPRINTF("Jumping to the booster app...\n");

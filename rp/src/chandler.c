@@ -103,7 +103,12 @@ void __not_in_flash_func(chandler_addCB)(CommandCallback cb) {
     }
   }
   CommandCallbackNode *node = malloc(sizeof(*node));
-  if (!node) return;
+  if (!node) {
+    // Registration happens at boot, so this would leave a whole feature
+    // (GEMDRIVE, the Runner) unreachable; say so instead of failing silently.
+    DPRINTF("chandler_addCB: out of memory, %p not registered\n", (void *)cb);
+    return;
+  }
   node->cb = cb;
   node->next = NULL;
   if (!callbackListHead) {

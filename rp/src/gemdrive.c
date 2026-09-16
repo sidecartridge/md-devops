@@ -649,9 +649,10 @@ static void handleDcreateCall(uint16_t *payload) {
   char sdPath[GEMDRIVE_DEFAULT_PATH_LEN + 64] = {0};
   getLocalFullPathname(atari, sdPath, sizeof(sdPath));
   FRESULT res = f_mkdir(sdPath);
-  uint16_t status = (res == FR_OK)         ? 0
-                    : (res == FR_NO_PATH) ? (uint16_t)-34   // EPTHNF
-                                          : (uint16_t)-36;  // EACCDN
+  uint16_t status = (res == FR_OK)                ? 0
+                    : (res == FR_NOT_ENOUGH_CORE) ? (uint16_t)-39   // ENSMEM
+                    : (res == FR_NO_PATH)         ? (uint16_t)-34   // EPTHNF
+                                                  : (uint16_t)-36;  // EACCDN
   DPRINTF("GEMDRIVE Dcreate: '%s' -> fr=%d\n", sdPath, (int)res);
   writeAppFreeWord(GEMDRIVE_DCREATE_STATUS_OFFSET, status);
 }
@@ -672,6 +673,8 @@ static void handleDdeleteCall(uint16_t *payload) {
     status = (uint16_t)-36;  // EACCDN — non-empty
   } else if (res == FR_NO_PATH || res == FR_NO_FILE) {
     status = (uint16_t)-34;  // EPTHNF
+  } else if (res == FR_NOT_ENOUGH_CORE) {
+    status = (uint16_t)-39;  // ENSMEM
   } else {
     status = (uint16_t)-65;  // EINTRN
   }
@@ -738,6 +741,8 @@ static void handleFdeleteCall(uint16_t *payload) {
     status = (uint32_t)-36;
   } else if (res == FR_NO_PATH) {
     status = (uint32_t)-34;
+  } else if (res == FR_NOT_ENOUGH_CORE) {
+    status = (uint32_t)-39;  // ENSMEM
   } else {
     status = (uint32_t)-65;
   }
@@ -805,6 +810,8 @@ static void handleFrenameCall(uint16_t *payload) {
     status = (uint32_t)-33;
   } else if (res == FR_DENIED || res == FR_EXIST) {
     status = (uint32_t)-36;
+  } else if (res == FR_NOT_ENOUGH_CORE) {
+    status = (uint32_t)-39;  // ENSMEM
   } else {
     status = (uint32_t)-65;
   }
