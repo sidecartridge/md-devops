@@ -27,6 +27,7 @@
 #include "pico/cyw43_arch.h"
 #include "pico/time.h"
 #include "runner.h"
+#include "select.h"
 #include "settings.h"
 #include "usbcdc.h"
 
@@ -348,6 +349,19 @@ static bool upload_drain_pbuf(http_conn_t *c, struct pbuf *seg, size_t off,
     done += chunk;
   }
   return true;
+}
+
+// What a spin-wait owes the rest of the firmware. Six HTTP handlers block
+// inside srv_recv_cb while the ST answers -- up to 10 s for a Runner load --
+// and nothing else runs meanwhile, so each turn of those loops has to feed the
+// watchdog, drain the cartridge ring the ST is waiting on, poll SELECT so the
+// button still resets the device, and push queued console bytes out of USB.
+static void http_spinTick(void) {
+  health_feed();
+  health_setPhase(HEALTH_PHASE_HTTP_WAIT);
+  chandler_loop();
+  select_checkPushReset();
+  usbcdc_drain();
 }
 
 // Traffic in either direction keeps a connection alive for the sweeper.
@@ -1808,9 +1822,7 @@ static void handle_runner_load(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_LOAD_TIMEOUT_US);
   while (emul_isRunnerBusy()) {
-    health_feed();
-    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
-    chandler_loop();
+    http_spinTick();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
       // Treat the timeout as a load failure with a synthetic
@@ -1939,9 +1951,7 @@ static void handle_runner_unload(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_UNLOAD_TIMEOUT_US);
   while (emul_isRunnerBusy()) {
-    health_feed();
-    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
-    chandler_loop();
+    http_spinTick();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
       // Synthetic timeout failure — keeps state consistent
@@ -2387,9 +2397,7 @@ static bool adv_load_dispatch_chunk(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), ADV_LOAD_TIMEOUT_US);
   while (!emul_isRunnerAdvLoadAcked()) {
-    health_feed();
-    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
-    chandler_loop();
+    http_spinTick();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       DPRINTF("adv_load: chunk dispatch timed out at target=0x%lX len=%lu\n",
               (unsigned long)c->adv_load_target, (unsigned long)len);
@@ -2509,9 +2517,7 @@ static bool handle_runner_adv_load_init(http_conn_t *c, struct pbuf *seg,
     absolute_time_t deadline =
         delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
     while (!emul_isRunnerMeminfoReady()) {
-      health_feed();
-      health_setPhase(HEALTH_PHASE_HTTP_WAIT);
-      chandler_loop();
+      http_spinTick();
       if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
         runner_meminfo_t empty = {0};
         uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
@@ -2582,9 +2588,7 @@ static void handle_runner_adv_meminfo(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
   while (!emul_isRunnerMeminfoReady()) {
-    health_feed();
-    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
-    chandler_loop();
+    http_spinTick();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
       runner_meminfo_t empty = {0};
@@ -2809,9 +2813,7 @@ static void handle_runner_meminfo(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
   while (!emul_isRunnerMeminfoReady()) {
-    health_feed();
-    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
-    chandler_loop();
+    http_spinTick();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       // Timeout — clear busy and report.
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
