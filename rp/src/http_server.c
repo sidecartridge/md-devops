@@ -44,6 +44,12 @@ extern unsigned char __rom_in_ram_start__[];
 // truncating large JSON responses; chunked streaming for big bodies
 // arrives in S5.
 #define HTTP_RESPONSE_BUF_BYTES 1024
+// The path buffers of the larger handlers are declared `static` rather than on
+// the stack (EPIC-12 STORY-03): they made single frames of up to 1,672 bytes,
+// and the deepest path through this file 3,784. Safe because the server is
+// single-threaded (C-09) and a handler runs to completion within one call --
+// the Runner's spin-waits pump chandler_loop only, never lwIP, so no second
+// request can enter a handler while one is in progress.
 #define HTTP_PATH_BUF_BYTES 192
 #define HTTP_QUERY_BUF_BYTES 192
 
@@ -1296,7 +1302,7 @@ static void handle_runner_status(http_conn_t *c) {
     snprintf(last_load_errno_buf, sizeof(last_load_errno_buf), "null");
   }
 
-  char body[640];
+  static char body[640];
   int n = snprintf(
       body, sizeof(body),
       "{\"ok\":true,\"active\":%s,\"busy\":%s,\"cwd\":\"%s\","
@@ -1456,7 +1462,7 @@ static void handle_runner_run(http_conn_t *c) {
     return;
   }
 
-  char path[RUNNER_PATH_LEN];
+  static char path[RUNNER_PATH_LEN];
   json_status_t js = json_extract_string(c->body, c->body_received, "path",
                                          path, sizeof(path));
   if (js == JSON_BAD) {
@@ -1494,14 +1500,14 @@ static void handle_runner_run(http_conn_t *c) {
   // for the m68k stays in user-supplied form (see below) so a bare
   // filename gets resolved by GEMDOS against the m68k's TOS cwd
   // (which the previous Dsetpath kept in sync with our cwd mirror).
-  char rebased[RUNNER_PATH_LEN];
+  static char rebased[RUNNER_PATH_LEN];
   if (!runner_resolve_relative(path, rebased, sizeof(rebased))) {
     write_error(c, 400, "Bad Request", "name_too_long",
                 "Path too long after cwd resolution");
     return;
   }
-  char norm[HTTP_PATH_BUF_BYTES];
-  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  static char norm[HTTP_PATH_BUF_BYTES];
+  static char abs_path[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(rebased, norm, sizeof(norm), abs_path,
                                  sizeof(abs_path));
   if (s != NORM_OK) {
@@ -1535,7 +1541,7 @@ static void handle_runner_run(http_conn_t *c) {
   // paths still work — they just don't depend on cwd. The Runner
   // Dsetdrvs to the emulated drive before each Pexec, so a bare
   // backslash form (no drive letter) resolves on our drive.
-  char st_path[RUNNER_PATH_LEN];
+  static char st_path[RUNNER_PATH_LEN];
   size_t out = 0;
   for (size_t i = 0; path[i] != '\0' && out < sizeof(st_path) - 1; i++) {
     char ch = path[i];
@@ -1603,7 +1609,7 @@ static void handle_runner_load(http_conn_t *c) {
     return;
   }
 
-  char path[RUNNER_PATH_LEN];
+  static char path[RUNNER_PATH_LEN];
   json_status_t js = json_extract_string(c->body, c->body_received, "path",
                                          path, sizeof(path));
   if (js == JSON_BAD) {
@@ -1635,14 +1641,14 @@ static void handle_runner_load(http_conn_t *c) {
   }
 
   // Same path-resolution + jail-check + f_stat as /runner/run.
-  char rebased[RUNNER_PATH_LEN];
+  static char rebased[RUNNER_PATH_LEN];
   if (!runner_resolve_relative(path, rebased, sizeof(rebased))) {
     write_error(c, 400, "Bad Request", "name_too_long",
                 "Path too long after cwd resolution");
     return;
   }
-  char norm[HTTP_PATH_BUF_BYTES];
-  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  static char norm[HTTP_PATH_BUF_BYTES];
+  static char abs_path[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(rebased, norm, sizeof(norm), abs_path,
                                  sizeof(abs_path));
   if (s != NORM_OK) {
@@ -1671,7 +1677,7 @@ static void handle_runner_load(http_conn_t *c) {
   }
 
   // Same backslash-form path translation as /runner/run.
-  char st_path[RUNNER_PATH_LEN];
+  static char st_path[RUNNER_PATH_LEN];
   size_t out = 0;
   for (size_t i = 0; path[i] != '\0' && out < sizeof(st_path) - 1; i++) {
     char ch = path[i];
@@ -1894,7 +1900,7 @@ static void handle_runner_cd(http_conn_t *c) {
     return;
   }
 
-  char path[RUNNER_PATH_LEN];
+  static char path[RUNNER_PATH_LEN];
   json_status_t js = json_extract_string(c->body, c->body_received, "path",
                                          path, sizeof(path));
   if (js == JSON_BAD) {
@@ -1910,14 +1916,14 @@ static void handle_runner_cd(http_conn_t *c) {
 
   // Resolve relative paths against the current cwd so e.g. `cd SUB`
   // from /TEST lands on /TEST/SUB.
-  char rebased[RUNNER_PATH_LEN];
+  static char rebased[RUNNER_PATH_LEN];
   if (!runner_resolve_relative(path, rebased, sizeof(rebased))) {
     write_error(c, 400, "Bad Request", "name_too_long",
                 "Path too long after cwd resolution");
     return;
   }
-  char norm[HTTP_PATH_BUF_BYTES];
-  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  static char norm[HTTP_PATH_BUF_BYTES];
+  static char abs_path[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(rebased, norm, sizeof(norm), abs_path,
                                  sizeof(abs_path));
   if (s != NORM_OK) {
@@ -1950,7 +1956,7 @@ static void handle_runner_cd(http_conn_t *c) {
   // m68k on /TEST/ARKANOID just like our mirror. Absolute inputs work
   // independently of cwd. The Runner Dsetdrvs before Dsetpath so a
   // bare backslash path resolves on the GEMDRIVE drive.
-  char st_path[RUNNER_PATH_LEN];
+  static char st_path[RUNNER_PATH_LEN];
   size_t out = 0;
   for (size_t i = 0; path[i] != '\0' && out < sizeof(st_path) - 1; i++) {
     char ch = path[i];
@@ -3106,7 +3112,7 @@ static void stream_listing_drive(http_conn_t *c) {
 
 static void handle_files_list(http_conn_t *c) {
   // Extract ?path=, default to "/".
-  char rel[HTTP_PATH_BUF_BYTES];
+  static char rel[HTTP_PATH_BUF_BYTES];
   rel[0] = '\0';
   if (c->query[0] != '\0') {
     if (!query_get(c->query, "path", rel, sizeof(rel))) {
@@ -3118,7 +3124,7 @@ static void handle_files_list(http_conn_t *c) {
     }
   }
 
-  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  static char abs_path[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_jail(rel, abs_path, sizeof(abs_path));
   if (s == NORM_BAD_PATH) {
     write_error(c, 400, "Bad Request", "bad_path", "Path not allowed");
@@ -3159,7 +3165,7 @@ static void handle_files_list(http_conn_t *c) {
   c->stream_body_done = false;
 
   // Canonical normalised path to echo in the envelope.
-  char norm[HTTP_PATH_BUF_BYTES];
+  static char norm[HTTP_PATH_BUF_BYTES];
   if (normalize_rel(rel, norm, sizeof(norm)) != NORM_OK) {
     norm[0] = '/';
     norm[1] = '\0';
@@ -3253,8 +3259,8 @@ static bool finfo_is_dir(const FILINFO *info) {
 }
 
 static void handle_folder_create(http_conn_t *c, const char *url_rel) {
-  char norm[HTTP_PATH_BUF_BYTES];
-  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  static char norm[HTTP_PATH_BUF_BYTES];
+  static char abs_path[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(url_rel, norm, sizeof(norm), abs_path,
                                  sizeof(abs_path));
   if (s != NORM_OK) {
@@ -3377,7 +3383,7 @@ static void handle_folder_rename(http_conn_t *c, const char *url_rel) {
     return;
   }
 
-  char to_url[HTTP_PATH_BUF_BYTES];
+  static char to_url[HTTP_PATH_BUF_BYTES];
   json_status_t js = json_extract_string(c->body, c->body_received, "to",
                                          to_url, sizeof(to_url));
   if (js == JSON_BAD) {
@@ -3392,8 +3398,8 @@ static void handle_folder_rename(http_conn_t *c, const char *url_rel) {
   }
 
   // Resolve source.
-  char src_norm[HTTP_PATH_BUF_BYTES];
-  char src_abs[HTTP_FAT_PATH_BUF_BYTES];
+  static char src_norm[HTTP_PATH_BUF_BYTES];
+  static char src_abs[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(url_rel, src_norm, sizeof(src_norm), src_abs,
                                  sizeof(src_abs));
   if (s != NORM_OK) {
@@ -3406,13 +3412,13 @@ static void handle_folder_rename(http_conn_t *c, const char *url_rel) {
   }
 
   // Resolve target. `to` is taken as-is (already-decoded JSON string).
-  char dst_norm[HTTP_PATH_BUF_BYTES];
+  static char dst_norm[HTTP_PATH_BUF_BYTES];
   s = normalize_rel(to_url, dst_norm, sizeof(dst_norm));
   if (s != NORM_OK) {
     write_path_error(c, s);
     return;
   }
-  char dst_abs[HTTP_FAT_PATH_BUF_BYTES];
+  static char dst_abs[HTTP_FAT_PATH_BUF_BYTES];
   s = resolve_jail(dst_norm, dst_abs, sizeof(dst_abs));
   if (s != NORM_OK) {
     write_path_error(c, s);
@@ -3570,8 +3576,8 @@ static void handle_file_download(http_conn_t *c,
     return;
   }
 
-  char norm[HTTP_PATH_BUF_BYTES];
-  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  static char norm[HTTP_PATH_BUF_BYTES];
+  static char abs_path[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(url_rel, norm, sizeof(norm), abs_path,
                                  sizeof(abs_path));
   if (s != NORM_OK) {
@@ -4030,7 +4036,7 @@ static void handle_file_rename(http_conn_t *c,
     return;
   }
 
-  char to_url[HTTP_PATH_BUF_BYTES];
+  static char to_url[HTTP_PATH_BUF_BYTES];
   json_status_t js = json_extract_string(c->body, c->body_received, "to",
                                          to_url, sizeof(to_url));
   if (js == JSON_BAD) {
@@ -4045,8 +4051,8 @@ static void handle_file_rename(http_conn_t *c,
   }
 
   // Resolve source.
-  char src_norm[HTTP_PATH_BUF_BYTES];
-  char src_abs[HTTP_FAT_PATH_BUF_BYTES];
+  static char src_norm[HTTP_PATH_BUF_BYTES];
+  static char src_abs[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(url_rel, src_norm, sizeof(src_norm), src_abs,
                                  sizeof(src_abs));
   if (s != NORM_OK) {
@@ -4060,13 +4066,13 @@ static void handle_file_rename(http_conn_t *c,
 
   // Resolve target. `to` was JSON-decoded already so we run it through
   // normalize_rel directly (no URL-decoding needed).
-  char dst_norm[HTTP_PATH_BUF_BYTES];
+  static char dst_norm[HTTP_PATH_BUF_BYTES];
   s = normalize_rel(to_url, dst_norm, sizeof(dst_norm));
   if (s != NORM_OK) {
     write_path_error(c, s);
     return;
   }
-  char dst_abs[HTTP_FAT_PATH_BUF_BYTES];
+  static char dst_abs[HTTP_FAT_PATH_BUF_BYTES];
   s = resolve_jail(dst_norm, dst_abs, sizeof(dst_abs));
   if (s != NORM_OK) {
     write_path_error(c, s);

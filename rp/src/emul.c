@@ -1034,7 +1034,10 @@ static bool foldersOnlyFilter(const char *name,
 // Remove last path component (".." navigation).
 static void pathUp(void) {
   char temp[MAX_FILENAME_LENGTH + 1];
-  char *segments[MAX_ENTRIES_DIR];
+  // One segment needs at least a separator and a character, so a path of
+  // MAX_FILENAME_LENGTH cannot have more than half that many (EPIC-12
+  // STORY-03; this array held 256 pointers, 1 KB of stack).
+  char *segments[(MAX_FILENAME_LENGTH / 2) + 1];
   int sp = 0;
 
   strncpy(temp, navState->folderPath, sizeof(temp));
@@ -1891,7 +1894,8 @@ void emul_start() {
   // files are stored. The folder name is defined in the configuration.
   // If there is no folder in the micro SD card, the app will create it.
 
-  FATFS fsys;
+  // Static: it lives for the whole run and FATFS carries a sector buffer.
+  static FATFS fsys;
   SettingsConfigEntry *folder =
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_FOLDER);
   char *folderName = "/devops";

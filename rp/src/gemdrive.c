@@ -869,9 +869,10 @@ static void __not_in_flash_func(handleWriteBuffCall)(uint16_t *payload) {
     return;
   }
 
-  // Pull the chunk out of the wire buffer (byte-swapped per word).
-  uint8_t tmp[GEMDRIVE_WRITE_BUFFER_SIZE];
-  COPY_AND_CHANGE_ENDIANESS_BLOCK16(payload, tmp, (bytes + 1) & ~1);
+  // Swap the chunk where it already sits, in the parser's payload buffer: a
+  // 1 KB copy on the stack for every chunk (EPIC-12 STORY-03).
+  uint8_t *tmp = (uint8_t *)payload;
+  CHANGE_ENDIANESS_BLOCK16(tmp, (bytes + 1) & ~1u);
 
   UINT bw = 0;
   // An SD write can block for tens of milliseconds, and much longer on a card
@@ -1050,15 +1051,17 @@ static void __not_in_flash_func(handleReadBuffCall)(uint16_t *payload) {
     bytesThisChunk = GEMDRIVE_READ_BUFFER_SIZE;
   }
 
-  uint8_t tmp[GEMDRIVE_READ_BUFFER_SIZE];
+  // Read into the window the ST reads from and swap there: a 4 KB copy on the
+  // stack was the deepest frame in the firmware (EPIC-12 STORY-03).
+  uint8_t *dst = (uint8_t *)(appFreeAddress() + GEMDRIVE_READ_BUFFER_OFFSET);
   UINT bytesRead = 0;
-  FRESULT res = f_read(&slot->fp, tmp, (UINT)bytesThisChunk, &bytesRead);
+  FRESULT res = f_read(&slot->fp, dst, (UINT)bytesThisChunk, &bytesRead);
   if (res != FR_OK) {
     writeAppFreeLong(GEMDRIVE_READ_BYTES_OFFSET, (uint32_t)-93);  // EIO_READ
     return;
   }
-  // Copy into shared region; m68k reads byte-by-byte so swap pairs.
-  writeAppFreeBytesSwapped(GEMDRIVE_READ_BUFFER_OFFSET, tmp, bytesRead);
+  // m68k reads byte-pairs in BE order.
+  CHANGE_ENDIANESS_BLOCK16(dst, bytesRead & ~1u);
   writeAppFreeLong(GEMDRIVE_READ_BYTES_OFFSET, (uint32_t)bytesRead);
 }
 
