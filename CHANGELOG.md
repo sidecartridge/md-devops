@@ -2,95 +2,80 @@
 
 ## v1.1.0 (2026-09-17) — robustness
 
-Everything here is a fix or a recovery path; there are no new features. The
-release also changes how the firmware is built: **v1.1.0 ships a `Release`
-build**, where every release up to `v1.0.1beta` shipped `MinSizeRel` because
-`Release` did not survive on hardware.
+No new features. Things that used to fail now work, and when something does
+go wrong the cartridge recovers by itself instead of waiting for you to
+unplug it.
 
-### The Remote API could not complete an upload
+### Copying files over Wi-Fi, whatever the size
 
-Any upload much beyond 200 KB failed, and three separate bugs were stacked
-behind it:
+Anything much beyond 200 KB never arrived. A 4 MB file now goes up and comes
+back down identical, and a slow connection is no longer cut off part way
+through.
 
-- **Every upload silently lost 437 bytes.** The body bytes that shared the
-  first TCP segment with the request headers were dropped, and the server
-  acknowledged them anyway, so the client had nothing to re-send and the
-  upload could never finish.
-- **Transfers were closed while still running.** The idle sweeper closed any
-  connection a few seconds after it was accepted, because the poll timer it
-  relied on is only reset by data the *server* sends — and during an upload
-  the server sends nothing.
-- **A 4 MB upload then hit the watchdog**, because extending a large file
-  makes the card walk its cluster chain for longer than the 8 second limit.
+### A transfer that dies no longer blocks the next one
 
-A 4 MB upload and download now round-trip byte-identical, and a client
-reading at 5 KB/s gets its file instead of being cut off after 8 seconds.
+If the other end vanished mid-transfer — laptop asleep, cable out, Ctrl-C —
+every later upload or download answered *busy* until the cartridge was
+reset, and a half-written file was left on the card. Transfers now clean up
+after themselves.
 
-### Aborted transfers no longer wedge the API
+### The SD card
 
-A client that disappeared mid-transfer left the transfer lock held, so every
-later upload or download answered `503 busy` until the device was reset. It
-also left FatFs handles counted against a table shared with GEMDRIVE, and a
-half-written file on the card.
+- **Take the card out and put it back**: it is picked up again in about two
+  seconds. No reset needed.
+- **With no card in**, the cartridge says so instead of pretending. The setup
+  menu shows `SD: NO CARD`, `[G]` and `[U]` refuse to start, and the API
+  answers *no SD card*. Before, it would report the last card's free space
+  and show you an empty, cheerful, non-existent directory.
 
-### A pulled SD card comes back on its own
+### Files written from the Atari arrive whole
 
-Putting a card back used to require a reset. Worse, with no card the device
-did not say so: `volume` answered `200` with the size and free space it had
-cached, and a directory listing answered `200` and empty.
-
-Now the card is noticed within about two seconds and remounted by itself,
-every endpoint that needs it answers `503 no_sd_card`, the setup menu shows
-`SD: NO CARD`, and `[G]` and `[U]` refuse to start rather than launching a
-mode with no drive behind it.
-
-### The Atari no longer duplicates data on a retried write
-
-When a write chunk timed out, the ST re-sent it and the firmware appended it
-a second time: the file gained a duplicated block and lost its tail. Chunks
-now carry a sequence number, so a re-sent chunk is recognised and answered
-without being written again.
+When a write took too long and the Atari sent the same block again, that
+block was written twice and the end of the file was lost. Retried blocks are
+now recognised and written once.
 
 ### Wi-Fi
 
-- **The radio was always in power save**, whatever the setting said, because
-  the driver re-applies its own default every time the interface comes up.
-  It now runs at full power: round-trip latency improves from 99 ms to 27 ms
-  average, and packet loss from 15% to 5% on the bench network.
-- **The device rejoins by itself** after a link loss, instead of staying off
-  the network until someone reset it.
-- **A bad static IP configuration can no longer crash the boot.** A missing
-  or malformed address used to fault before the setup menu appeared — the
-  menu being the only place to fix it. Anything invalid now falls back to
-  DHCP and says why on the menu.
-- **The Wi-Fi password no longer appears in the debug log.** It was printed
-  on every boot.
+- **Faster and steadier.** The radio was always in power-saving mode,
+  whatever the setting said. On the bench network, response time dropped
+  from 99 ms to 27 ms and lost packets from 15% to 5%.
+- **It rejoins on its own** after the router reboots or you walk out of
+  range. Before, it stayed off the network until someone reset the
+  cartridge.
+- **A wrong fixed IP address no longer locks you out.** It used to crash
+  before the setup menu appeared — the one place where you could correct it.
+  Anything invalid now falls back to DHCP and tells you why on the menu.
+- **Your Wi-Fi password is no longer printed** on the debug console at every
+  boot.
 
-### Crashes are visible and survivable
+### It recovers from its own crashes
 
-A panic, a HardFault or an 8 second hang now reboots the device and reports
-what happened on the menu's top line (`Recovered: hang in main_loop x2`),
-with the reason, the phase and the faulting address also in
-`GET /api/v1/system/health`. A crash-loop guard keeps the device in the menu
-instead of re-entering whatever crashed. Core 0's stack moved to the top of
-RAM with an MPU guard, so an overflow faults instead of quietly corrupting
-memory.
+If the firmware crashes or freezes, the cartridge reboots and tells you on
+the top line of the menu — for example `Recovered: hang in main_loop x2` —
+rather than sitting there dead. It will not fall back into the same crash
+over and over: after a repeat it stays in the menu, where you can change
+whatever caused it.
 
-### The CLI reports dropped connections
+### The command-line tool
 
-`sidecart.py` used to print a Python traceback when the device rebooted
-under a command. It now prints one line and exits with the network status.
+`sidecart.py` printed a page of Python errors when the cartridge rebooted
+under a command. It now prints one line and stops.
 
 ### Known limitations
 
-- **Programs that trace heavily through the debug ABI can take the ST
-  down.** A program reading more than a few thousand bytes through the
-  cartridge debug window during `runner exec` faults the Atari; the rate
-  rises with the size of the burst. The cause is not yet found — the
-  firmware side has been measured and cleared — so heavy tracing should be
-  kept to short bursts for now.
-- Wi-Fi recovery is verified against injected faults, not against a real
-  access-point outage.
+- **A program that traces heavily while running under the Runner can crash
+  the Atari.** Reading more than a few thousand bytes through the cartridge
+  debug window during `runner exec` bombs the machine, more often the bigger
+  the burst. We have not found the cause yet, so keep tracing to short
+  bursts for now.
+- Wi-Fi recovery has been tested with faults we injected ourselves, not
+  against a real access point going down.
+
+### For developers
+
+This is the first release built with full optimisation (`Release`);
+everything up to `v1.0.1beta` shipped `MinSizeRel`, because `Release` did not
+survive on hardware. Both build types now pass the same hardware gate.
 
 ## v1.0.1beta (2026-05-05) — stability fixes
 
