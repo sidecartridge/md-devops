@@ -19,6 +19,7 @@
 #include "gconfig.h"
 #include "health.h"
 #include "memfunc.h"
+#include "network.h"
 #include "lwip/err.h"
 #include "lwip/memp.h"
 #include "lwip/pbuf.h"
@@ -2976,6 +2977,24 @@ static void handle_system_health(http_conn_t *c) {
       r.crash_loop ? "true" : "false", r.watchdog_enabled ? "true" : "false",
       (unsigned long)commemul_getOverruns(), (unsigned long)bytes_dropped,
       (unsigned long)usbcdc_dropped);
+
+  // Wi-Fi supervision (EPIC-14). power_save is read back from the radio, not
+  // the value we asked for: the driver reapplies its own default on every
+  // bring-up, so the only honest answer is what the chip reports.
+  uint32_t pm = 0;
+  char pm_str[16];
+  if (network_getPowerSaveMode(&pm)) {
+    snprintf(pm_str, sizeof(pm_str), "%lu", (unsigned long)pm);
+  } else {
+    snprintf(pm_str, sizeof(pm_str), "null");
+  }
+  fits = fits && body_appendf(body, sizeof(body), &len,
+                              ",\"wifi\":{\"link_up\":%s,\"power_save\":%s,"
+                              "\"rejoins\":%lu,\"unreachable\":%lu}",
+                              network_isLinkHealthy() ? "true" : "false",
+                              pm_str,
+                              (unsigned long)network_getRejoinAttempts(),
+                              (unsigned long)network_getProbeFailures());
 #if LWIP_STATS && MEM_STATS && MEMP_STATS
   const struct stats_mem *pools[] = {
       &lwip_stats.mem, lwip_stats.memp[MEMP_PBUF_POOL],

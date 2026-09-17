@@ -48,6 +48,50 @@ static void network_resetRuntimeState(void) {
 #endif
 }
 
+// Power saving is off, always, and re-applied after every bring-up because the
+// driver puts it back (see the comment in network_wifiInit). The value is read
+// back rather than assumed, and reported by the health endpoint.
+static uint32_t wifiPmReadback = 0;
+static bool wifiPmReadbackValid = false;
+
+static void network_applyNoPowerSave(void) {
+  if (!cyw43Initialized) {
+    return;
+  }
+  cyw43_wifi_pm(&cyw43_state, CYW43_NONE_PM);
+  uint32_t pm = 0;
+  if (cyw43_wifi_get_pm(&cyw43_state, &pm) == 0) {
+    wifiPmReadback = pm;
+    wifiPmReadbackValid = true;
+    if (pm != CYW43_NONE_PM) {
+      DPRINTF("WiFi power save: asked for 0x%08lx, radio reports 0x%08lx\n",
+              (unsigned long)CYW43_NONE_PM, (unsigned long)pm);
+    } else {
+      DPRINTF("WiFi power save: off (0x%08lx)\n", (unsigned long)pm);
+    }
+  } else {
+    wifiPmReadbackValid = false;
+    DPRINTF("WiFi power save: could not read the mode back\n");
+  }
+}
+
+bool network_getPowerSaveMode(uint32_t *pm) {
+  // Read it from the radio every time. A value cached at bring-up would go on
+  // claiming power saving was off however the mode changed afterwards, which
+  // is the opposite of what this report is for.
+  if (!cyw43Initialized) {
+    return false;
+  }
+  uint32_t live = 0;
+  if (cyw43_wifi_get_pm(&cyw43_state, &live) != 0) {
+    return false;
+  }
+  wifiPmReadback = live;
+  wifiPmReadbackValid = true;
+  *pm = live;
+  return true;
+}
+
 static void network_resetStaInterface(struct netif *nif) {
 #if LWIP_MDNS_RESPONDER
   if (mdnsStaRegistered) {
@@ -458,34 +502,20 @@ int network_wifiInit(wifi_mode_t mode) {
     wifiCurrentMode = WIFI_MODE_AP;
   }
 
-  // Setting the power management
-  uint32_t pmValue = NETWORK_POWER_MGMT_DISABLED;  // 0: Disable PM
-  SettingsConfigEntry *pmEntry =
-      settings_find_entry(gconfig_getContext(), PARAM_WIFI_POWER);
-  if (pmEntry != NULL) {
-    pmValue = strtoul(pmEntry->value, NULL, HEX_BASE);
-  }
-  if (pmValue < NETWORK_POWER_MGMT_MAX_OPTIONS) {
-    switch (pmValue) {
-      case 0:
-        pmValue = NETWORK_POWER_MGMT_DISABLED;  // DISABLED_PM
-        break;
-      case 1:
-        pmValue = CYW43_PERFORMANCE_PM;  // PERFORMANCE_PM
-        break;
-      case 2:
-        pmValue = CYW43_AGGRESSIVE_PM;  // AGGRESSIVE_PM
-        break;
-      case 3:
-        pmValue = CYW43_DEFAULT_PM;  // DEFAULT_PM
-        break;
-      default:
-        pmValue = CYW43_NO_POWERSAVE_MODE;  // NO_POWERSAVE_MODE
-        break;
-    }
-  }
-  DPRINTF("Setting power management to: %08x\n", pmValue);
-  cyw43_wifi_pm(&cyw43_state, pmValue);
+  // PARAM_WIFI_POWER is deliberately ignored (EPIC-14 STORY-02, D-07). Two
+  // reasons: it never reached the radio anyway, and no value of it is wanted.
+  //
+  // It never arrived because every connect calls network_resetStaInterface,
+  // which disables and re-enables STA mode. Disabling clears the only
+  // interface bit, so the re-enable runs cyw43_wifi_set_up with itf_state 0,
+  // and that path applies CYW43_DEFAULT_PM unconditionally
+  // (cyw43_ctrl.c:558-561) -- CYW43_PERFORMANCE_PM, a PM2 power-save mode.
+  // Whatever this function had set was overwritten before the first packet.
+  //
+  // And it is not wanted because this device answers an Atari that is waiting
+  // on the cartridge bus: a radio that sleeps between beacons adds latency to
+  // every reply for no benefit on a mains-powered board.
+  network_applyNoPowerSave();
   return 0;
 }
 #endif
@@ -680,6 +710,9 @@ static wifi_sta_conn_process_status_t network_beginStaConnect(void) {
   // connect attempt (mDNS service, stale IP/status).
   struct netif *nif = &cyw43_state.netif[CYW43_ITF_STA];
   network_resetStaInterface(nif);
+  // The re-enable inside that reset just put CYW43_DEFAULT_PM back, so this
+  // has to run after it, on every boot attempt and every rejoin alike.
+  network_applyNoPowerSave();
 
   // Hostname is optional; PARAM_HOSTNAME may be missing entirely.
   SettingsConfigEntry *hostnameEntry =

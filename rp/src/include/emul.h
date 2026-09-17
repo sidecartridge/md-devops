@@ -41,6 +41,10 @@ void emul_start();
 // reachable stand-in for the silent failure, which cannot be produced on
 // demand (EPIC-14 STORY-01).
 #define DEVHOOKS_APP_WIFI_FAKE_GATEWAY 5
+// Debug builds only. Puts the radio back into the PM2 power-save mode the
+// driver applies by default, so the cost of power saving can be measured
+// against the no-power-save default (EPIC-14 STORY-02).
+#define DEVHOOKS_APP_WIFI_POWERSAVE 6
 
 /**
  * @brief Whether the user picked Runner mode at boot ([U] in the
