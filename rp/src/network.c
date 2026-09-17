@@ -92,6 +92,106 @@ bool network_getPowerSaveMode(uint32_t *pm) {
   return true;
 }
 
+static char *network_trim_ascii_spaces(char *text);
+
+// --- Static TCP/IP validation (EPIC-14 STORY-03) ---
+//
+// The static branch used to dereference settings_find_entry(...)->value for the
+// address, netmask and gateway with no NULL check, so a global config missing
+// any of the three faulted before the setup menu could come up -- with no way
+// to fix the setting, because the menu is where you fix it. Values also went
+// straight into ipaddr_addr(), which accepts "10" and "1.2" as addresses.
+//
+// Anything missing or malformed now falls back to DHCP and says so, which is
+// recoverable; a fault is not.
+static bool staticConfigRejected = false;
+static char staticConfigReason[40] = "";
+
+bool network_getStaticConfigRejected(const char **reason) {
+  if (reason != NULL) {
+    *reason = staticConfigReason;
+  }
+  return staticConfigRejected;
+}
+
+static void network_rejectStaticConfig(const char *reason) {
+  staticConfigRejected = true;
+  snprintf(staticConfigReason, sizeof(staticConfigReason), "%s", reason);
+  DPRINTF("Static IP rejected (%s); falling back to DHCP\n", reason);
+}
+
+// Four decimal octets and nothing else. Deliberately stricter than
+// ipaddr_addr(), which would take "10" or "1.2".
+static bool network_parseDottedQuad(const char *text, ip_addr_t *out) {
+  if (text == NULL) {
+    return false;
+  }
+  uint32_t octets[4] = {0};
+  int count = 0;
+  const char *p = text;
+  while (*p != '\0' && count < 4) {
+    if (*p < '0' || *p > '9') {
+      return false;
+    }
+    uint32_t value = 0;
+    int digits = 0;
+    while (*p >= '0' && *p <= '9') {
+      value = (value * 10u) + (uint32_t)(*p - '0');
+      digits++;
+      if (digits > 3 || value > 255u) {
+        return false;
+      }
+      p++;
+    }
+    octets[count++] = value;
+    if (*p == '.') {
+      p++;
+      if (*p == '\0') {
+        return false;  // trailing dot
+      }
+    } else if (*p != '\0') {
+      return false;
+    }
+  }
+  if (count != 4 || *p != '\0') {
+    return false;
+  }
+  IP4_ADDR(out, octets[0], octets[1], octets[2], octets[3]);
+  return true;
+}
+
+// Reads one setting as a dotted quad. Returns false with the reason already
+// reported when the key is missing, empty or malformed.
+static bool network_readDottedQuad(const char *key, const char *what,
+                                   ip_addr_t *out) {
+  SettingsConfigEntry *entry = settings_find_entry(gconfig_getContext(), key);
+  if (entry == NULL || entry->value[0] == '\0') {
+    char reason[40];
+    snprintf(reason, sizeof(reason), "no %s", what);
+    network_rejectStaticConfig(reason);
+    return false;
+  }
+  char buf[NETWORK_MAX_STRING_LENGTH];
+  snprintf(buf, sizeof(buf), "%s", entry->value);
+  if (!network_parseDottedQuad(network_trim_ascii_spaces(buf), out)) {
+    char reason[40];
+    snprintf(reason, sizeof(reason), "bad %s", what);
+    network_rejectStaticConfig(reason);
+    return false;
+  }
+  return true;
+}
+
+// A netmask has to be a run of ones followed by a run of zeros.
+static bool network_netmaskIsContiguous(const ip_addr_t *mask) {
+  uint32_t host = lwip_ntohl(ip4_addr_get_u32(ip_2_ip4(mask)));
+  if (host == 0u) {
+    return false;
+  }
+  uint32_t inverted = ~host;
+  return (inverted & (inverted + 1u)) == 0u;
+}
+
 static void network_resetStaInterface(struct netif *nif) {
 #if LWIP_MDNS_RESPONDER
   if (mdnsStaRegistered) {
@@ -770,16 +870,39 @@ static wifi_sta_conn_process_status_t network_beginStaConnect(void) {
     DPRINTF("DHCP enabled\n");
   } else {
     DPRINTF("Static IP enabled\n");
-    dhcp_stop(nif);
+    // Validate everything before touching the interface, so a bad setting
+    // leaves DHCP running instead of half-applying a broken configuration.
     ip_addr_t ipaddr;
     ip_addr_t netmask;
     ip_addr_t gwy;
-    ipaddr.addr = ipaddr_addr(
-        settings_find_entry(gconfig_getContext(), PARAM_WIFI_IP)->value);
-    netmask.addr = ipaddr_addr(
-        settings_find_entry(gconfig_getContext(), PARAM_WIFI_NETMASK)->value);
-    gwy.addr = ipaddr_addr(
-        settings_find_entry(gconfig_getContext(), PARAM_WIFI_GATEWAY)->value);
+    bool ok = network_readDottedQuad(PARAM_WIFI_IP, "IP", &ipaddr) &&
+              network_readDottedQuad(PARAM_WIFI_NETMASK, "netmask", &netmask) &&
+              network_readDottedQuad(PARAM_WIFI_GATEWAY, "gateway", &gwy);
+    if (ok && !network_netmaskIsContiguous(&netmask)) {
+      network_rejectStaticConfig("bad netmask");
+      ok = false;
+    }
+    if (ok) {
+      uint32_t host = lwip_ntohl(ip4_addr_get_u32(ip_2_ip4(&ipaddr)));
+      if (host == 0u || host == 0xFFFFFFFFu || (host >> 24) >= 224u) {
+        network_rejectStaticConfig("unusable IP");
+        ok = false;
+      }
+    }
+    if (ok && !ip4_addr_isany_val(*ip_2_ip4(&gwy))) {
+      uint32_t m = ip4_addr_get_u32(ip_2_ip4(&netmask));
+      if ((ip4_addr_get_u32(ip_2_ip4(&gwy)) & m) !=
+          (ip4_addr_get_u32(ip_2_ip4(&ipaddr)) & m)) {
+        network_rejectStaticConfig("gateway off subnet");
+        ok = false;
+      }
+    }
+    if (!ok) {
+      goto static_ip_done;  // DHCP stays on; the menu says why
+    }
+    staticConfigRejected = false;
+    staticConfigReason[0] = '\0';
+    dhcp_stop(nif);
     netif_set_addr(nif, &ipaddr, &netmask, &gwy);
     DPRINTF("IP: %s\n", ipaddr_ntoa(&ipaddr));
     DPRINTF("Netmask: %s\n", ipaddr_ntoa(&netmask));
@@ -826,6 +949,7 @@ static wifi_sta_conn_process_status_t network_beginStaConnect(void) {
         }
       }
     }
+  static_ip_done:;
   }
   netif_set_up(nif);
 

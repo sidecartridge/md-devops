@@ -45,6 +45,13 @@ void emul_start();
 // driver applies by default, so the cost of power saving can be measured
 // against the no-power-save default (EPIC-14 STORY-02).
 #define DEVHOOKS_APP_WIFI_POWERSAVE 6
+// Debug builds only. Overrides the global Wi-Fi settings **in memory only**
+// (settings_put_* does not touch flash; only settings_save does) so the static
+// TCP/IP validation can be exercised without rewriting the user's config -- a
+// reboot restores it. Payload word 0 picks the case: 0 invalid address,
+// 1 missing address, 2 non-contiguous netmask, 3 gateway off subnet
+// (EPIC-14 STORY-03).
+#define DEVHOOKS_APP_WIFI_BAD_STATIC 7
 
 /**
  * @brief Whether the user picked Runner mode at boot ([U] in the

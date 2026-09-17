@@ -279,6 +279,15 @@ uint32_t network_getProbeFailures(void);
 bool network_getPowerSaveMode(uint32_t* pm);
 
 /**
+ * @brief True when a static TCP/IP configuration was rejected and DHCP is in
+ *        use instead.
+ *
+ * @param reason Optional; receives a short description ("no IP", "bad
+ *               netmask", "gateway off subnet", ...).
+ */
+bool network_getStaticConfigRejected(const char** reason);
+
+/**
  * @brief Returns the configured WiFi mode as text.
  *
  * @return "STA", "AP", or "UNKNOWN".
