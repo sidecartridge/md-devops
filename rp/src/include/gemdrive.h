@@ -101,6 +101,16 @@
 #define GEMDRIVE_WRITE_BYTES_OFFSET 0x10F0      // 4 bytes (bytes written)
 #define GEMDRIVE_WRITE_BUFFER_OFFSET 0x10F4     // 1024 bytes
 #define GEMDRIVE_WRITE_BUFFER_SIZE 1024
+
+#if defined(_DEBUG) && (_DEBUG != 0)
+/**
+ * @brief Debug-only: stall the answer to the next `chunks` write chunks.
+ *
+ * The data is committed first, so this reproduces a lost answer rather than a
+ * lost write (EPIC-15 STORY-05).
+ */
+void gemdrive_setWriteStall(uint16_t chunks, uint16_t deciseconds);
+#endif
 // Report a write that took longer than this (debug builds only): the ST waits
 // about 300 ms for its answer before retrying the chunk.
 #define GEMDRIVE_SLOW_WRITE_US 20000

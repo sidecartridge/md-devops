@@ -812,6 +812,14 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
       DPRINTF("devhooks: slow connect returned %d\n", (int)rc);
       return 1;
     }
+    case DEVHOOKS_APP_GEMDRIVE_STALL: {
+      uint16_t chunks = (payloadSize >= 2u) ? payload[0] : 1u;
+      uint16_t ds = (payloadSize >= 4u) ? payload[1] : 0u;
+      gemdrive_setWriteStall(chunks, ds);
+      DPRINTF("devhooks: stalling the next %u write chunk(s) by %u ds\n",
+              (unsigned)chunks, (unsigned)ds);
+      return 1;
+    }
     case DEVHOOKS_APP_COUNTDOWN_STOP:
       haltCountdown = true;
       return 1;
