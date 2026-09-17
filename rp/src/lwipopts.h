@@ -36,9 +36,25 @@
 #define MEM_OVERFLOW_CHECK 0
 
 #define MEMP_NUM_PBUF 8
-#define MEMP_NUM_TCP_PCB 4
+// Measured on hardware with DEVOPS_LWIP_STATS (EPIC-13 STORY-04, 2026-09-16,
+// build b7f138f): a 4 MB upload, a 4 MB download, a listing, a 40-request
+// burst, two concurrent clients and 20 aborted transfers, with no pool
+// reporting a single allocation failure.
+//
+// tcp_pcb peaked at 4 of 4 and stayed there: the server closes every
+// connection itself, so each request leaves a pcb in TIME_WAIT for 2 x TCP_MSL
+// and the pool is permanently full between requests. 6 slots is the 2 HTTP
+// connections plus the debug stream plus headroom, and TCP_MSL below drains
+// the rest six times faster. (Listening pcbs come from their own pool.)
+#define MEMP_NUM_TCP_PCB 6
+// Peaked at 9 of 16 with two clients and aborted transfers. TCP_SND_QUEUELEN
+// is 8 per connection, so 16 is what two senders can queue; left as is.
 #define MEMP_NUM_TCP_SEG 16
 #define MEMP_NUM_ARP_QUEUE 2
+// Peaked at 2 of 12 even during 4 MB transfers: in poll mode a received pbuf
+// is handled and freed before the driver allocates the next one, so the pool
+// is only really used for out-of-order segments. Kept at 12 anyway -- this is
+// the receive path, and a pool that runs dry drops packets off the air.
 #define PBUF_POOL_SIZE 12
 #define LWIP_ARP 1
 #define LWIP_ETHERNET 1
@@ -47,6 +63,15 @@
 // IGMP is required by the mDNS responder for multicast group membership.
 #define LWIP_IGMP 1
 #define TCP_MSS 1460
+// lwIP's default MSL is 60 s, so a closed connection holds its pcb for 2
+// minutes of TIME_WAIT and the 4-slot pool measured full after a handful of
+// requests (EPIC-13 STORY-04). 10 s matches Booster and drains it in 20 s. The
+// risk MSL guards against -- a delayed segment from an old connection landing
+// on a new one with the same port pair -- needs a reused ephemeral port within
+// the window, which a LAN client does not do.
+#define TCP_MSL 10000UL
+// Peak lwIP heap use (PBUF_RAM, from libc malloc here) was 12,920 bytes across
+// the same scenarios; the 4 x MSS window costs nothing extra in .bss.
 #define TCP_WND (4 * TCP_MSS)
 #define TCP_SND_BUF (4 * TCP_MSS)
 #define TCP_SND_QUEUELEN ((2 * (TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS))

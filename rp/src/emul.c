@@ -445,6 +445,15 @@ void emul_resetRunnerSession(void) {
   runnerLastCdErrno = 0;
   runnerLastHasResErrno = false;
   runnerLastResErrno = 0;
+  // The session resets on the Runner's HELLO, which means the ST has cold
+  // booted and owns nothing: no basepage, no failed unload to report. Keeping
+  // the mirror across that left the RP certain a program was still loaded, so
+  // every later load answered 409 and the unload that would have cleared it
+  // answered 422 -- the ST rightly refuses to Mfree a basepage from a previous
+  // life (EPIC-13 STORY-08).
+  runnerPendingBasepage = 0;
+  runnerLoadHasErrno = false;
+  runnerLoadErrno = 0;
   runnerMeminfoPending = false;
   runnerMeminfoHasSnapshot = false;
   runnerAdvancedInstalled = false;
