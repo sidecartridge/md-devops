@@ -1041,7 +1041,10 @@ wifi_sta_conn_process_status_t network_wifiStaConnect() {
         network_wifiConnStatus(&wifiConnStatusTime, wifiConnPollingInterval);
 #if PICO_CYW43_ARCH_POLL
     network_safePoll();
-    cyw43_arch_wait_for_work_until(make_timeout_time_ms(2 * SEC_TO_MS));
+    // The polling callback below is the only thing servicing the ST, the
+    // terminal, USB and SELECT while this loop runs, so it has to turn at the
+    // main loop's rate rather than sleeping for seconds (EPIC-14 STORY-04).
+    cyw43_arch_wait_for_work_until(make_timeout_time_ms(NETWORK_CONNECT_POLL_MS));
 #else
     sleep_ms(NETWORK_POLLING_INTERVAL);
 #endif

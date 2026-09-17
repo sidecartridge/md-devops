@@ -51,6 +51,8 @@
 // Core 1 worker plan (chandler + tud_task + usbcdc_drain on a
 // dedicated core) is parked in the backlog — escalate
 // there only if 100 Hz proves insufficient.
+// Main loop cadence. NETWORK_CONNECT_POLL_MS (network.h) must match: the
+// blocking connect loop stands in for this loop while it runs.
 #define SLEEP_LOOP_MS 10
 
 enum {
@@ -550,6 +552,9 @@ static absolute_time_t lastCountdownTick;
 static void emul_pollTick(void) {
   health_feed();
   chandler_loop();
+  // SELECT too: this is what runs instead of the main loop for as long as a
+  // connect takes, and the button has to work throughout (EPIC-14 STORY-04).
+  select_checkPushReset();
   usbcdc_drain();
   term_loop();
 }
@@ -776,6 +781,16 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
       DPRINTF("devhooks: static config case %u staged in memory\n",
               (unsigned)which);
       (void)cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+      return 1;
+    }
+    case DEVHOOKS_APP_WIFI_SLOW_CONNECT: {
+      settings_put_string(gconfig_getContext(), PARAM_WIFI_SSID,
+                          "NO_SUCH_AP_XYZ");
+      DPRINTF("devhooks: slow connect starting (SSID staged in memory)\n");
+      network_setPollingCallback(emul_pollTick);
+      wifi_sta_conn_process_status_t rc = network_wifiStaConnect();
+      network_setPollingCallback(NULL);
+      DPRINTF("devhooks: slow connect returned %d\n", (int)rc);
       return 1;
     }
     case DEVHOOKS_APP_COUNTDOWN_STOP:
@@ -2021,7 +2036,25 @@ void emul_start() {
   // initialized
   preinit();
 
-  // 6. Init the network, if needed
+  // 6. Configure the SELECT button and register the reset callbacks.
+  //    Short press → reset_device. Long press (≥ SELECT_LONG_RESET ms)
+  //    → reset_deviceAndEraseFlash. Edge detection + debounce + long-
+  //    press timing run in the foreground via select_checkPushReset(),
+  //    polled from the main loop below and from emul_pollTick during a
+  //    connect — Core 1 stays idle here, since launching it interferes
+  //    with the cyw43_arch_wait_for_work_until poll the main loop relies
+  //    on for Wi-Fi service.
+  //
+  //    This has to come **before** the network, not after it: the boot
+  //    connect can take three attempts of 30 s, and until the button is
+  //    configured it does nothing at all. A device that cannot reach its
+  //    access point was exactly the case where a factory reset was needed
+  //    and could not be asked for (EPIC-14 STORY-04).
+  select_configure();
+  select_setResetCallback(reset_device);
+  select_setLongResetCallback(reset_deviceAndEraseFlash);
+
+  // 7. Init the network, if needed
   // It's always a good idea to wait for the network to be ready
   // Get the WiFi mode from the settings
   // If you are developing code that does not use the network, you can
@@ -2087,17 +2120,6 @@ void emul_start() {
       DPRINTF("WiFi mode is AP. No initializing.\n");
     }
   }
-
-  // 7. Configure the SELECT button and register the reset callbacks.
-  //    Short press → reset_device. Long press (≥ SELECT_LONG_RESET ms)
-  //    → reset_deviceAndEraseFlash. Edge detection + debounce + long-
-  //    press timing run in the foreground via select_checkPushReset(),
-  //    polled from the main loop below — Core 1 stays idle here, since
-  //    launching it interferes with the cyw43_arch_wait_for_work_until
-  //    poll the main loop relies on for Wi-Fi service.
-  select_configure();
-  select_setResetCallback(reset_device);
-  select_setLongResetCallback(reset_deviceAndEraseFlash);
 
   // Crash-loop guard: after repeated crash reboots, stay in the menu
   // instead of autobooting into whatever keeps crashing.
