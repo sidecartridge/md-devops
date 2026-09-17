@@ -99,10 +99,17 @@ Clients can switch on `code` reliably. All defined symbols:
 `bad_request`, `bad_path`, `bad_query`, `name_too_long`, `not_found`,
 `is_directory`, `is_file`, `conflict`, `length_required`,
 `payload_too_large`, `range_invalid`, `bad_json`, `unprocessable`,
-`unsupported_media`, `method_not_allowed`, `busy`, `no_sd_card`, `disk_error`,
+`unsupported_media`, `method_not_allowed`, `busy`, `no_sd_card`,
+`too_many_open_files`, `disk_error`,
 `insufficient_memory`, `internal_error`, `runner_inactive`, `gateway_timeout`, `no_snapshot`,
 `wrong_hook`, `ram_overflow`, `pexec_failed`, `mfree_failed`,
 `program_already_loaded`, `no_program_loaded`.
+
+`too_many_open_files` — FatFs's lock table is full. It is shared with GEMDRIVE
+(`FF_FS_LOCK`, 28 entries: 8 GEMDRIVE files, 16 GEMDRIVE searches and 2 HTTP
+connections holding a file and a directory each), so this usually means the ST
+is holding its share right now and the operation is worth retrying rather than
+a fault.
 
 `no_sd_card` — there is no usable SD card mounted. **Every** endpoint that
 needs the card answers this the same way: `volume`, listings, downloads,
@@ -179,7 +186,8 @@ cadence.
   "watchdog": true,
   "rom3_overruns": 0,
   "debugcap_dropped": 0,
-  "usbcdc_dropped": 0
+  "usbcdc_dropped": 0,
+  "wifi": { "link_up": true, "power_save": 16, "rejoins": 0, "unreachable": 0 }
 }
 ```
 
@@ -192,6 +200,10 @@ cadence.
 | `heap.free` | Bytes `malloc` can still use: never-claimed heap plus free chunks inside the claimed part. |
 | `heap.min_free` | Lowest `heap.free` seen since boot, sampled every 100 ms in the main loop and on every health request. |
 | `heap.sbrk_high_water` | Most heap ever claimed from the system, in bytes. |
+| `wifi.link_up` | `true` when the station is associated and lwIP has an address. |
+| `wifi.power_save` | The power-management word **read back from the radio on every request**, not the value asked for. `16` is `CYW43_NONE_PM`, no power saving, which is what the firmware always applies. Anything else means the driver put its own default back. |
+| `wifi.rejoins` | Joins the link supervisor has armed since boot, after a link loss or an unreachable network. |
+| `wifi.unreachable` | Times the gateway probe concluded the network was gone while the link still claimed to be up. |
 | `stack.reserved` | Core-0 stack size the linker reserves. |
 | `stack.high_water` | Deepest core-0 stack use since boot. It can exceed `reserved`: the stack then runs into the unused core-1 stack area below it. |
 | `stack.painted` | Bytes below the stack top that are measured. |

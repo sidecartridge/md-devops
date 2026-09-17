@@ -40,7 +40,7 @@ cd target/atarist && ./build.sh "$(pwd)" release
 The top-level `./build.sh` also re-pins SDK submodules and rebuilds the full RP firmware (CMake configure + lwIP/cyw43/mbedtls + UF2), which is minutes of work for a m68k syntax check. The atarist script alone enforces the 10 KB `BOOT.BIN` cap and prints `Cartridge code: N / 10240 bytes` — exactly what the iteration loop needs. Reserve the top-level build for RP-side changes or both-sides changes.
 
 ### Build gotchas
-- **Both build types are CMake `Release` (`-O3`, `NDEBUG`).** `release` sets `DEBUG_MODE=0`; `debug` sets `DEBUG_MODE=1`, which only adds `DPRINTF` traces on the UART console (GPIO 0/1, **921,600 baud**; at the SDK's 115,200 the boot traces delayed the cartridge enough that a power-cycled ST booted into GEM). `DEBUG_BUFFERED_CONSOLE` in `rp/src/include/debug.h` (default 1) queues `DPRINTF` text in a 4 KB RAM ring sent by the UART transmit interrupt, so traces no longer stall the firmware; set it to 0 for the blocking console when chasing a hang, since text still queued when the firmware hangs is lost. Up to v1.0.1beta every build was `MinSizeRel`, because `Release` broke at runtime; v1.1.0 is making `Release` work. `RP_CMAKE_BUILD_TYPE=MinSizeRel` overrides only the CMake type, to compare against that configuration. A fixed `RELEASE_DATE` in the environment makes two builds of one commit byte-identical.
+- **Both build types are CMake `Release` (`-O3`, `NDEBUG`).** `release` sets `DEBUG_MODE=0`; `debug` sets `DEBUG_MODE=1`, which only adds `DPRINTF` traces on the UART console (GPIO 0/1, **921,600 baud**; at the SDK's 115,200 the boot traces delayed the cartridge enough that a power-cycled ST booted into GEM). `DEBUG_BUFFERED_CONSOLE` in `rp/src/include/debug.h` (default 1) queues `DPRINTF` text in a 4 KB RAM ring sent by the UART transmit interrupt, so traces no longer stall the firmware; set it to 0 for the blocking console when chasing a hang, since text still queued when the firmware hangs is lost. Up to v1.0.1beta every build was `MinSizeRel`, because `Release` broke at runtime. **v1.1.0 ships `Release`**: both types pass the hardware gate (EPIC-16 STORY-01) — smoke, 4 MB transfers, aborted clients, and forced panic / HardFault / watchdog recovery. `RP_CMAKE_BUILD_TYPE=MinSizeRel` overrides only the CMake type, to compare against that configuration; it warns loudly, no workflow sets it, and it is comparison-only. A fixed `RELEASE_DATE` in the environment makes two builds of one commit byte-identical.
 - `rp.elf` keeps its symbols (no `--strip-all`); the flashed image is the same either way. In VS Code, pick the `release` or `debug` variant from `.vscode/cmake-variants.yaml`, which sets `DEBUG_MODE` and the development UUID.
 - `CHARACTER_GAP_MS` must remain defined (700) in `rp/src/include/blink.h` — removing it breaks the RP build.
 - Harmless VASM warnings during the m68k build (`target data type overflow`, `trailing garbage after option -D`) can be ignored.
@@ -88,11 +88,14 @@ See `programming.md` for the full table and budget rules.
 - `emul.c` / `emul.h` — the application's main loop and entry point. This is where to add new features.
 - `romemul.c` / `romemul.pio` — PIO programs and the runtime that emulates the cartridge ROM/RAM bus to the Atari (driven by `READ_*` / `WRITE_*` GPIOs defined in `include/constants.h`).
 - `gconfig.c` / `aconfig.c` — global vs per-app configuration stored in dedicated flash sectors, on top of `settings/` (a key-value store).
-- `network.c`, `httpc/`, `download.c` — Wi-Fi (CYW43, lwIP poll mode), HTTPS-capable HTTP client, firmware download support.
+- `network.c`, `httpc/`, `download.c` — Wi-Fi (CYW43, lwIP poll mode), HTTPS-capable HTTP client, firmware download support. The radio never sleeps: `PARAM_WIFI_POWER` is deliberately ignored and `CYW43_NONE_PM` is re-applied after every bring-up, because the driver puts its own default back on each STA re-enable (EPIC-14 STORY-02). `network_superviseLink()` runs from the main loop and rejoins on its own after a link loss, backing off 5 s to 60 s; it also probes the default gateway by ARP every 60 s, because both `cyw43_tcpip_link_status()` and `cyw43_wifi_link_status()` can report a healthy link when the radio has left the network.
+- `lwipopts.h` — the pool sizes carry the measurement that justifies them (EPIC-13 STORY-04). `TCP_MSL` is 10 s, not lwIP's 60, because the server closes every connection and a 2-minute TIME_WAIT kept the pcb pool permanently full.
 - `sdcard.c`, `hw_config.c` — FatFs over SPI/SDIO via the bundled `fatfs-sdk`.
 - `display.c`, `display_term.c`, `term.c`, `u8g2/` — terminal-style display rendered into the Atari framebuffer at `$FAE0C0` and/or a local OLED.
 - `blink.c`, `select.c`, `reset.c`, `tprotocol.c` — LED Morse status, SELECT-button handling, soft reset/jump-to-booster, transport protocol primitives.
-- `health.c` — watchdog (8 s), crash and hang reboots with the reason kept in watchdog scratch registers 0-3, crash-loop guard, stack and heap high-water marks. Reported by `GET /api/v1/system/health`. `sd_timeouts.c` overrides fatfs-sdk's weak SD timeout table so a failing card cannot outlast the watchdog.
+- `health.c` — watchdog (8 s), crash and hang reboots with the reason kept in watchdog scratch registers 0-3, crash-loop guard, stack and heap high-water marks. Reported by `GET /api/v1/system/health` and shown on the menu's top line (`Recovered: hang in main_loop x2`). `sd_timeouts.c` overrides fatfs-sdk's weak SD timeout table so a failing card cannot outlast the watchdog.
+- **`FF_FS_LOCK` is 28** (`rp/src/ff/ffconf.h`), not the default 8: it counts open files *and* open non-root directories, shared between GEMDRIVE (8 files + 16 searches) and the HTTP server (2 connections × a `FIL` and a `DIR`). `FR_TOO_MANY_OPEN_FILES` maps to GEMDOS `ENHNDL` and HTTP `503 too_many_open_files`.
+- **The SD card is remounted automatically.** It is only mounted at boot, so a pulled card used to stay dead until a reset: with card-detect disabled nothing marks the drive uninitialised, and FatFs will not re-init a volume that is still registered. `sdcard_pollRemount()` reads sector 0 every 2 s to notice a pull (FatFs itself keeps serving from cache and reports no error), then `deinit()`s the card and re-mounts. While no card is mounted every SD endpoint answers `503 no_sd_card` and the menu refuses `[G]` and `[U]`.
 
 ### Memory layout (`rp/src/memmap_rp.ld`)
 The RP2040's 2 MB flash is sliced into named regions, and code is responsible for not stomping on them:
@@ -105,8 +108,13 @@ The RP2040's 2 MB flash is sliced into named regions, and code is responsible fo
 | `CONFIG_FLASH` | `0x101E0000` | 120 K | 30 sectors of per-app config |
 | `GLOBAL_LOOKUP_FLASH` | `0x101FE000` | 4 K | UUID → config-sector lookup |
 | `GLOBAL_CONFIG_FLASH` | `0x101FF000` | 4 K | Global config |
-| `RAM` | `0x20000000` | 128 K | Normal RAM |
-| `ROM_IN_RAM` | `0x20020000` | 128 K | ROM data mirrored to RAM for fast bus access |
+| `RAM` | `0x20000000` | 192 K | Normal RAM (EPIC-12 reclaimed the upper 64 K) |
+| `ROM_IN_RAM` | `0x20030000` | 64 K | The cartridge window the ST sees at `$FA0000` |
+| `SCRATCH_X` / `SCRATCH_Y` | `0x20040000` / `0x20041000` | 4 K each | Core-local scratch |
+
+Core 0's stack is 16 KB at the top of `RAM` (`__StackTop = 0x20030000`), guarded by the MPU
+(`PICO_USE_STACK_GUARDS`), and the link fails if the heap floor and the stack would collide — three
+`ASSERT`s in `memmap_rp.ld`. Measured stack peak across the v1.1 work is about 3.3 KB.
 
 The build assumes Core 0 owns flash writes (`PICO_FLASH_ASSUME_CORE0_SAFE=1`). The PIO bus emulation runs hot — Core 0 also overclocks to 225 MHz at `VREG_VOLTAGE_1_10`.
 

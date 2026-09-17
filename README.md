@@ -116,6 +116,33 @@ The button is the canonical recovery path for any banner the
 firmware shows on the ST screen (e.g. the `Reloc/stack
 overlap` warning described below).
 
+### When there is no SD card
+
+GEMDRIVE emulates a drive from a folder on the microSD card, so without a
+working card there is nothing to emulate. The setup menu says so on the
+GEMDRIVE line — `SD: NO CARD` instead of `SD: mounted` — and `[G]` and `[U]`
+refuse to start, with *"Insert a working microSD card: GEMDRIVE needs one."*
+on the status line, rather than launching a mode with no drive behind it.
+
+Every API endpoint that needs the card answers `503 no_sd_card` while it is
+missing, including `volume` and directory listings.
+
+Insert a working card and the block clears by itself within a couple of
+seconds — no reset. The same applies to a card pulled while the device is
+running: it is noticed within about two seconds and remounted when it comes
+back.
+
+### When the network goes away
+
+The device rejoins by itself. A lost link is noticed either from lwIP or from
+a gateway probe the firmware sends every minute, and it then retries the join
+with a backoff from 5 seconds up to a minute, so the API and
+`<hostname>.local` come back without anyone touching the hardware.
+
+The radio runs at full power, with power saving off. Earlier versions always
+ran in power save regardless of the setting, which roughly quadrupled
+round-trip latency.
+
 ### When the Pico crashes or hangs
 
 The Pico reboots itself instead of freezing. A crash (a `panic` or a
