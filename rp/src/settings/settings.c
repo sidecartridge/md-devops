@@ -513,10 +513,16 @@ void settings_print(SettingsContext *ctx, char *buffer) {
         break;
     }
 
-    // Print in the format: "KEY (TYPE): Value\n"
+    // Print in the format: "KEY (TYPE): Value\n", except for secrets. Every
+    // caller of this sends the result to the debug console, and those logs get
+    // pasted into issues and chats, so a key whose name says it holds a
+    // password prints only whether one is set (EPIC-14 STORY-05).
+    const char *value = ctx->configData.entries[i].value;
+    if (strstr(ctx->configData.entries[i].key, "PASSWORD") != NULL) {
+      value = (value[0] != '\0') ? "<set>" : "<none>";
+    }
     len = snprintf(ptr, remaining, "%s (%s): %s\n",
-                   ctx->configData.entries[i].key, typeStr,
-                   ctx->configData.entries[i].value);
+                   ctx->configData.entries[i].key, typeStr, value);
 
     ptr += len;
     remaining = (len < remaining) ? (remaining - len) : 0;

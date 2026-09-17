@@ -471,7 +471,7 @@ int network_wifiInit(wifi_mode_t mode) {
     DPRINTF("SSID: %s\n", ssidStr);
 
     char passwordStr[WIFI_AP_PASS_MAX_LENGTH] = WIFI_AP_PASS;
-    DPRINTF("Password: %s\n", passwordStr);
+    DPRINTF("Password: %s\n", (passwordStr[0] != '\0') ? "<set>" : "<none>");
 
     int authInt = WIFI_AP_AUTH;  // WPA2_AES_PSK
 
@@ -867,8 +867,11 @@ static wifi_sta_conn_process_status_t network_beginStaConnect(void) {
     DPRINTF(
         "No password found in config. Trying to connect without password\n");
   }
-  DPRINTF("The password is: %s\n",
-          passwordValue != NULL ? passwordValue : "<null>");
+  // Never the password itself: these logs get pasted into issues and chats
+  // (EPIC-14 STORY-05). Whether one is set is all that helps when debugging.
+  DPRINTF("Password: %s\n",
+          (passwordValue != NULL && passwordValue[0] != '\0') ? "<set>"
+                                                              : "<none>");
 
   snprintf(wifiNetworkInfo.ssid, sizeof(wifiNetworkInfo.ssid), "%s", ssid->value);
   wifiNetworkInfo.auth_mode = (uint16_t)atoi(authMode->value);
@@ -878,7 +881,9 @@ static wifi_sta_conn_process_status_t network_beginStaConnect(void) {
   uint32_t authValue = getAuthPicoCode(atoi(authMode->value));
   int errorCode = 0;
   DPRINTF("Connecting to SSID=%s, password=%s, auth=%08x. ASYNC\n", ssid->value,
-          passwordValue != NULL ? passwordValue : "<null>", authValue);
+          (passwordValue != NULL && passwordValue[0] != '\0') ? "<set>"
+                                                              : "<none>",
+          authValue);
   errorCode =
       cyw43_arch_wifi_connect_async(ssid->value, passwordValue, authValue);
   if (errorCode != 0) {
