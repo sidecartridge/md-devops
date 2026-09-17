@@ -51,6 +51,10 @@ HTTP-management surface stitched on top.
 - **Live setup menu** — graphical status icons (Wi-Fi / SD / USB
   CDC / Adv Vector), animated countdown bar, USB CDC attach state
   refreshed live as you plug / unplug.
+- **Looks after itself** — a pulled microSD card is picked up again
+  when it comes back, the Wi-Fi rejoins on its own after a router
+  reboot, and a firmware crash or hang reboots the Pico into the
+  setup menu with the reason on screen instead of freezing.
 
 # ⚠️ Read before installing
 
@@ -123,6 +127,9 @@ working card there is nothing to emulate. The setup menu says so on the
 GEMDRIVE line — `SD: NO CARD` instead of `SD: mounted` — and `[G]` and `[U]`
 refuse to start, with *"Insert a working microSD card: GEMDRIVE needs one."*
 on the status line, rather than launching a mode with no drive behind it.
+
+The auto-launch countdown is refused the same way, so a device powered on
+without a card waits in the menu instead of booting into a broken drive.
 
 Every API endpoint that needs the card answers `503 no_sd_card` while it is
 missing, including `volume` and directory listings.
@@ -474,12 +481,13 @@ debug bytes.
 ```sh
 $ python3 cli/sidecart.py health
 version         : v1.1.0
+build           : c783b55 (release)
 uptime          : 312 s
-heap free       : 61240 / 118720 bytes
-heap min free   : 48812 bytes
-sbrk high-water : 72316 bytes
-stack high-water: 5324 bytes, 2048 reserved, 8192 measured
-code in RAM     : 71048 bytes
+heap free       : 40984 / 49852 bytes
+heap min free   : 27000 bytes
+sbrk high-water : 23808 bytes
+stack high-water: 3556 bytes, 16384 reserved, 16352 measured
+code in RAM     : 33512 bytes
 last reset      : power_on
 crash count     : 0
 watchdog        : on

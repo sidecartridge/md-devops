@@ -60,6 +60,12 @@ python3 cli/sidecart.py gemdrive rm SWITCHER.TOS
 - **One body-streaming request at a time.** A second concurrent
   download or upload returns `503 busy` with `Retry-After: 1`.
   Listings, ping, volume, and metadata mutations are not gated.
+- **Two connections at once, and a 20 s idle timeout.** A connection
+  that neither sends nor accepts data for 20 s is closed, so a client
+  that disappears mid-transfer frees the transfer lock and its file
+  handles instead of holding them until the device is reset. A slow
+  transfer that is still making progress is never cut off: the timer
+  is reset by bytes moving in either direction, not by the clock.
 - **Response always carries** `Content-Type`, `Content-Length` (or
   chunked listing), `Connection: close`, `Server: md-devops/<v>`.
   No `Date:` header — the device has no real-time clock.
@@ -89,7 +95,7 @@ python3 cli/sidecart.py gemdrive rm SWITCHER.TOS
 | `416 Range Not Satisfiable` | Range outside file bounds. Carries `Content-Range: bytes */<size>`. |
 | `422 Unprocessable Entity` | Malformed JSON body, missing required field, listing-on-file, rename-into-own-descendant. |
 | `500 Internal Server Error` | FatFs disk error. |
-| `503 Service Unavailable` | Body-stream lock held (`busy`), no usable SD card (`no_sd_card`), Runner busy with another command (`busy`), or `insufficient_memory`: FatFs could not allocate its working buffer, so the operation can be retried when memory frees up. Always carries `Retry-After: 1`. |
+| `503 Service Unavailable` | Body-stream lock held (`busy`), no usable SD card (`no_sd_card`), Runner busy with another command (`busy`), FatFs's lock table full (`too_many_open_files`), or `insufficient_memory`: FatFs could not allocate its working buffer, so the operation can be retried when memory frees up. Always carries `Retry-After: 1`. |
 | `504 Gateway Timeout` | Synchronous Runner endpoint exceeded its server-side spin-wait deadline (`gateway_timeout`). Per-endpoint deadlines: `runner load` 10 s; `runner unload` 5 s; `runner meminfo`, `runner adv/meminfo`, and each `runner adv/load` chunk 1 s. |
 
 ## Error code vocabulary
@@ -146,7 +152,7 @@ Returns the firmware version and uptime in seconds.
 
 **Success** (`200`):
 ```json
-{ "ok": true, "version": "v0.0.1dev", "uptime_s": 123 }
+{ "ok": true, "version": "v1.1.0", "uptime_s": 123 }
 ```
 
 **`curl`**:
@@ -178,11 +184,11 @@ cadence.
   "build": "b9b53cc",
   "debug": false,
   "uptime_s": 312,
-  "heap": { "total": 118720, "free": 61240, "min_free": 48812, "sbrk_high_water": 72316 },
-  "stack": { "reserved": 2048, "high_water": 5324, "painted": 8192, "overflow": false },
-  "code_in_ram": 71048,
+  "heap": { "total": 49852, "free": 40984, "min_free": 27000, "sbrk_high_water": 23808 },
+  "stack": { "reserved": 16384, "high_water": 3556, "painted": 16352, "overflow": false },
+  "code_in_ram": 33512,
   "reset": { "reason": "panic", "phase": null, "pc": "0x10012abc", "lr": null,
-             "sp": "0x20041e58", "crash_count": 1, "crash_loop": false },
+             "sp": "0x2002fe58", "crash_count": 1, "crash_loop": false },
   "watchdog": true,
   "rom3_overruns": 0,
   "debugcap_dropped": 0,
@@ -196,7 +202,7 @@ cadence.
 | `build` | Git commit the firmware was built from: `<sha7>`, or `<sha7>-dirty.<diff7>` with uncommitted changes (`<diff7>` hashes the diff, so the same changes always give the same ID). Also printed on the debug console at boot. |
 | `debug` | `true` for a `debug` build (`DPRINTF` traces on the console), `false` for `release`. |
 | `uptime_s` | Seconds since the RP booted. `ping` counts from when the HTTP server started instead. |
-| `heap.total` | Bytes between the end of BSS and the heap cap at the start of the cartridge window. |
+| `heap.total` | Bytes between the end of BSS and the bottom of the core-0 stack, which is where the heap is capped. |
 | `heap.free` | Bytes `malloc` can still use: never-claimed heap plus free chunks inside the claimed part. |
 | `heap.min_free` | Lowest `heap.free` seen since boot, sampled every 100 ms in the main loop and on every health request. |
 | `heap.sbrk_high_water` | Most heap ever claimed from the system, in bytes. |
@@ -205,7 +211,7 @@ cadence.
 | `wifi.rejoins` | Joins the link supervisor has armed since boot, after a link loss or an unreachable network. |
 | `wifi.unreachable` | Times the gateway probe concluded the network was gone while the link still claimed to be up. |
 | `stack.reserved` | Core-0 stack size the linker reserves. |
-| `stack.high_water` | Deepest core-0 stack use since boot. It can exceed `reserved`: the stack then runs into the unused core-1 stack area below it. |
+| `stack.high_water` | Deepest core-0 stack use since boot. The stack is 16 KB at the top of RAM and the MPU guards its bottom, so growing past `reserved` faults and reboots the device rather than reaching the heap. |
 | `stack.painted` | Bytes below the stack top that are measured. |
 | `stack.overflow` | `true` when the stack reached the bottom of the measured area, so the real depth is unknown and memory below it was overwritten. |
 | `code_in_ram` | Bytes of code and initialised data copied to RAM at boot. |

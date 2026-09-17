@@ -705,9 +705,9 @@ Example of the code that implemens the high level commands of the terminal. It a
 The memory mapping of the Multi-device board is defined in the file `rp/src/memmap_rp.ld` and it performs significant changes to the standard memory mapping of a RP2040 application. The memory mapping of the Multi-device board is:
 - FLASH: Reduced from the 2MBytes found in the Raspberry Pi Pico W boards to 1024Kbytes for the active microfirmware app.
 - RAM: Reduced from the 264KBytes found in the Raspberry Pi Pico W boards to **192Kbytes** (origin `0x20000000`, length `192K`).
-- SCRATCH_X: No changes.
-- SCRATCH_Y: No changes.
-- CONFIG_FLASH: FLASH memory reserved for the configuration parameters of the Multi-device board. 4Kbytes.
+- SCRATCH_X: No changes; core 1's stack still lives here.
+- SCRATCH_Y: Left unused. Core 0's stack is a 16 KB region at the top of `RAM` instead (`__StackTop = 0x20030000`), guarded at the bottom by the MPU, because the 2 KB the SDK reserves at the end of SCRATCH_Y is not enough for this firmware.
+- CONFIG_FLASH: FLASH memory reserved for the per-app configuration parameters. 120Kbytes at `0x101E0000`, 30 sectors of 4Kbytes, one per installed app. Two more 4Kbyte sectors sit above it: GLOBAL_LOOKUP_FLASH (`0x101FE000`, the app UUID to config-sector table) and GLOBAL_CONFIG_FLASH (`0x101FF000`).
 - ROM_IN_RAM: RAM memory reserved for the cartridge ROM4 image. **64Kbytes** at `0x20030000`. This is exactly one cartridge ROM bank; the second 64 KB bank is no longer mirrored to RAM since ROM3 is now used as a command channel rather than a data bank.
 
 The split between `RAM` (192K) and `ROM_IN_RAM` (64K) is fixed: the ROM4 read engine derives the address it serves from `__rom_in_ram_start__` (a symbol defined by the linker script), and changing the location or size of `ROM_IN_RAM` would require updating both the linker script and the C-side address shift in `init_romemul`.
