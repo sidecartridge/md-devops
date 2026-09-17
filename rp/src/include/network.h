@@ -45,6 +45,11 @@
 
 #define NETWORK_POLLING_INTERVAL 100  // 100 ms
 #define NETWORK_CONNECT_TIMEOUT 30    // 30 seconds
+// How long the blocking connect loop may wait per turn. It must match the main
+// loop's SLEEP_LOOP_MS (emul.c): while a connect runs, that loop is not
+// running, and this loop's polling callback is the only thing servicing the ST,
+// the terminal, USB and the SELECT button (EPIC-14 STORY-04).
+#define NETWORK_CONNECT_POLL_MS 10
 
 // Link supervisor (EPIC-14 STORY-01). The grace period keeps it out of the way
 // of a connect that is still in progress; the backoff doubles from the minimum

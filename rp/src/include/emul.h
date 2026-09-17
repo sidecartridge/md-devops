@@ -52,6 +52,12 @@ void emul_start();
 // 1 missing address, 2 non-contiguous netmask, 3 gateway off subnet
 // (EPIC-14 STORY-03).
 #define DEVHOOKS_APP_WIFI_BAD_STATIC 7
+// Debug builds only. Reproduces the boot connect: stages an SSID that does not
+// exist (in memory only, so a reboot restores the real one) and runs the same
+// blocking network_wifiStaConnect() with the same polling callback, which then
+// times out after NETWORK_CONNECT_TIMEOUT. Used to check that SELECT, the ST
+// and the terminal stay alive for the whole attempt (EPIC-14 STORY-04).
+#define DEVHOOKS_APP_WIFI_SLOW_CONNECT 8
 
 /**
  * @brief Whether the user picked Runner mode at boot ([U] in the
