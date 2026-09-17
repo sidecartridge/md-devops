@@ -742,6 +742,14 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
       DPRINTF("devhooks: gateway pointed at 192.0.2.1\n");
       return 1;
     }
+    case DEVHOOKS_APP_WIFI_POWERSAVE: {
+      cyw43_wifi_pm(&cyw43_state, CYW43_PERFORMANCE_PM);
+      uint32_t pm = 0;
+      (void)cyw43_wifi_get_pm(&cyw43_state, &pm);
+      DPRINTF("devhooks: power save forced on, radio reports 0x%08lx\n",
+              (unsigned long)pm);
+      return 1;
+    }
     case DEVHOOKS_APP_COUNTDOWN_STOP:
       haltCountdown = true;
       return 1;

@@ -272,6 +272,13 @@ uint32_t network_getRejoinAttempts(void);
 uint32_t network_getProbeFailures(void);
 
 /**
+ * @brief The power-save mode read back from the radio after the last bring-up.
+ *
+ * @return false when the mode could not be read.
+ */
+bool network_getPowerSaveMode(uint32_t* pm);
+
+/**
  * @brief Returns the configured WiFi mode as text.
  *
  * @return "STA", "AP", or "UNKNOWN".
