@@ -49,7 +49,8 @@ int main() {
   // and can introduce delays in the execution of the code. This can cause
   // problems when the code is time-sensitive.
 #if defined(_DEBUG) && (_DEBUG != 0)
-  // Initialize chosen serial port
+  // Initialize chosen serial port. With DEVOPS_NO_USBCDC the USB driver is not
+  // compiled in, so this brings up the UART console only (EPIC-18 STORY-01).
   stdio_init_all();
   setvbuf(stdout, NULL, _IONBF,
           1);  // specify that the stream should be unbuffered

@@ -241,7 +241,18 @@ endif()
 # USB stdio stays compiled in because usbcdc.c runs the TinyUSB CDC
 # interface through it, detaching it from stdio at runtime. UART stdio is the
 # DPRINTF console, so only debug builds enable it.
-pico_enable_stdio_usb(${PROJECT_NAME} 1)
+# DEVOPS_NO_USBCDC=1 in the environment builds with USB left alone entirely:
+# TinyUSB is never compiled in, so no USB interrupts and no background task can
+# take core-0 cycles away from the ROM3 servicing loop. Used to test whether
+# the USB stack is what makes a Pexec'd program's debug burst wedge the ST
+# (EPIC-18 STORY-01).
+if(DEFINED ENV{DEVOPS_NO_USBCDC} AND NOT "$ENV{DEVOPS_NO_USBCDC}" STREQUAL "0")
+    message("DEVOPS_NO_USBCDC: USB stdio and the CDC console are disabled")
+    add_definitions(-DDEVOPS_NO_USBCDC=1)
+    pico_enable_stdio_usb(${PROJECT_NAME} 0)
+else()
+    pico_enable_stdio_usb(${PROJECT_NAME} 1)
+endif()
 if(${_DEBUG} STREQUAL "0")
     pico_enable_stdio_uart(${PROJECT_NAME} 0)
 else()

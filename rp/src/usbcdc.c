@@ -14,9 +14,12 @@
 
 #include "include/debugcap.h"
 #include "pico/stdio.h"
-#include "pico/stdio_usb.h"
 #include "pico/stdlib.h"
+#if !defined(DEVOPS_NO_USBCDC) || (DEVOPS_NO_USBCDC == 0)
+// Only present when USB stdio is compiled in (EPIC-18 STORY-01).
+#include "pico/stdio_usb.h"
 #include "tusb.h"
+#endif
 
 static bool g_usbcdcInitialized = false;
 static debugcap_cursor_t g_usbcdcCursor = {.read_pos = 0, .dropped = 0};
@@ -28,6 +31,10 @@ static debugcap_cursor_t g_usbcdcCursor = {.read_pos = 0, .dropped = 0};
 static bool g_usbcdcLastConnected = false;
 
 void usbcdc_init(void) {
+#if defined(DEVOPS_NO_USBCDC) && (DEVOPS_NO_USBCDC != 0)
+  // Built without USB on purpose: never start TinyUSB (EPIC-18 STORY-01).
+  return;
+#else
   if (g_usbcdcInitialized) {
     return;
   }
@@ -53,9 +60,13 @@ void usbcdc_init(void) {
   debugcap_cursor_initSnapshot(&g_usbcdcCursor);
 
   g_usbcdcInitialized = true;
+#endif
 }
 
 void __not_in_flash_func(usbcdc_drain)(void) {
+#if defined(DEVOPS_NO_USBCDC) && (DEVOPS_NO_USBCDC != 0)
+  return;  // no USB in this build (EPIC-18 STORY-01)
+#else
   if (!g_usbcdcInitialized) {
     return;
   }
@@ -93,6 +104,7 @@ void __not_in_flash_func(usbcdc_drain)(void) {
   }
   tud_cdc_write(buf, take);
   tud_cdc_write_flush();
+#endif
 }
 
 void usbcdc_getStats(uint32_t *dropped, bool *attached) {
@@ -100,6 +112,10 @@ void usbcdc_getStats(uint32_t *dropped, bool *attached) {
     *dropped = g_usbcdcInitialized ? g_usbcdcCursor.dropped : 0u;
   }
   if (attached != NULL) {
+#if defined(DEVOPS_NO_USBCDC) && (DEVOPS_NO_USBCDC != 0)
+    *attached = false;
+#else
     *attached = g_usbcdcInitialized ? tud_cdc_connected() : false;
+#endif
   }
 }
