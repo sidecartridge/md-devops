@@ -11,7 +11,6 @@
 
 #include "constants.h"
 #include "debug.h"
-#include "pico/multicore.h"
 #include "pico/stdlib.h"
 
 #define SELECT_LOOP_DELAY 10  // 10 ms
@@ -34,13 +33,7 @@ typedef void (*reset_callback_t)(void);
  */
 void select_configure();
 
-/**
- * @brief Waits for button release.
- *
- * Blocks execution until the SELECT button is released. Ensures the user’s
- * push is fully handled.
- */
-void select_waitPush();
+
 
 /**
  * @brief Detects button press.
@@ -51,26 +44,9 @@ void select_waitPush();
  */
 bool select_detectPush();
 
-/**
- * @brief Waits for push in secondary core.
- *
- * Launches an asynchronous wait for a SELECT button push on the secondary core.
- * Accepts two callbacks: one for short press reset and one for long press
- * reset.
- *
- * @param reset Callback to be invoked on a short button press.
- * @param resetLong Callback to be invoked on a long button press.
- */
-void select_coreWaitPush(reset_callback_t reset, reset_callback_t resetLong);
 
-/**
- * @brief Disables secondary core wait.
- *
- * Disables waiting for the SELECT button push on the secondary core.
- *
- * Useful to cancel or adjust the handling in multicore scenarios.
- */
-void select_coreWaitPushDisable();
+
+
 
 /**
  * @brief Monitors for reset trigger.

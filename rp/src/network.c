@@ -7,8 +7,6 @@
 static bool cyw43Initialized = false;
 static wifi_mode_t wifiCurrentMode = WIFI_MODE_STA;
 static wifi_network_info_t wifiNetworkInfo = {.rssi = INT16_MIN};
-static wifi_scan_data_t wifiScanData = {0};
-static bool wifiScanInProgress = false;
 static char wifiHostname[NETWORK_MAX_STRING_LENGTH];
 static ip_addr_t currentIp = {0};
 static uint8_t cyw43Mac[NETWORK_MAC_SIZE];
@@ -37,7 +35,6 @@ static void network_resetConnectionState(void) {
 }
 
 static void network_resetRuntimeState(void) {
-  wifiScanInProgress = false;
   network_resetConnectionState();
   memset(cyw43Mac, 0, sizeof(cyw43Mac));
   cyw43MacStr[0] = '\0';
@@ -634,107 +631,13 @@ void network_safePoll() {
   }
 }
 
-/**
- * @brief Scans for available Wi-Fi networks and stores the results.
- *
- * This function initiates a Wi-Fi network scan if the network is initialized
- * and the scan interval has elapsed. It processes the scan results and stores
- * unique networks in the global `wifi_scan_data` structure.
- *
- * @param wifi_scan_time Pointer to the absolute time of the last scan.
- * @param wifi_scan_interval Interval between scans in seconds.
- * @return int Returns 0 on success, -1 if the network is not initialized.
- */
-int network_scan(absolute_time_t *wifiScanTime, int wifiScanInterval) {
-  if (!cyw43Initialized) {
-    // If the network is not initialized, we cancel the scan
-    return -1;
-  }
-  int scan_result(void *env, const cyw43_ev_scan_result_t *result) {
-    // Check if the BSSID already exists in the found networks
-    bool bssid_exists(wifi_network_info_t * network) {
-      for (size_t i = 0; i < wifiScanData.count; i++) {
-        if (strcmp(wifiScanData.networks[i].bssid, network->bssid) == 0) {
-          return true;  // BSSID found
-        }
-      }
-      return false;  // BSSID not found
-    }
-    if (result && wifiScanData.count < MAX_NETWORKS) {
-      wifi_network_info_t network;
+// Wi-Fi scanning lived here: network_scan(), network_scanIsActive() and
+// network_getFoundNetworks(), with a 100-entry result table. Removed in EPIC-14
+// STORY-07. Nothing ever called them -- scanning and Wi-Fi configuration belong
+// to Booster, which this app only reads settings from -- and the scan callbacks
+// were GCC nested functions, which clang-based tooling cannot parse, so the
+// dead code also cost every editor check in the file.
 
-      // Copy SSID
-      snprintf(network.ssid, sizeof(network.ssid), "%s", result->ssid);
-
-      // Format BSSID
-      snprintf(network.bssid, sizeof(network.bssid),
-               "%02x:%02x:%02x:%02x:%02x:%02x", result->bssid[0],
-               result->bssid[1], result->bssid[2], result->bssid[3],
-               result->bssid[4], result->bssid[5]);
-
-      // Store authentication mode
-      network.auth_mode = result->auth_mode;
-
-      // Store signal strength
-      network.rssi = result->rssi;
-
-      // Check if BSSID already exists
-      if (!bssid_exists(&network)) {
-        if (strlen(network.ssid) > 0) {
-          wifiScanData.networks[wifiScanData.count] = network;
-          wifiScanData.count++;
-          DPRINTF("FOUND NETWORK %s (%s) with auth %d and RSSI %d\n",
-                  network.ssid, network.bssid, network.auth_mode, network.rssi);
-        }
-      }
-    }
-    return 0;
-  }
-  // DPRINTF("Time diff: %lld\n", absolute_time_diff_us(get_absolute_time(),
-  // (absolute_time_t)*wifi_scan_time));
-  if (absolute_time_diff_us(get_absolute_time(), *wifiScanTime) < 0) {
-    if (!wifiScanInProgress) {
-      DPRINTF("Scanning networks...\n");
-      cyw43_wifi_scan_options_t scanOptions = {0};
-      int err = cyw43_wifi_scan(&cyw43_state, &scanOptions, NULL, scan_result);
-      if (err == 0) {
-        DPRINTF("Performing wifi scan\n");
-        wifiScanInProgress = true;
-      } else {
-        DPRINTF("Failed to start scan: %d\n", err);
-        *wifiScanTime = make_timeout_time_ms(wifiScanInterval * SEC_TO_MS);
-      }
-    } else {
-      if (!cyw43_wifi_scan_active(&cyw43_state)) {
-        DPRINTF("Continue scanning...\n");
-        wifiScanInProgress = false;
-      }
-      *wifiScanTime = make_timeout_time_ms(wifiScanInterval * SEC_TO_MS);
-    }
-  }
-  // else {
-  //     DPRINTF("Scan already in progress\n");
-  // }
-}
-
-int network_scanIsActive() {
-  if (!cyw43Initialized) {
-    // If the network is not initialized, we cancel the scan
-    DPRINTF("WiFi not initialized.\n");
-    return -1;
-  }
-  return (int)cyw43_wifi_scan_active(&cyw43_state);
-}
-
-/**
- * @brief Return the list of found networks.
- *
- * This function returns a pointer to the list of Wi-Fi networks that have been
- * found during a scan.
- *
- * @return wifi_scan_data_t* Pointer to the list of found Wi-Fi networks.
- */
-wifi_scan_data_t *network_getFoundNetworks() { return &wifiScanData; }
 
 static void wifiLinkCallback(struct netif *netif) {
   DPRINTF("WiFi Link: %s\n", (netif_is_link_up(netif) ? "UP" : "DOWN"));
