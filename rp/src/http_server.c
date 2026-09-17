@@ -28,6 +28,7 @@
 #include "pico/cyw43_arch.h"
 #include "pico/time.h"
 #include "runner.h"
+#include "sdcard.h"
 #include "select.h"
 #include "settings.h"
 #include "usbcdc.h"
@@ -226,6 +227,7 @@ static void write_error(http_conn_t *c, int status, const char *reason,
                         const char *code_symbol, const char *message);
 static void write_fs_error(http_conn_t *c, FRESULT fr, const char *message);
 static void write_405(http_conn_t *c, const char *allow);
+static void write_no_card(http_conn_t *c);
 
 static err_t srv_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err);
 static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, struct pbuf *p,
@@ -1307,8 +1309,7 @@ static void handle_volume(http_conn_t *c) {
   FRESULT res = f_getfree("", &free_clusters, &fs);
   if (res != FR_OK || fs == NULL) {
     DPRINTF("http_server: /volume f_getfree failed (%d)\n", (int)res);
-    write_error(c, 503, "Service Unavailable", "busy",
-                "SD filesystem unavailable");
+    write_fs_error(c, res, "f_getfree failed");
     return;
   }
   uint64_t bytes_per_sector =
@@ -4358,6 +4359,23 @@ static bool strip_rename_action(char *rel) {
 static void route(http_conn_t *c) {
   health_setPhase(HEALTH_PHASE_HTTP_REQUEST);
 
+  // Everything under /gemdrive needs the card, and so does loading a program
+  // from it. One check here is what keeps the answer identical across volume,
+  // listings, downloads, uploads, folder operations and the Runner
+  // (EPIC-15 STORY-02).
+  static const char gemdrive_prefix[] = "/api/v1/gemdrive";
+  static const char runner_load_prefix[] = "/api/v1/runner/load";
+  static const char runner_run_prefix[] = "/api/v1/runner/run";
+  if (!sdcard_isMounted() &&
+      (strncmp(c->path, gemdrive_prefix, sizeof(gemdrive_prefix) - 1) == 0 ||
+       strncmp(c->path, runner_load_prefix, sizeof(runner_load_prefix) - 1) ==
+           0 ||
+       strncmp(c->path, runner_run_prefix, sizeof(runner_run_prefix) - 1) ==
+           0)) {
+    write_no_card(c);
+    return;
+  }
+
   // HEAD is treated as GET for matching purposes (the dispatcher
   // suppresses the body during write).
   uint8_t method_bit =
@@ -4645,7 +4663,25 @@ static void write_error(http_conn_t *c, int status, const char *reason,
 // A FatFs call failed. With the malloc panic off (EPIC-11 STORY-01) FatFs can
 // report FR_NOT_ENOUGH_CORE instead of the device dying, so report that apart
 // from a disk fault: the caller can retry when memory frees up.
+// Every SD endpoint answers a missing card the same way (EPIC-15 STORY-02).
+// Before this, /volume said 503 "busy" while a listing said 500 "disk_error"
+// for the same missing card, and a listing could even answer 200 with an empty
+// directory from FatFs's cache.
+static void write_no_card(http_conn_t *c) {
+  write_error(c, 503, "Service Unavailable", "no_sd_card",
+              "No SD card mounted");
+}
+
 static void write_fs_error(http_conn_t *c, FRESULT fr, const char *message) {
+  // A disk error may mean the card is gone; let the SD layer start retrying
+  // the mount (EPIC-15 STORY-01).
+  sdcard_noteResult(fr);
+  // If that is what happened, say so rather than reporting a disk fault: the
+  // card being out is a different thing from the card being broken.
+  if (!sdcard_isMounted()) {
+    write_no_card(c);
+    return;
+  }
   if (fr == FR_NOT_ENOUGH_CORE) {
     write_error(c, 503, "Service Unavailable", "insufficient_memory", message);
     return;

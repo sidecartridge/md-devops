@@ -1,11 +1,30 @@
 #include "sdcard.h"
 
+#include "health.h"
+#include "diskio.h"
+
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
 static FATFS *mountedFsPtr = NULL;
 static bool sdMounted = false;
+
+// Remount state (EPIC-15 STORY-01). The card is mounted once at boot, so a card
+// pulled and put back stayed dead until a reset: FatFs keeps the volume
+// registered, and with card-detect disabled on this board nothing ever marks
+// the drive uninitialised, so mount_volume() sees a mounted volume and never
+// asks the driver to re-initialise the card.
+//
+// Unregistering the volume is what breaks that: with fs_type cleared, the next
+// f_mount() runs disk_initialize(), which calls the card's own init
+// unconditionally (fatfs-sdk src/glue.c), and a freshly inserted card comes up.
+static FATFS *bootFsPtr = NULL;
+static char bootFolder[SDCARD_FOLDER_NAME_MAX] = "";
+static absolute_time_t nextRemountAt;
+static bool remountScheduled = false;
+static uint32_t remountAttempts = 0;
+static uint32_t remountRecoveries = 0;
 
 // qsort comparator: directories first, then alphabetic case-insensitive.
 static int dirFirstCmp(const void *a, const void *b) {
@@ -96,6 +115,12 @@ sdcard_status_t sdcard_initFilesystem(FATFS *fsPtr, const char *folderName) {
     DPRINTF("Invalid SD filesystem initialization arguments.\n");
     return SDCARD_INIT_ERROR;
   }
+
+  // Remember what to mount with before trying, not after succeeding: a device
+  // booted with no card has to keep retrying too, and that is the case where
+  // the retry matters most.
+  bootFsPtr = fsPtr;
+  snprintf(bootFolder, sizeof(bootFolder), "%s", folderName);
 
   // Check the status of the sd card
   sdcard_status_t sdcardOk = sdcardInit();
@@ -203,6 +228,113 @@ void sdcard_getInfo(FATFS *fsPtr, uint32_t *totalSizeMb,
 }
 
 bool sdcard_isMounted(void) { return sdMounted && (mountedFsPtr != NULL); }
+
+uint32_t sdcard_getRemountRecoveries(void) { return remountRecoveries; }
+
+// Whether the card is still there cannot be inferred from FatFs results: with
+// the card physically out, `volume` still answered 200 from the cached FAT and
+// a listing answered 200 with an empty directory, because FatFs serves what it
+// has cached and never reports a disk error. Card-detect is disabled on this
+// board, so disk_status() cannot tell us either.
+//
+// The only honest question is a real one: read a sector off the card. Sector 0
+// is always there, the read bypasses FatFs's cache, and a card that has been
+// pulled cannot answer it.
+static absolute_time_t nextPresenceCheckAt;
+static bool presenceCheckStarted = false;
+static uint8_t presenceBuf[512];
+
+static void sdcard_pollPresence(void) {
+  absolute_time_t now = get_absolute_time();
+  if (!presenceCheckStarted) {
+    presenceCheckStarted = true;
+    nextPresenceCheckAt = delayed_by_ms(now, SDCARD_PRESENCE_POLL_MS);
+    return;
+  }
+  if (absolute_time_diff_us(now, nextPresenceCheckAt) > 0) {
+    return;
+  }
+  nextPresenceCheckAt = delayed_by_ms(now, SDCARD_PRESENCE_POLL_MS);
+
+  DRESULT dres = disk_read(0, presenceBuf, 0, 1);
+  if (dres == RES_OK) {
+    return;
+  }
+  DPRINTF("SD card: sector read failed (%d) -- card gone\n", (int)dres);
+  sdMounted = false;
+  mountedFsPtr = NULL;
+  remountScheduled = true;
+  nextRemountAt = now;
+}
+
+void sdcard_noteResult(FRESULT fres) {
+  if (!sdMounted) {
+    return;
+  }
+  // Only the results that mean "the medium is not answering". A missing file or
+  // a full lock table says nothing about the card.
+  if (fres == FR_DISK_ERR || fres == FR_NOT_READY || fres == FR_INVALID_DRIVE ||
+      fres == FR_NO_FILESYSTEM) {
+    DPRINTF("SD card: marking unmounted after FatFs error %d\n", (int)fres);
+    sdMounted = false;
+    mountedFsPtr = NULL;
+    remountScheduled = true;
+    nextRemountAt = get_absolute_time();  // try at the next poll
+  }
+}
+
+// Called from the main loop. Cheap when the card is mounted; when it is not,
+// retries a full remount every SDCARD_REMOUNT_RETRY_MS.
+void sdcard_pollRemount(void) {
+  if (sdcard_isMounted()) {
+    sdcard_pollPresence();
+    return;
+  }
+  if (bootFsPtr == NULL || bootFolder[0] == '\0') {
+    return;
+  }
+  if (!remountScheduled) {
+    remountScheduled = true;
+    nextRemountAt = get_absolute_time();
+  }
+  if (absolute_time_diff_us(get_absolute_time(), nextRemountAt) > 0) {
+    return;
+  }
+
+  // A remount talks to the card over SPI and can take a moment, and a card that
+  // is half-inserted can take longer still.
+  health_feed();
+  health_setPhase(HEALTH_PHASE_BOOT);
+  remountAttempts++;
+  // Two things have to be undone before a reinserted card will come up.
+  //
+  // First the driver: sd_card_spi_init() returns immediately unless STA_NOINIT
+  // is set ("Check if we're not already initialized before proceeding",
+  // sd_card_spi.c), and with card-detect disabled nothing ever sets it when a
+  // card is pulled. So the driver would keep believing the old card is still
+  // initialised and skip the whole init sequence, leaving FatFs to fail on the
+  // first sector read. deinit() sets STA_NOINIT and forgets the card type.
+  //
+  // Then FatFs: while the volume stays registered, mount_volume() will not ask
+  // the driver to initialise anything at all.
+  sd_card_t *sdCard = sd_get_by_num(0);
+  if (sdCard != NULL && sdCard->deinit != NULL) {
+    sdCard->deinit(sdCard);
+  }
+  f_mount(NULL, "0:", 0);
+  sdcard_status_t rc = sdcard_initFilesystem(bootFsPtr, bootFolder);
+  health_feed();
+  if (rc == SDCARD_INIT_OK) {
+    remountRecoveries++;
+    presenceCheckStarted = false;
+    DPRINTF("SD card: remounted after %lu attempt(s)\n",
+            (unsigned long)remountAttempts);
+    remountAttempts = 0;
+    remountScheduled = false;
+    return;
+  }
+  nextRemountAt = delayed_by_ms(get_absolute_time(), SDCARD_REMOUNT_RETRY_MS);
+}
 
 bool sdcard_getMountedInfo(uint32_t *totalSizeMb, uint32_t *freeSpaceMb) {
   if ((totalSizeMb == NULL) || (freeSpaceMb == NULL)) {

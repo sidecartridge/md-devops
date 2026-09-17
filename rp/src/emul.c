@@ -632,6 +632,13 @@ static void drawSetupInfoLine(const char *message) {
 // Set when [G] or [U] was refused because no HELLO arrived since the RP
 // booted (see emul_canLaunch). Cleared when HELLO lands.
 static bool launchNeedsStReset = false;
+// Set when [G] or [U] was refused because no usable SD card is mounted
+// (EPIC-15 STORY-02). Cleared as soon as a card appears; the retry loop in
+// sdcard_pollRemount is what makes that happen without a reset.
+static bool launchNeedsSdCard = false;
+// Tracks the card state the menu was last drawn with, so the line is redrawn
+// when it changes rather than on every pass.
+static bool lastDrawnSdMounted = false;
 // True while the countdown itself is launching, so a refusal can restart the
 // countdown once HELLO lands instead of leaving it stopped.
 static bool countdownLaunching = false;
@@ -646,6 +653,8 @@ static void drawHaltedInfoLine(void) {
   drawSetupInfoLine(
       settingsSaveFailed
           ? "Saving the settings failed: the change was not stored."
+      : launchNeedsSdCard
+          ? "Insert a working microSD card: GEMDRIVE needs one."
       : launchNeedsStReset
           ? "Reset the Atari ST first: no HELLO since RP boot."
           : "Countdown stopped. Press [G], [U] or [X] to continue.");
@@ -801,6 +810,14 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
       wifi_sta_conn_process_status_t rc = network_wifiStaConnect();
       network_setPollingCallback(NULL);
       DPRINTF("devhooks: slow connect returned %d\n", (int)rc);
+      return 1;
+    }
+    case DEVHOOKS_APP_GEMDRIVE_STALL: {
+      uint16_t chunks = (payloadSize >= 2u) ? payload[0] : 1u;
+      uint16_t ds = (payloadSize >= 4u) ? payload[1] : 0u;
+      gemdrive_setWriteStall(chunks, ds);
+      DPRINTF("devhooks: stalling the next %u write chunk(s) by %u ds\n",
+              (unsigned)chunks, (unsigned)ds);
       return 1;
     }
     case DEVHOOKS_APP_COUNTDOWN_STOP:
@@ -1312,7 +1329,13 @@ static void menu(void) {
 
   // Folder + drive read straight from aconfig, like source/md-drives.
   vt52Cursor(2, 0);
-  term_printString("GEMDRIVE\n");
+  // The card's state goes on the header line, not a row of its own: the
+  // section dividers are at fixed pixel rows and the status icons are
+  // right-aligned per header row, so an extra line shifts every section below
+  // into them (EPIC-15 STORY-02). Kept short to clear the drive icon on the
+  // right.
+  term_printString(sdcard_isMounted() ? "GEMDRIVE   SD: mounted\n"
+                                      : "GEMDRIVE   SD: NO CARD\n");
 
   SettingsConfigEntry *gemDriveFolder =
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER);
@@ -1514,6 +1537,17 @@ static void showCounter(int cdown) {
 // run's shared variables survived in uncleared RAM.
 static bool emul_canLaunch(void) {
   haltCountdown = true;
+  // Without a card there is nothing to emulate a drive from, and both modes
+  // would come up broken. Refuse and say so; sdcard_pollRemount keeps trying,
+  // so inserting one clears this within a couple of seconds (EPIC-15 STORY-02).
+  if (!sdcard_isMounted()) {
+    DPRINTF("Launch refused: no SD card mounted\n");
+    launchNeedsSdCard = true;
+    restartCountdownOnHello = countdownLaunching;
+    menu();
+    display_refresh();
+    return false;
+  }
   if (gemdrive_getPhystop(NULL, NULL)) return true;
   DPRINTF("Launch refused: no HELLO from the ST since the RP booted\n");
   launchNeedsStReset = true;
@@ -2185,6 +2219,31 @@ void emul_start() {
     // the main-loop cadence. Short press fires reset_device; long
     // press (≥ SELECT_LONG_RESET ms) fires reset_deviceAndEraseFlash.
     select_checkPushReset();
+
+    // Bring a reinserted SD card back without a reset (EPIC-15 STORY-01).
+    // Cheap while the card is mounted.
+    sdcard_pollRemount();
+
+    // Follow the card's state on the menu, and lift the launch block as soon
+    // as a usable card appears (EPIC-15 STORY-02).
+    bool sdMountedNow = sdcard_isMounted();
+    if (sdMountedNow != lastDrawnSdMounted) {
+      lastDrawnSdMounted = sdMountedNow;
+      if (sdMountedNow && launchNeedsSdCard) {
+        launchNeedsSdCard = false;
+        if (restartCountdownOnHello) {
+          restartCountdownOnHello = false;
+          (void)term_consumeAnyKeyPressed();
+          countdown = BOOT_COUNTDOWN_SECONDS;
+          lastCountdownTick = get_absolute_time();
+          haltCountdown = false;
+        }
+      }
+      if (menuScreenActive) {
+        menu();
+        display_refresh();
+      }
+    }
 
     // Heap sampling, the debug summary and debug test hooks.
     health_tick();
