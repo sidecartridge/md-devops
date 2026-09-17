@@ -2948,11 +2948,15 @@ static void handle_system_health(http_conn_t *c) {
   }
 
   // Static: the body is too big for the 2 KB core-0 stack. Sized for the
-  // longest possible report (567 bytes, 803 with the lwIP counters).
+  // longest possible report: 567 bytes plus the wifi object (EPIC-14), and in
+  // debug builds the tproto counters too (EPIC-18), with the lwIP counters on
+  // top when they are compiled in. Overflowing this is not silent -- the
+  // handler answers 500 "Health report does not fit the response buffer" --
+  // but it is still a report nobody can read, so leave headroom.
 #if LWIP_STATS && MEM_STATS && MEMP_STATS
-  static char body[816];
+  static char body[1024];
 #else
-  static char body[576];
+  static char body[768];
 #endif
   size_t len = 0;
   bool fits = body_appendf(
@@ -2978,6 +2982,20 @@ static void handle_system_health(http_conn_t *c) {
       r.crash_loop ? "true" : "false", r.watchdog_enabled ? "true" : "false",
       (unsigned long)commemul_getOverruns(), (unsigned long)bytes_dropped,
       (unsigned long)usbcdc_dropped);
+
+#if defined(_DEBUG) && (_DEBUG != 0)
+  // ROM3 command parser state (EPIC-18 STORY-01). step 0 is HEADER_DETECTION,
+  // i.e. idle and ready; anything else means a frame is part-read. A wedge
+  // where step stays non-zero, debug_in_frame climbs and resyncs_mid_frame
+  // does not, is the parser held mid-frame by debug traffic.
+  fits = fits && body_appendf(body, sizeof(body), &len,
+                              ",\"tproto\":{\"step\":%lu,\"debug_in_frame\":%lu,"
+                              "\"resyncs\":%lu,\"resyncs_mid_frame\":%lu}",
+                              (unsigned long)chandler_getParseStep(),
+                              (unsigned long)chandler_getDebugInFrame(),
+                              (unsigned long)tprotocol_resyncs,
+                              (unsigned long)tprotocol_resyncsMidFrame);
+#endif
 
   // Wi-Fi supervision (EPIC-14). power_save is read back from the radio, not
   // the value we asked for: the driver reapplies its own default on every

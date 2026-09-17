@@ -199,6 +199,11 @@ static inline void __not_in_flash_func(handle_protocol_checksum_error)(
       protocol->final_checksum, TPROTO_GET_RANDOM_TOKEN(protocol->payload));
 }
 
+static uint32_t chandlerDebugInFrame = 0;
+
+uint32_t chandler_getDebugInFrame(void) { return chandlerDebugInFrame; }
+uint32_t chandler_getParseStep(void) { return (uint32_t)tprotocol_nextTPstep; }
+
 static inline void __not_in_flash_func(chandler_consume_rom3_sample)(
     uint16_t sample) {
   if (chandlerAwaitingFirstSample) {
@@ -221,6 +226,13 @@ static inline void __not_in_flash_func(chandler_consume_rom3_sample)(
   if ((sample & 0xFF00u) == 0xFF00u) {
     if (emul_isFirmwareMode()) {
       debugcap_emit((uint8_t)(sample & 0xFFu));
+    }
+    // A debug read arriving while a command frame is part-read is the
+    // suspected corruption: it is consumed below as frame data, and it
+    // refreshes the idle-gap timestamp that would otherwise resynchronise
+    // the parser (EPIC-18 STORY-01).
+    if (tprotocol_nextTPstep != HEADER_DETECTION) {
+      chandlerDebugInFrame++;
     }
   }
 

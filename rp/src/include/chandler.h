@@ -20,6 +20,11 @@
 #include "tprotocol.h"
 
 #define CHANDLER_ADDRESS_HIGH_BIT 0x8000  // High bit of the address
+
+/** EPIC-18 STORY-01: debug reads seen while a command frame was part-read. */
+uint32_t chandler_getDebugInFrame(void);
+/** EPIC-18 STORY-01: the parser's current step, so a wedge can be inspected. */
+uint32_t chandler_getParseStep(void);
 #define CHANDLER_PARAMETERS_MAX_SIZE 20  // Max size of the parameters for debug
 
 // All offsets are relative to __rom_in_ram_start__, which mirrors

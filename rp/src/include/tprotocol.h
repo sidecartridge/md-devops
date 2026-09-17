@@ -145,6 +145,9 @@ typedef void (*ProtocolChecksumErrorCallback)(const TransmissionProtocol *);
 extern uint32_t tprotocol_last_header_found;
 extern uint32_t tprotocol_new_header_found;
 extern TPParseStep tprotocol_nextTPstep;
+// EPIC-18 STORY-01 instrumentation; see tprotocol.c.
+extern uint32_t tprotocol_resyncs;
+extern uint32_t tprotocol_resyncsMidFrame;
 extern TransmissionProtocol tprotocol_transmission;
 
 // This function is called once we finish reading the command + payload
@@ -190,6 +193,14 @@ static inline void __not_in_flash_func(tprotocol_parse)(
   tprotocol_new_header_found = timer_hw->timerawl;
   if (tprotocol_new_header_found - tprotocol_last_header_found >
       PROTOCOL_READ_RESTART_MICROSECONDS) {
+    tprotocol_resyncs++;
+    if (tprotocol_nextTPstep != HEADER_DETECTION) {
+      // The gap rescued a frame that was stuck part-read. If the parser can
+      // get stuck and this never fires, something is holding the timestamp
+      // fresh -- which is what debug traffic is suspected of doing
+      // (EPIC-18 STORY-01).
+      tprotocol_resyncsMidFrame++;
+    }
     tprotocol_nextTPstep = HEADER_DETECTION;
   }
   tprotocol_last_header_found = tprotocol_new_header_found;
