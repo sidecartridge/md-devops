@@ -89,7 +89,7 @@ python3 cli/sidecart.py gemdrive rm SWITCHER.TOS
 | `416 Range Not Satisfiable` | Range outside file bounds. Carries `Content-Range: bytes */<size>`. |
 | `422 Unprocessable Entity` | Malformed JSON body, missing required field, listing-on-file, rename-into-own-descendant. |
 | `500 Internal Server Error` | FatFs disk error. |
-| `503 Service Unavailable` | Body-stream lock held, SD not mounted, Runner busy with another command, or `insufficient_memory`: FatFs could not allocate its working buffer, so the operation can be retried when memory frees up. Always carries `Retry-After: 1`. |
+| `503 Service Unavailable` | Body-stream lock held (`busy`), no usable SD card (`no_sd_card`), Runner busy with another command (`busy`), or `insufficient_memory`: FatFs could not allocate its working buffer, so the operation can be retried when memory frees up. Always carries `Retry-After: 1`. |
 | `504 Gateway Timeout` | Synchronous Runner endpoint exceeded its server-side spin-wait deadline (`gateway_timeout`). Per-endpoint deadlines: `runner load` 10 s; `runner unload` 5 s; `runner meminfo`, `runner adv/meminfo`, and each `runner adv/load` chunk 1 s. |
 
 ## Error code vocabulary
@@ -99,10 +99,17 @@ Clients can switch on `code` reliably. All defined symbols:
 `bad_request`, `bad_path`, `bad_query`, `name_too_long`, `not_found`,
 `is_directory`, `is_file`, `conflict`, `length_required`,
 `payload_too_large`, `range_invalid`, `bad_json`, `unprocessable`,
-`unsupported_media`, `method_not_allowed`, `busy`, `disk_error`,
+`unsupported_media`, `method_not_allowed`, `busy`, `no_sd_card`, `disk_error`,
 `insufficient_memory`, `internal_error`, `runner_inactive`, `gateway_timeout`, `no_snapshot`,
 `wrong_hook`, `ram_overflow`, `pexec_failed`, `mfree_failed`,
 `program_already_loaded`, `no_program_loaded`.
+
+`no_sd_card` — there is no usable SD card mounted. **Every** endpoint that
+needs the card answers this the same way: `volume`, listings, downloads,
+uploads, folder operations, `runner load` and `runner run`. It is not a fault
+to recover from by hand: the firmware retries the mount every two seconds, so
+inserting a working card clears it within a few seconds with no reset, and the
+setup menu shows `SD: NO CARD` meanwhile and refuses `[G]` and `[U]`.
 
 Runner-specific codes (see *Runner mode* below):
 - `runner_inactive` — the user didn't pick `[U]` at boot.
@@ -235,7 +242,7 @@ python3 cli/sidecart.py health
 `UNKNOWN` (the SD card mounted but FatFs reported a filesystem
 type the firmware doesn't have a string for).
 
-**Errors:** `503 busy` if the SD card is not mounted.
+**Errors:** `503 no_sd_card` if no usable SD card is mounted.
 
 **`curl`**:
 ```sh
