@@ -350,6 +350,20 @@ old_handler:
 	even
 
 ; ====================================================================
+; write_seq — chunk sequence number for .Fwrite (EPIC-15 STORY-05).
+;
+; Bumped once per chunk, never per retry, and never reset: every retry
+; of a chunk carries the number the first attempt carried, and no two
+; distinct chunks ever share one. That is what lets the RP tell "you
+; did not hear my answer, here is the same data again" from "here is
+; the next chunk", which it could not do from the data alone -- a
+; retried chunk and a new one look identical on the wire.
+	cnop	0,4
+write_seq:
+	dc.l	0
+	even
+
+; ====================================================================
 ; gemdrive_trap — full trap #1 dispatcher
 ;
 ; The CPU has already pushed the trap exception frame ([SR, PC]) on
@@ -705,11 +719,18 @@ gemdrive_trap:
 	ble.s	.fwrite_chunk_size_ok
 	move.l	#BUFFER_WRITE_SIZE, d5
 .fwrite_chunk_size_ok:
+	; One new sequence number per chunk. a1/d1 are scratch under the
+	; GEMDOS calling convention, and d1 is inside the movem below, so
+	; it survives every retry of this chunk.
+	lea	write_seq(pc), a1
+	addq.l	#1, (a1)
+	move.l	(a1), d1
 	move.w	#CMD_RETRIES_COUNT, d7
 .fwrite_retry:
 	movem.l	d1-d7/a4, -(sp)
 	move.w	#CMD_WRITE_BUFF_CALL, d0
-	move.l	d5, d6
+	move.l	d5, d6				; payload size = chunk size
+	move.l	d1, d5				; d5 = sequence (RP reads it here)
 	bsr	send_sync_write_command_to_sidecart
 	movem.l	(sp)+, d1-d7/a4
 	tst.w	d0

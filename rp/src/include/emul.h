@@ -58,6 +58,11 @@ void emul_start();
 // times out after NETWORK_CONNECT_TIMEOUT. Used to check that SELECT, the ST
 // and the terminal stay alive for the whole attempt (EPIC-14 STORY-04).
 #define DEVHOOKS_APP_WIFI_SLOW_CONNECT 8
+// Debug builds only. Makes the next N GEMDRIVE write chunks stall after the
+// data is committed but before the ST is answered, which is exactly the shape
+// of the failure in EPIC-15 STORY-05: the write happened, the answer was lost,
+// and the ST re-sends the chunk. Payload word 0 = how many chunks to stall.
+#define DEVHOOKS_APP_GEMDRIVE_STALL 9
 
 /**
  * @brief Whether the user picked Runner mode at boot ([U] in the

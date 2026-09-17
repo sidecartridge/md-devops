@@ -49,6 +49,13 @@ static char dpathStr[GEMDRIVE_DEFAULT_PATH_LEN] = "\\";
 typedef struct {
   bool inUse;
   FIL fp;
+  // Last write chunk accepted on this handle (EPIC-15 STORY-05). The m68k
+  // bumps its sequence once per chunk and re-sends the same one on every
+  // retry, so a repeat means the ST never heard the answer -- not that there
+  // is more data. Writing it again is what duplicated a chunk and lost the
+  // tail of the file.
+  uint32_t lastWriteSeq;
+  uint32_t lastWriteBytes;
 } GemFileSlot;
 static GemFileSlot fileTable[GEMDRIVE_MAX_OPEN_FILES];
 
@@ -255,6 +262,8 @@ static int __not_in_flash_func(allocFileSlot)(void) {
     if (!fileTable[i].inUse) {
       fileTable[i].inUse = true;
       memset(&fileTable[i].fp, 0, sizeof(FIL));
+      fileTable[i].lastWriteSeq = 0;
+      fileTable[i].lastWriteBytes = 0;
       return i;
     }
   }
@@ -865,18 +874,59 @@ static void __not_in_flash_func(handleFdatetimeCall)(uint16_t *payload) {
   writeAppFreeLong(GEMDRIVE_FDATETIME_STATUS_OFFSET, 0);
 }
 
+#if defined(_DEBUG) && (_DEBUG != 0)
+// Debug-only fault injection for EPIC-15 STORY-05: stall after committing a
+// chunk so the ST's synchronous wait times out and it re-sends that chunk.
+static volatile uint16_t gemdriveWriteStallChunks = 0;
+static volatile uint16_t gemdriveWriteStallDs = 20;  // 100 ms units
+
+void gemdrive_setWriteStall(uint16_t chunks, uint16_t deciseconds) {
+  gemdriveWriteStallChunks = chunks;
+  if (deciseconds > 0) {
+    gemdriveWriteStallDs = deciseconds;
+  }
+}
+
+static void gemdrive_stallIfRequested(void) {
+  if (gemdriveWriteStallChunks == 0) {
+    return;
+  }
+  gemdriveWriteStallChunks--;
+  DPRINTF("GEMDRIVE Fwrite: stalling this answer on purpose\n");
+  // Long enough to outlast the ST's COMMAND_TIMEOUT, short enough that the
+  // watchdog never fires -- fed on the way through.
+  for (uint16_t i = 0; i < gemdriveWriteStallDs; i++) {
+    health_feed();
+    sleep_ms(100);
+  }
+  health_feed();
+}
+#endif
+
 static void __not_in_flash_func(handleWriteBuffCall)(uint16_t *payload) {
   uint16_t handle = TPROTO_GET_PAYLOAD_PARAM16(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   uint32_t bytes = TPROTO_GET_PAYLOAD_PARAM32(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
-  TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d5
+  // d5 carries the chunk sequence number (EPIC-15 STORY-05).
+  uint32_t seq = TPROTO_GET_PAYLOAD_PARAM32(payload);
+  TPROTO_NEXT32_PAYLOAD_PTR(payload);
 
   if (bytes > GEMDRIVE_WRITE_BUFFER_SIZE) bytes = GEMDRIVE_WRITE_BUFFER_SIZE;
 
   GemFileSlot *slot = fileSlotByHandle(handle);
   if (slot == NULL) {
     writeAppFreeLong(GEMDRIVE_WRITE_BYTES_OFFSET, 0);
+    return;
+  }
+
+  // The same chunk again: the write already happened, only the answer was
+  // lost. Report what it wrote and do not touch the file -- appending it a
+  // second time is exactly the corruption this guards against.
+  if (seq != 0 && seq == slot->lastWriteSeq) {
+    DPRINTF("GEMDRIVE Fwrite: repeat of chunk %lu, answering %lu again\n",
+            (unsigned long)seq, (unsigned long)slot->lastWriteBytes);
+    writeAppFreeLong(GEMDRIVE_WRITE_BYTES_OFFSET, slot->lastWriteBytes);
     return;
   }
 
@@ -905,6 +955,15 @@ static void __not_in_flash_func(handleWriteBuffCall)(uint16_t *payload) {
   }
 #endif
   health_feed();
+  if (res == FR_OK) {
+    // Remember it before answering: if this answer is the one that gets lost,
+    // the retry has to find it here.
+    slot->lastWriteSeq = seq;
+    slot->lastWriteBytes = (uint32_t)bw;
+  }
+#if defined(_DEBUG) && (_DEBUG != 0)
+  gemdrive_stallIfRequested();
+#endif
   if (res != FR_OK) {
     // Zero tells the ST the write failed; its loop returns EIO rather than
     // retrying a chunk this side may already have written.
