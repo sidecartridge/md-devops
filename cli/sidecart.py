@@ -38,7 +38,8 @@ Exit codes:
     5  server returned 400 / 422 / other 4xx
     6  server returned 503 (busy or SD unmounted)
     7  server returned 5xx other than 503
-    8  network / DNS error (couldn't reach the host)
+    8  network error: couldn't reach the host, or it dropped the
+       connection (a reboot, a panic or a SELECT press all look like this)
 
 Examples:
     python3 cli/sidecart.py ping
@@ -57,6 +58,7 @@ import argparse
 import http.client
 import json
 import os
+import socket
 import sys
 import urllib.error
 import urllib.parse
@@ -66,6 +68,30 @@ DEFAULT_HOST = "sidecart.local"
 DEFAULT_PORT = 80
 USER_AGENT = "sidecart-cli/0.1"
 REQUEST_TIMEOUT_S = 10
+
+# The device dropping a connection is a normal thing to survive -- it reboots
+# on a watchdog, a panic or a SELECT press, and the HTTP server closes idle
+# connections on purpose. urllib only wraps some of that in URLError; the rest
+# escapes as a bare OSError and used to reach the user as a traceback
+# (EPIC-15 STORY-03). IncompleteRead is in here because a chunked body cut
+# short raises it rather than an OSError.
+CONNECTION_DROPPED = (
+    ConnectionResetError,
+    ConnectionAbortedError,
+    BrokenPipeError,
+    http.client.RemoteDisconnected,
+    http.client.IncompleteRead,
+    socket.timeout,
+    TimeoutError,
+)
+
+
+def _dropped(operation: str, exc: BaseException) -> int:
+    """Report a dropped connection as one line and the network exit code."""
+    detail = str(exc) or exc.__class__.__name__
+    print(f"error: {operation}: connection dropped by the device ({detail})",
+          file=sys.stderr)
+    return EXIT_NETWORK
 
 # Granular exit-code map (see docs/epics/02-http-api.md "CLI / Exit code
 # map"). Lets shell scripts branch on category.
@@ -143,6 +169,12 @@ def request_json(method: str, url: str, *, body: bytes | None = None,
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
             status = resp.status
+    except CONNECTION_DROPPED as exc:
+        # Re-raised as URLError so the callers' existing handling applies;
+        # the reason carries what actually happened.
+        detail = str(exc) or exc.__class__.__name__
+        raise urllib.error.URLError(
+            f"connection dropped by the device ({detail})") from exc
     except urllib.error.HTTPError as exc:
         # Server returned >= 400 — read its body so we can render the
         # error envelope, then close the response handle to silence
@@ -408,6 +440,8 @@ def cmd_get(args: argparse.Namespace) -> int:
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         resp = urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S)
+    except CONNECTION_DROPPED as exc:
+        return _dropped(f"downloading {url}", exc)
     except urllib.error.HTTPError as exc:
         try:
             raw = exc.read() if exc.fp is not None else b""
@@ -464,6 +498,13 @@ def cmd_get(args: argparse.Namespace) -> int:
             # Newline after the progress line.
             sys.stderr.write("\n")
             sys.stderr.flush()
+    except CONNECTION_DROPPED as exc:
+        # Mid-transfer: the partial file is left in place so --resume can pick
+        # it up, which is the whole reason that option exists.
+        if not args.quiet:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+        return _dropped(f"downloading {url}", exc)
     finally:
         resp.close()
 
@@ -843,6 +884,8 @@ def cmd_debug_tail(args: argparse.Namespace) -> int:
     try:
         # No timeout — we deliberately want to block forever.
         resp = urllib.request.urlopen(req, timeout=None)
+    except CONNECTION_DROPPED as exc:
+        return _dropped(f"tailing {url}", exc)
     except urllib.error.HTTPError as exc:
         # Non-200 from the server — render the error envelope if any.
         try:
@@ -875,6 +918,10 @@ def cmd_debug_tail(args: argparse.Namespace) -> int:
             out.flush()
     except KeyboardInterrupt:
         return EXIT_OK
+    except CONNECTION_DROPPED as exc:
+        # A tail is long-lived by design, so the device rebooting under it is
+        # the expected way for this to end, not an anomaly.
+        return _dropped(f"tailing {url}", exc)
     finally:
         resp.close()
     return EXIT_OK

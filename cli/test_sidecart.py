@@ -16,6 +16,8 @@ import contextlib
 import io
 import json
 import os
+import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -1714,3 +1716,96 @@ class StatusMappingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _ResettingServer:
+    """A server that accepts a connection and then drops it mid-response.
+
+    Covers what the device does when it reboots under a command: a watchdog,
+    a panic or a SELECT press all cut the socket without a reply, and urllib
+    surfaces that as ConnectionResetError or RemoteDisconnected rather than
+    URLError (EPIC-15 STORY-03).
+    """
+
+    def __init__(self, mode: str = "immediate") -> None:
+        self.mode = mode
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(4)
+        self.port = self.sock.getsockname()[1]
+        self.host = f"127.0.0.1:{self.port}"
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.running = True
+        self.thread.start()
+
+    def _serve(self) -> None:
+        while self.running:
+            try:
+                conn, _addr = self.sock.accept()
+            except OSError:
+                return
+            try:
+                conn.recv(65536)
+                if self.mode == "partial":
+                    # Headers promising a body, then the socket dies: this is
+                    # what a reboot mid-download looks like.
+                    conn.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: 1000\r\n\r\n" + b"x" * 10)
+                # Reset rather than a clean close, so the client sees ECONNRESET.
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                struct.pack("ii", 1, 0))
+            except OSError:
+                pass
+            finally:
+                with contextlib.suppress(OSError):
+                    conn.close()
+
+    def close(self) -> None:
+        self.running = False
+        with contextlib.suppress(OSError):
+            self.sock.close()
+        self.thread.join(timeout=2)
+
+
+class DroppedConnectionTests(unittest.TestCase):
+    """A device that drops the connection must never print a traceback."""
+
+    def _assert_clean_network_error(self, code: int, out: str, err: str) -> None:
+        self.assertEqual(code, sidecart.EXIT_NETWORK)
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn("Traceback", out)
+        # Exactly one line, and it is an error line.
+        lines = [ln for ln in err.strip().splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 1, f"expected one line, got: {lines!r}")
+        self.assertTrue(lines[0].startswith("error:"), lines[0])
+
+    def test_reset_before_reply(self) -> None:
+        server = _ResettingServer("immediate")
+        self.addCleanup(server.close)
+        code, out, err = _run_cli(["--host", server.host, "ping"])
+        self._assert_clean_network_error(code, out, err)
+
+    def test_reset_on_json_command(self) -> None:
+        server = _ResettingServer("immediate")
+        self.addCleanup(server.close)
+        code, out, err = _run_cli(
+            ["--host", server.host, "gemdrive", "ls", "/"])
+        self._assert_clean_network_error(code, out, err)
+
+    def test_reset_mid_download(self) -> None:
+        server = _ResettingServer("partial")
+        self.addCleanup(server.close)
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "out.bin")
+            code, out, err = _run_cli(
+                ["--host", server.host, "-q", "gemdrive", "get", "/A.BIN",
+                 dest])
+        self._assert_clean_network_error(code, out, err)
+
+    def test_reset_on_health(self) -> None:
+        server = _ResettingServer("immediate")
+        self.addCleanup(server.close)
+        code, out, err = _run_cli(["--host", server.host, "health"])
+        self._assert_clean_network_error(code, out, err)
