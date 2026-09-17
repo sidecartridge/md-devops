@@ -750,6 +750,34 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
               (unsigned long)pm);
       return 1;
     }
+    case DEVHOOKS_APP_WIFI_BAD_STATIC: {
+      uint16_t which = (payloadSize >= 2u) ? payload[0] : 0u;
+      SettingsContext *ctx = gconfig_getContext();
+      settings_put_bool(ctx, PARAM_WIFI_DHCP, false);
+      settings_put_string(ctx, PARAM_WIFI_IP, "192.168.1.60");
+      settings_put_string(ctx, PARAM_WIFI_NETMASK, "255.255.255.0");
+      settings_put_string(ctx, PARAM_WIFI_GATEWAY, "192.168.1.1");
+      switch (which) {
+        case 1:
+          settings_put_string(ctx, PARAM_WIFI_IP, "");
+          break;
+        case 2:
+          settings_put_string(ctx, PARAM_WIFI_NETMASK, "255.0.255.0");
+          break;
+        case 3:
+          settings_put_string(ctx, PARAM_WIFI_GATEWAY, "10.9.9.9");
+          break;
+        case 4:
+          break;  // leave the valid values above alone
+        default:
+          settings_put_string(ctx, PARAM_WIFI_IP, "999.1.2.3");
+          break;
+      }
+      DPRINTF("devhooks: static config case %u staged in memory\n",
+              (unsigned)which);
+      (void)cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+      return 1;
+    }
     case DEVHOOKS_APP_COUNTDOWN_STOP:
       haltCountdown = true;
       return 1;
@@ -1387,9 +1415,18 @@ static void menu(void) {
   char ipLine[80];
   snprintf(urlLine, sizeof(urlLine), "  URL         : http://%s.local/",
            hostname);
+  // A rejected static configuration has to be visible here: the menu is where
+  // the setting gets fixed, so silently running on DHCP would hide the reason
+  // the chosen address never appeared (EPIC-14 STORY-03).
+  const char *staticReason = NULL;
+  bool staticRejected = network_getStaticConfigRejected(&staticReason);
   if (apiIp.addr != 0) {
-    snprintf(ipLine, sizeof(ipLine), "  IP address  : %s",
-             ipaddr_ntoa(&apiIp));
+    snprintf(ipLine, sizeof(ipLine), "  IP address  : %s%s%s",
+             ipaddr_ntoa(&apiIp), staticRejected ? " DHCP: " : "",
+             staticRejected ? staticReason : "");
+  } else if (staticRejected) {
+    snprintf(ipLine, sizeof(ipLine), "  IP address  : (no IP) DHCP: %s",
+             staticReason);
   } else {
     snprintf(ipLine, sizeof(ipLine), "  IP address  : (no IP)");
   }
