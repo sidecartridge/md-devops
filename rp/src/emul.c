@@ -784,9 +784,19 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
       return 1;
     }
     case DEVHOOKS_APP_WIFI_SLOW_CONNECT: {
-      settings_put_string(gconfig_getContext(), PARAM_WIFI_SSID,
-                          "NO_SUCH_AP_XYZ");
-      DPRINTF("devhooks: slow connect starting (SSID staged in memory)\n");
+      // Payload 0: an SSID that does not exist (times out). Payload 1: the
+      // real SSID with a wrong key, which the access point answers with
+      // BADAUTH. Both staged in memory only.
+      uint16_t mode = (payloadSize >= 2u) ? payload[0] : 0u;
+      if (mode == 1u) {
+        settings_put_string(gconfig_getContext(), PARAM_WIFI_PASSWORD,
+                            "wrongpassword");
+        DPRINTF("devhooks: connect with a wrong key staged in memory\n");
+      } else {
+        settings_put_string(gconfig_getContext(), PARAM_WIFI_SSID,
+                            "NO_SUCH_AP_XYZ");
+        DPRINTF("devhooks: slow connect starting (SSID staged in memory)\n");
+      }
       network_setPollingCallback(emul_pollTick);
       wifi_sta_conn_process_status_t rc = network_wifiStaConnect();
       network_setPollingCallback(NULL);
