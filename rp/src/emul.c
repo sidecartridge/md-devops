@@ -2186,6 +2186,10 @@ void emul_start() {
     // press (≥ SELECT_LONG_RESET ms) fires reset_deviceAndEraseFlash.
     select_checkPushReset();
 
+    // Bring a reinserted SD card back without a reset (EPIC-15 STORY-01).
+    // Cheap while the card is mounted.
+    sdcard_pollRemount();
+
     // Heap sampling, the debug summary and debug test hooks.
     health_tick();
     devhooks_poll();

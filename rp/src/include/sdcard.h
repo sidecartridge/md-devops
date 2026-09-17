@@ -21,6 +21,13 @@ typedef enum {
   SDCARD_CREATE_FOLDER_ERROR = -3
 } sdcard_status_t;
 
+// How long to wait between remount attempts while no card is mounted.
+#define SDCARD_REMOUNT_RETRY_MS 2000u
+// How often to ask the card whether it is still there, by reading one sector.
+#define SDCARD_PRESENCE_POLL_MS 2000u
+// Longest GEMDRIVE folder name kept for a later remount.
+#define SDCARD_FOLDER_NAME_MAX 128
+
 #define SDCARD_KILOBAUD 1000
 
 // Bounds enforced by sdcard_setSpiSpeedSettings() so a malformed
@@ -136,6 +143,25 @@ void sdcard_getInfo(FATFS *fsPtr, uint32_t *totalSizeMb, uint32_t *freeSpaceMb);
  * @return true if mounted and usable; false otherwise.
  */
 bool sdcard_isMounted(void);
+
+/**
+ * @brief Tell the SD layer what a FatFs call returned.
+ *
+ * Results that mean the medium stopped answering mark the card unmounted, so
+ * sdcard_pollRemount() starts trying to bring it back. Everything else is
+ * ignored.
+ */
+void sdcard_noteResult(FRESULT fres);
+
+/**
+ * @brief Retry the mount while no card is mounted. Call from the main loop.
+ */
+void sdcard_pollRemount(void);
+
+/**
+ * @brief How many times a card has been remounted since boot.
+ */
+uint32_t sdcard_getRemountRecoveries(void);
 
 /**
  * @brief Retrieves total and free SD card space from the mounted filesystem.

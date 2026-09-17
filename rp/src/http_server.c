@@ -28,6 +28,7 @@
 #include "pico/cyw43_arch.h"
 #include "pico/time.h"
 #include "runner.h"
+#include "sdcard.h"
 #include "select.h"
 #include "settings.h"
 #include "usbcdc.h"
@@ -4646,6 +4647,9 @@ static void write_error(http_conn_t *c, int status, const char *reason,
 // report FR_NOT_ENOUGH_CORE instead of the device dying, so report that apart
 // from a disk fault: the caller can retry when memory frees up.
 static void write_fs_error(http_conn_t *c, FRESULT fr, const char *message) {
+  // A disk error may mean the card is gone; let the SD layer start retrying
+  // the mount (EPIC-15 STORY-01).
+  sdcard_noteResult(fr);
   if (fr == FR_NOT_ENOUGH_CORE) {
     write_error(c, 503, "Service Unavailable", "insufficient_memory", message);
     return;

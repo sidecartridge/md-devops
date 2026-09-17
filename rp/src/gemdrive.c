@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "sdcard.h"
 #include "aconfig.h"
 #include "chandler.h"
 #include "debug.h"
@@ -453,6 +454,7 @@ static void __not_in_flash_func(handleDfreeCall)(void) {
   uint32_t bytesPerSector = 0, sectorsPerCluster = 0;
 
   FRESULT res = f_getfree("", &freeClusters, &fs);
+  sdcard_noteResult(res);
   if (res != FR_OK || fs == NULL) {
     status = (uint32_t)-1;
     DPRINTF("GEMDRIVE Dfree: f_getfree failed (%d)\n", (int)res);
@@ -529,6 +531,7 @@ static void __not_in_flash_func(handleDsetpathCall)(uint16_t *payload) {
 
   FILINFO info;
   FRESULT res = f_stat(sdPath, &info);
+  sdcard_noteResult(res);
   if (res != FR_OK || !(info.fattrib & AM_DIR)) {
     DPRINTF("GEMDRIVE Dsetpath: '%s' not a directory (fr=%d, attr=0x%X)\n",
             sdPath, (int)res, (unsigned)info.fattrib);
@@ -649,6 +652,7 @@ static void __not_in_flash_func(handleDcreateCall)(uint16_t *payload) {
   char sdPath[GEMDRIVE_DEFAULT_PATH_LEN + 64] = {0};
   getLocalFullPathname(atari, sdPath, sizeof(sdPath));
   FRESULT res = f_mkdir(sdPath);
+  sdcard_noteResult(res);
   uint16_t status = (res == FR_OK)                ? 0
                     : (res == FR_NOT_ENOUGH_CORE) ? (uint16_t)-39   // ENSMEM
                     : (res == FR_NO_PATH)         ? (uint16_t)-34   // EPTHNF
@@ -666,6 +670,7 @@ static void __not_in_flash_func(handleDdeleteCall)(uint16_t *payload) {
   char sdPath[GEMDRIVE_DEFAULT_PATH_LEN + 64] = {0};
   getLocalFullPathname(atari, sdPath, sizeof(sdPath));
   FRESULT res = f_unlink(sdPath);
+  sdcard_noteResult(res);
   uint16_t status;
   if (res == FR_OK) {
     status = 0;
@@ -699,6 +704,7 @@ static void __not_in_flash_func(handleFcreateCall)(uint16_t *payload) {
   }
   FRESULT res = f_open(&fileTable[slotIdx].fp, sdPath,
                        FA_READ | FA_WRITE | FA_CREATE_ALWAYS);
+  sdcard_noteResult(res);
   if (res != FR_OK) {
     DPRINTF("GEMDRIVE Fcreate: '%s' -> fr=%d\n", sdPath, (int)res);
     releaseFileSlot(slotIdx);
@@ -736,6 +742,7 @@ static void __not_in_flash_func(handleFdeleteCall)(uint16_t *payload) {
   char sdPath[GEMDRIVE_DEFAULT_PATH_LEN + 64] = {0};
   getLocalFullPathname(atari, sdPath, sizeof(sdPath));
   FRESULT res = f_unlink(sdPath);
+  sdcard_noteResult(res);
   uint32_t status;
   if (res == FR_OK || res == FR_NO_FILE) {
     status = 0;  // source treats FR_NO_FILE as success
@@ -765,6 +772,7 @@ static void __not_in_flash_func(handleFattribCall)(uint16_t *payload) {
 
   FILINFO info;
   FRESULT res = f_stat(sdPath, &info);
+  sdcard_noteResult(res);
   if (res != FR_OK) {
     writeAppFreeLong(GEMDRIVE_FATTRIB_STATUS_OFFSET, (uint32_t)-33);
     return;
@@ -805,6 +813,7 @@ static void __not_in_flash_func(handleFrenameCall)(uint16_t *payload) {
   getLocalFullPathname(dstAtari, dstSd, sizeof(dstSd));
 
   FRESULT res = f_rename(srcSd, dstSd);
+  sdcard_noteResult(res);
   uint32_t status;
   if (res == FR_OK) {
     status = 0;
@@ -887,6 +896,7 @@ static void __not_in_flash_func(handleWriteBuffCall)(uint16_t *payload) {
   uint32_t writeStartUs = (uint32_t)time_us_32();
 #endif
   FRESULT res = f_write(&slot->fp, tmp, (UINT)bytes, &bw);
+  sdcard_noteResult(res);
 #if defined(_DEBUG) && (_DEBUG != 0)
   uint32_t writeUs = (uint32_t)time_us_32() - writeStartUs;
   if (writeUs > GEMDRIVE_SLOW_WRITE_US) {
@@ -974,6 +984,7 @@ static void __not_in_flash_func(handleFopenCall)(uint16_t *payload) {
   }
 
   FRESULT res = f_open(&fileTable[slotIdx].fp, sdPath, faMode);
+  sdcard_noteResult(res);
   if (res != FR_OK) {
     DPRINTF("GEMDRIVE Fopen: '%s' (mode=%lu) failed (%d)\n", sdPath,
             (unsigned long)mode, (int)res);
@@ -999,6 +1010,7 @@ static void __not_in_flash_func(handleFcloseCall)(uint16_t *payload) {
     return;
   }
   FRESULT res = f_close(&slot->fp);
+  sdcard_noteResult(res);
   releaseFileSlot(handle - GEMDRIVE_FIRST_FD);
   writeAppFreeLong(GEMDRIVE_FCLOSE_STATUS_OFFSET,
                    (res == FR_OK) ? 0 : (uint32_t)-37);
@@ -1033,6 +1045,7 @@ static void __not_in_flash_func(handleFseekCall)(uint16_t *payload) {
       return;
   }
   FRESULT res = f_lseek(&slot->fp, newPos);
+  sdcard_noteResult(res);
   if (res != FR_OK) {
     writeAppFreeLong(GEMDRIVE_FSEEK_STATUS_OFFSET, (uint32_t)-64);
     return;
@@ -1062,6 +1075,7 @@ static void __not_in_flash_func(handleReadBuffCall)(uint16_t *payload) {
   uint8_t *dst = (uint8_t *)(appFreeAddress() + GEMDRIVE_READ_BUFFER_OFFSET);
   UINT bytesRead = 0;
   FRESULT res = f_read(&slot->fp, dst, (UINT)bytesThisChunk, &bytesRead);
+  sdcard_noteResult(res);
   if (res != FR_OK) {
     writeAppFreeLong(GEMDRIVE_READ_BYTES_OFFSET, (uint32_t)-93);  // EIO_READ
     return;
@@ -1257,6 +1271,7 @@ static void __not_in_flash_func(handleFsfirstCall)(uint16_t *payload) {
   // gives us only the first hit and garbage after that.
   FILINFO info;
   FRESULT res = f_findfirst(&slot->dir, &info, sdDir, slot->pattern);
+  sdcard_noteResult(res);
   if (res == FR_OK) {
     slot->hasDir = true;
   }
@@ -1291,6 +1306,7 @@ static void __not_in_flash_func(handleFsnextCall)(uint16_t *payload) {
   }
   FILINFO info;
   FRESULT res = f_findnext(&slot->dir, &info);
+  sdcard_noteResult(res);
   if (res == FR_OK && info.fname[0]) {
     res = advancePastFiltered(&slot->dir, &info, slot->attribs);
   }
