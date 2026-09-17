@@ -51,6 +51,8 @@
 // Core 1 worker plan (chandler + tud_task + usbcdc_drain on a
 // dedicated core) is parked in the backlog — escalate
 // there only if 100 Hz proves insufficient.
+// Main loop cadence. NETWORK_CONNECT_POLL_MS (network.h) must match: the
+// blocking connect loop stands in for this loop while it runs.
 #define SLEEP_LOOP_MS 10
 
 enum {
@@ -550,6 +552,9 @@ static absolute_time_t lastCountdownTick;
 static void emul_pollTick(void) {
   health_feed();
   chandler_loop();
+  // SELECT too: this is what runs instead of the main loop for as long as a
+  // connect takes, and the button has to work throughout (EPIC-14 STORY-04).
+  select_checkPushReset();
   usbcdc_drain();
   term_loop();
 }
@@ -722,6 +727,81 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
       DPRINTF("devhooks: holding %lu KB more heap: %s\n", (unsigned long)kb,
               (block != NULL) ? "ok" : "refused");
       return (block != NULL) ? 1u : 0u;
+    }
+    case DEVHOOKS_APP_WIFI_LEAVE: {
+      // A real disassociation, so the supervisor's rejoin can be tested
+      // without touching the access point (EPIC-14 STORY-01).
+      int rc = cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+      DPRINTF("devhooks: wifi leave -> %d\n", rc);
+      return (rc == 0) ? 1u : 0u;
+    }
+    case DEVHOOKS_APP_WIFI_FAKE_GATEWAY: {
+      // Leave the association alone and just make the gateway unanswerable, so
+      // everything above the probe still reports a healthy link.
+      struct netif *nif = &cyw43_state.netif[CYW43_ITF_STA];
+      ip4_addr_t bogus;
+      IP4_ADDR(&bogus, 192, 0, 2, 1);  // TEST-NET-1, never routed
+      cyw43_arch_lwip_begin();
+      netif_set_gw(nif, &bogus);
+      cyw43_arch_lwip_end();
+      DPRINTF("devhooks: gateway pointed at 192.0.2.1\n");
+      return 1;
+    }
+    case DEVHOOKS_APP_WIFI_POWERSAVE: {
+      cyw43_wifi_pm(&cyw43_state, CYW43_PERFORMANCE_PM);
+      uint32_t pm = 0;
+      (void)cyw43_wifi_get_pm(&cyw43_state, &pm);
+      DPRINTF("devhooks: power save forced on, radio reports 0x%08lx\n",
+              (unsigned long)pm);
+      return 1;
+    }
+    case DEVHOOKS_APP_WIFI_BAD_STATIC: {
+      uint16_t which = (payloadSize >= 2u) ? payload[0] : 0u;
+      SettingsContext *ctx = gconfig_getContext();
+      settings_put_bool(ctx, PARAM_WIFI_DHCP, false);
+      settings_put_string(ctx, PARAM_WIFI_IP, "192.168.1.60");
+      settings_put_string(ctx, PARAM_WIFI_NETMASK, "255.255.255.0");
+      settings_put_string(ctx, PARAM_WIFI_GATEWAY, "192.168.1.1");
+      switch (which) {
+        case 1:
+          settings_put_string(ctx, PARAM_WIFI_IP, "");
+          break;
+        case 2:
+          settings_put_string(ctx, PARAM_WIFI_NETMASK, "255.0.255.0");
+          break;
+        case 3:
+          settings_put_string(ctx, PARAM_WIFI_GATEWAY, "10.9.9.9");
+          break;
+        case 4:
+          break;  // leave the valid values above alone
+        default:
+          settings_put_string(ctx, PARAM_WIFI_IP, "999.1.2.3");
+          break;
+      }
+      DPRINTF("devhooks: static config case %u staged in memory\n",
+              (unsigned)which);
+      (void)cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+      return 1;
+    }
+    case DEVHOOKS_APP_WIFI_SLOW_CONNECT: {
+      // Payload 0: an SSID that does not exist (times out). Payload 1: the
+      // real SSID with a wrong key, which the access point answers with
+      // BADAUTH. Both staged in memory only.
+      uint16_t mode = (payloadSize >= 2u) ? payload[0] : 0u;
+      if (mode == 1u) {
+        settings_put_string(gconfig_getContext(), PARAM_WIFI_PASSWORD,
+                            "wrongpassword");
+        DPRINTF("devhooks: connect with a wrong key staged in memory\n");
+      } else {
+        settings_put_string(gconfig_getContext(), PARAM_WIFI_SSID,
+                            "NO_SUCH_AP_XYZ");
+        DPRINTF("devhooks: slow connect starting (SSID staged in memory)\n");
+      }
+      network_setPollingCallback(emul_pollTick);
+      wifi_sta_conn_process_status_t rc = network_wifiStaConnect();
+      network_setPollingCallback(NULL);
+      DPRINTF("devhooks: slow connect returned %d\n", (int)rc);
+      return 1;
     }
     case DEVHOOKS_APP_COUNTDOWN_STOP:
       haltCountdown = true;
@@ -1360,9 +1440,18 @@ static void menu(void) {
   char ipLine[80];
   snprintf(urlLine, sizeof(urlLine), "  URL         : http://%s.local/",
            hostname);
+  // A rejected static configuration has to be visible here: the menu is where
+  // the setting gets fixed, so silently running on DHCP would hide the reason
+  // the chosen address never appeared (EPIC-14 STORY-03).
+  const char *staticReason = NULL;
+  bool staticRejected = network_getStaticConfigRejected(&staticReason);
   if (apiIp.addr != 0) {
-    snprintf(ipLine, sizeof(ipLine), "  IP address  : %s",
-             ipaddr_ntoa(&apiIp));
+    snprintf(ipLine, sizeof(ipLine), "  IP address  : %s%s%s",
+             ipaddr_ntoa(&apiIp), staticRejected ? " DHCP: " : "",
+             staticRejected ? staticReason : "");
+  } else if (staticRejected) {
+    snprintf(ipLine, sizeof(ipLine), "  IP address  : (no IP) DHCP: %s",
+             staticReason);
   } else {
     snprintf(ipLine, sizeof(ipLine), "  IP address  : (no IP)");
   }
@@ -1957,7 +2046,25 @@ void emul_start() {
   // initialized
   preinit();
 
-  // 6. Init the network, if needed
+  // 6. Configure the SELECT button and register the reset callbacks.
+  //    Short press → reset_device. Long press (≥ SELECT_LONG_RESET ms)
+  //    → reset_deviceAndEraseFlash. Edge detection + debounce + long-
+  //    press timing run in the foreground via select_checkPushReset(),
+  //    polled from the main loop below and from emul_pollTick during a
+  //    connect — Core 1 stays idle here, since launching it interferes
+  //    with the cyw43_arch_wait_for_work_until poll the main loop relies
+  //    on for Wi-Fi service.
+  //
+  //    This has to come **before** the network, not after it: the boot
+  //    connect can take three attempts of 30 s, and until the button is
+  //    configured it does nothing at all. A device that cannot reach its
+  //    access point was exactly the case where a factory reset was needed
+  //    and could not be asked for (EPIC-14 STORY-04).
+  select_configure();
+  select_setResetCallback(reset_device);
+  select_setLongResetCallback(reset_deviceAndEraseFlash);
+
+  // 7. Init the network, if needed
   // It's always a good idea to wait for the network to be ready
   // Get the WiFi mode from the settings
   // If you are developing code that does not use the network, you can
@@ -2024,17 +2131,6 @@ void emul_start() {
     }
   }
 
-  // 7. Configure the SELECT button and register the reset callbacks.
-  //    Short press → reset_device. Long press (≥ SELECT_LONG_RESET ms)
-  //    → reset_deviceAndEraseFlash. Edge detection + debounce + long-
-  //    press timing run in the foreground via select_checkPushReset(),
-  //    polled from the main loop below — Core 1 stays idle here, since
-  //    launching it interferes with the cyw43_arch_wait_for_work_until
-  //    poll the main loop relies on for Wi-Fi service.
-  select_configure();
-  select_setResetCallback(reset_device);
-  select_setLongResetCallback(reset_deviceAndEraseFlash);
-
   // Crash-loop guard: after repeated crash reboots, stay in the menu
   // instead of autobooting into whatever keeps crashing.
   if (health_isCrashLoop()) {
@@ -2069,6 +2165,10 @@ void emul_start() {
 
 #if PICO_CYW43_ARCH_POLL
     network_safePoll();
+    // Notice a link that has gone away and rejoin. Non-blocking, and the only
+    // thing that catches an association lost without a callback (EPIC-14
+    // STORY-01).
+    network_superviseLink();
     cyw43_arch_wait_for_work_until(make_timeout_time_ms(SLEEP_LOOP_MS));
 #else
     sleep_ms(SLEEP_LOOP_MS);

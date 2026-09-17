@@ -45,6 +45,28 @@
 
 #define NETWORK_POLLING_INTERVAL 100  // 100 ms
 #define NETWORK_CONNECT_TIMEOUT 30    // 30 seconds
+// How long the blocking connect loop may wait per turn. It must match the main
+// loop's SLEEP_LOOP_MS (emul.c): while a connect runs, that loop is not
+// running, and this loop's polling callback is the only thing servicing the ST,
+// the terminal, USB and the SELECT button (EPIC-14 STORY-04).
+#define NETWORK_CONNECT_POLL_MS 10
+
+// Link supervisor (EPIC-14 STORY-01). The grace period keeps it out of the way
+// of a connect that is still in progress; the backoff doubles from the minimum
+// to the maximum and stays there, so a network that is gone for hours costs one
+// attempt a minute.
+#define NETWORK_LINK_DOWN_GRACE_MS 5000u
+#define NETWORK_REJOIN_BACKOFF_MIN_MS 5000u
+#define NETWORK_REJOIN_BACKOFF_MAX_MS 60000u
+
+// Gateway reachability probe. The driver and lwIP can both report a healthy
+// link while the radio is off the network, so the supervisor asks the gateway
+// to answer an ARP request. The interval is long because each probe flushes the
+// ARP cache for the interface.
+#define NETWORK_PROBE_INTERVAL_MS 60000u
+#define NETWORK_PROBE_RETRY_MS 5000u
+#define NETWORK_PROBE_TIMEOUT_MS 3000u
+#define NETWORK_PROBE_FAILURES 3u
 
 #define NETWORK_POWER_MGMT_DISABLED 0xa11140
 #define NETWORK_POWER_MGMT_MAX_OPTIONS 5
@@ -53,7 +75,6 @@
 
 #define NETWORK_MAC_SIZE 6
 
-#define MAX_NETWORKS 100
 #define MAX_SSID_LENGTH \
   36  // SSID can have up to 32 characters + null terminator + padding
 #define MAX_BSSID_LENGTH 20
@@ -113,11 +134,7 @@ typedef struct {
   int16_t rssi;                  // Received Signal Strength Indicator
 } wifi_network_info_t;
 
-typedef struct {
-  uint32_t magic;  // Some magic value for identification/validation
-  wifi_network_info_t networks[MAX_NETWORKS];
-  uint16_t count;  // The number of networks found/stored
-} wifi_scan_data_t;
+
 
 // Function to handle callback when trying to connect
 typedef void (*NetworkPollingCallback)(void);
@@ -167,35 +184,11 @@ void network_deInit();
  */
 void network_safePoll();
 
-/**
- * @brief Initiates a scan for available WiFi networks.
- *
- * Uses timing parameters to control scanning frequency and duration.
- *
- * @param wifi_scan_time Pointer to an absolute time structure for scan timing.
- * @param wifi_scan_interval Interval between scanning cycles in milliseconds.
- * @return Number of networks discovered on success, or an error code if
- * scanning fails.
- */
-int network_scan(absolute_time_t* wifi_scan_time, int wifi_scan_interval);
 
-/**
- * @brief Indicates whether a WiFi network scan is currently active.
- *
- * Useful for preventing concurrent scan attempts.
- *
- * @return Non-zero if a scan is in progress, zero otherwise.
- */
-int network_scanIsActive();
 
-/**
- * @brief Retrieves information about found WiFi networks.
- *
- * Provides the data structure containing the list of scanned networks.
- *
- * @return Pointer to a wifi_scan_data_t structure with network details.
- */
-wifi_scan_data_t* network_getFoundNetworks();
+
+
+
 
 /**
  * @brief Attempts connecting to a WiFi network in station mode.
@@ -228,6 +221,47 @@ wifi_sta_conn_status_t network_wifiConnStatus(
  * @return Pointer to a string summarizing connection status.
  */
 char* network_wifiConnStatusStr();
+
+/**
+ * @brief Notice a lost association and rejoin, without blocking.
+ *
+ * Call once per main-loop iteration. Checks the driver's full join state as
+ * well as the lwIP link status -- neither public status call alone reports an
+ * association that has gone away -- and rearms the join with a backoff when it
+ * has. Never waits for the result.
+ */
+void network_superviseLink(void);
+
+/**
+ * @brief True when the station is associated and lwIP has an address.
+ */
+bool network_isLinkHealthy(void);
+
+/**
+ * @brief How many rejoins the supervisor has armed since boot.
+ */
+uint32_t network_getRejoinAttempts(void);
+
+/**
+ * @brief How many times the gateway probe has declared the network gone.
+ */
+uint32_t network_getProbeFailures(void);
+
+/**
+ * @brief The power-save mode read back from the radio after the last bring-up.
+ *
+ * @return false when the mode could not be read.
+ */
+bool network_getPowerSaveMode(uint32_t* pm);
+
+/**
+ * @brief True when a static TCP/IP configuration was rejected and DHCP is in
+ *        use instead.
+ *
+ * @param reason Optional; receives a short description ("no IP", "bad
+ *               netmask", "gateway off subnet", ...).
+ */
+bool network_getStaticConfigRejected(const char** reason);
 
 /**
  * @brief Returns the configured WiFi mode as text.
