@@ -47,10 +47,9 @@
 // headroom, and so CDC bytes appear on the workstation with
 // minimal latency. Lower than this gets into busy-loop
 // territory; higher and we re-introduce the visibility / drop
-// problems that motivated the optimization work. The full
-// Core 1 worker plan (chandler + tud_task + usbcdc_drain on a
-// dedicated core) is parked in the backlog — escalate
-// there only if 100 Hz proves insufficient.
+// problems that motivated the optimization work. Moving
+// chandler + tud_task + usbcdc_drain to core 1 is the next step
+// if 100 Hz ever proves insufficient; it has not been needed.
 // Main loop cadence. NETWORK_CONNECT_POLL_MS (network.h) must match: the
 // blocking connect loop stands in for this loop while it runs.
 #define SLEEP_LOOP_MS 10
@@ -1505,8 +1504,8 @@ static void menu(void) {
   // writes are done so the term renderer doesn't clobber them.
   // Frames around config groups are NOT drawn here because
   // vertical borders would slice through character columns and
-  // corrupt the text — see Tier 2 backlog if framed sections
-  // become a requirement.
+  // corrupt the text. Framed sections would need the term renderer to
+  // know about them.
   drawMenuDividers();
   drawMenuStatusIcons();
 
