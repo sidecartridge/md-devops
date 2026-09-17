@@ -1,10 +1,16 @@
 #include "include/gconfig.h"
 
+// These are Booster's global settings, not ours: md-devops reads them and never
+// writes them back (nothing here passes gconfig_getContext() to settings_save,
+// only aconfig). They are used only for keys missing from flash, so they matter
+// on a blank global config -- and there they should show the same values
+// Booster would. Kept in step with Booster v2.4.2 booster/src/gconfig.c
+// (EPIC-14 STORY-06).
 static SettingsConfigEntry defaultEntries[] = {
     {PARAM_APPS_FOLDER, SETTINGS_TYPE_STRING, "/apps"},
     {PARAM_APPS_CATALOG_URL, SETTINGS_TYPE_STRING,
-     "http://atarist.sidecartridge.com/apps.json"},
-    {PARAM_BOOT_FEATURE, SETTINGS_TYPE_STRING, "CONFIGURATOR"},
+     "https://md-store.sidecartridge.com/atari-st/apps.json"},
+    {PARAM_BOOT_FEATURE, SETTINGS_TYPE_STRING, "FABRIC"},
     {PARAM_HOSTNAME, SETTINGS_TYPE_STRING, "sidecart"},
     {PARAM_SAFE_CONFIG_REBOOT, SETTINGS_TYPE_BOOL, "true"},
     {PARAM_SD_BAUD_RATE_KB, SETTINGS_TYPE_INT, "12500"},
@@ -18,7 +24,10 @@ static SettingsConfigEntry defaultEntries[] = {
     {PARAM_WIFI_MODE, SETTINGS_TYPE_INT, "0"},
     {PARAM_WIFI_NETMASK, SETTINGS_TYPE_STRING, ""},
     {PARAM_WIFI_PASSWORD, SETTINGS_TYPE_STRING, ""},
-    {PARAM_WIFI_POWER, SETTINGS_TYPE_INT, "0"},
+    // Matches Booster's default. md-devops ignores this setting entirely and
+    // always runs the radio with power saving off (EPIC-14 STORY-02); the value
+    // is here only so a blank config reads the same in both.
+    {PARAM_WIFI_POWER, SETTINGS_TYPE_INT, "4"},
     {PARAM_WIFI_RSSI, SETTINGS_TYPE_BOOL, "true"},
     {PARAM_WIFI_SCAN_SECONDS, SETTINGS_TYPE_INT, "10"},
     {PARAM_WIFI_SSID, SETTINGS_TYPE_STRING, ""}};
