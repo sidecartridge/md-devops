@@ -26,5 +26,11 @@ void __not_in_flash_func(commemul_poll)(CommEmulSampleCallback callback);
 // Times the DMA ring lapped the reader since boot. Each one lost up to
 // a ring's worth of ROM3 samples (commands the ST retries, debug bytes).
 uint32_t commemul_getOverruns(void);
+/** EPIC-18 STORY-01: most samples ever found unread in one poll. */
+uint32_t commemul_getMaxUnread(void);
+/** EPIC-18 STORY-01: longest gap between two polls, microseconds. */
+uint32_t commemul_getMaxPollGapUs(void);
+/** EPIC-18 STORY-01: the ring's capacity in samples, for comparison. */
+uint32_t commemul_getRingWords(void);
 
 #endif  // COMMEMUL_H

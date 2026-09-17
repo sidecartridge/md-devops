@@ -36,6 +36,13 @@ static uint32_t commLastWritten = 0;
 // Ring index the channel was armed at.
 static uint32_t commArmIdx = 0;
 static uint32_t commOverruns = 0;
+// Largest number of samples found unread in a single poll, and the largest
+// gap between polls. If a debug burst really laps the ring, maxUnread reaches
+// COMM_RING_WORDS; if it never does, the ring is not the mechanism
+// (EPIC-18 STORY-01).
+static uint32_t commMaxUnread = 0;
+static uint32_t commMaxPollGapUs = 0;
+static uint32_t commLastPollUs = 0;
 static int commDmaChannel = -1;
 static int commSm = -1;
 static bool commInitialized = false;
@@ -111,6 +118,17 @@ void __not_in_flash_func(commemul_poll)(CommEmulSampleCallback callback) {
   // old and new data. Count it and drop them.
   uint32_t unread = transfersWritten - commLastWritten;
   commLastWritten = transfersWritten;
+  if (unread > commMaxUnread) {
+    commMaxUnread = unread;
+  }
+  uint32_t nowUs = (uint32_t)time_us_32();
+  if (commLastPollUs != 0) {
+    uint32_t gap = nowUs - commLastPollUs;
+    if (gap > commMaxPollGapUs) {
+      commMaxPollGapUs = gap;
+    }
+  }
+  commLastPollUs = nowUs;
   if (unread >= COMM_RING_WORDS) {
     commOverruns++;
     commReadIdx = writeIdx;
@@ -143,3 +161,6 @@ void __not_in_flash_func(commemul_poll)(CommEmulSampleCallback callback) {
 }
 
 uint32_t commemul_getOverruns(void) { return commOverruns; }
+uint32_t commemul_getMaxUnread(void) { return commMaxUnread; }
+uint32_t commemul_getMaxPollGapUs(void) { return commMaxPollGapUs; }
+uint32_t commemul_getRingWords(void) { return COMM_RING_WORDS; }

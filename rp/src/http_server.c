@@ -2990,11 +2990,16 @@ static void handle_system_health(http_conn_t *c) {
   // does not, is the parser held mid-frame by debug traffic.
   fits = fits && body_appendf(body, sizeof(body), &len,
                               ",\"tproto\":{\"step\":%lu,\"debug_in_frame\":%lu,"
-                              "\"resyncs\":%lu,\"resyncs_mid_frame\":%lu}",
+                              "\"resyncs\":%lu,\"resyncs_mid_frame\":%lu,"
+                              "\"max_unread\":%lu,\"ring_words\":%lu,"
+                              "\"max_poll_gap_us\":%lu}",
                               (unsigned long)chandler_getParseStep(),
                               (unsigned long)chandler_getDebugInFrame(),
                               (unsigned long)tprotocol_resyncs,
-                              (unsigned long)tprotocol_resyncsMidFrame);
+                              (unsigned long)tprotocol_resyncsMidFrame,
+                              (unsigned long)commemul_getMaxUnread(),
+                              (unsigned long)commemul_getRingWords(),
+                              (unsigned long)commemul_getMaxPollGapUs());
 #endif
 
   // Wi-Fi supervision (EPIC-14). power_save is read back from the radio, not
