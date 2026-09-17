@@ -1,5 +1,7 @@
 #include "include/network.h"
 
+#include "lwip/etharp.h"
+
 #include "include/health.h"
 
 static bool cyw43Initialized = false;
@@ -659,7 +661,10 @@ static void srv_txt(struct mdns_service *service, void *txt_userdata) {
 }
 #endif
 
-wifi_sta_conn_process_status_t network_wifiStaConnect() {
+// Everything up to and including arming the asynchronous join. Split out of
+// network_wifiStaConnect so the link supervisor can start a rejoin without the
+// 30 s wait loop, which must never run inside the main loop (EPIC-14 STORY-01).
+static wifi_sta_conn_process_status_t network_beginStaConnect(void) {
   if (!cyw43Initialized) {
     DPRINTF("WiFi not initialized. Cancelling connection\n");
     return NETWORK_WIFI_STA_CONN_ERR_NOT_INITIALIZED;
@@ -847,6 +852,14 @@ wifi_sta_conn_process_status_t network_wifiStaConnect() {
     DPRINTF("Failed to connect to WiFi: %d\n", errorCode);
     return NETWORK_WIFI_STA_CONN_ERR_CONNECTION_FAILED;
   }
+  return 0;
+}
+
+wifi_sta_conn_process_status_t network_wifiStaConnect() {
+  wifi_sta_conn_process_status_t armed = network_beginStaConnect();
+  if (armed != 0) {
+    return armed;
+  }
 
   // Enter a loop until the device has a WiFi connection with an IP address. Or
   // timesout.
@@ -894,6 +907,208 @@ wifi_sta_conn_process_status_t network_wifiStaConnect() {
   DPRINTF("Connected. Check the connection status...\n");
   network_updateCurrentNetworkInfoRadio();
   return 0;
+}
+
+// --- Link supervisor (EPIC-14 STORY-01) ---
+//
+// Detection is deliberately based on the lwIP link status alone, after the
+// driver's join state was measured and ruled out.
+//
+// cyw43_ctrl.c collects AUTH, LINK and KEYED as a join progresses and then
+// **collapses the whole set back to ACTIVE** the moment it completes
+// (`if (wifi_join_state == WIFI_JOIN_STATE_ALL) wifi_join_state =
+// WIFI_JOIN_STATE_ACTIVE;`, cyw43_ctrl.c:434). Read on this hardware while the
+// API was serving requests normally, `wifi_join_state` is **0x0001** -- exactly
+// the value captured on a device that had silently dropped off the network. The
+// two states are indistinguishable in the driver, so the join bits cannot tell
+// a live link from a dead one, and watching them only produced a rejoin loop on
+// a perfectly healthy connection.
+//
+// What this supervisor does catch is an ordinary disconnect, where lwIP is told
+// the link is down. The silent case -- radio gone, driver and lwIP both still
+// reporting success -- needs a liveness probe and is not solved here.
+
+// The silent case: the radio leaves the network and both the driver and lwIP
+// keep reporting success, so nothing above notices. The only way to tell is to
+// ask something on the network to answer. An ARP request for the default
+// gateway is the cheapest question available -- no sockets, no DNS, no
+// internet, one small frame -- and the reply has to come over the air.
+//
+// The ARP cache is flushed first because a stale entry would answer for a dead
+// network. That costs one re-ARP for whoever we talk to next, which is why the
+// interval is minutes rather than seconds.
+static absolute_time_t nextProbeAt;
+static absolute_time_t probeDeadline;
+static bool probeInFlight = false;
+static bool probeStarted = false;
+static uint32_t probeFailures = 0;
+static uint32_t probeDeclaredDead = 0;
+
+uint32_t network_getProbeFailures(void) { return probeDeclaredDead; }
+
+static bool network_gatewayKnown(struct netif *nif) {
+  const ip4_addr_t *gw = netif_ip4_gw(nif);
+  struct eth_addr *eth = NULL;
+  const ip4_addr_t *ip = NULL;
+  return etharp_find_addr(nif, gw, &eth, &ip) >= 0;
+}
+
+// Returns true when the probe has concluded the network is gone.
+static bool network_pollGatewayProbe(struct netif *nif) {
+  const ip4_addr_t *gw = netif_ip4_gw(nif);
+  if (gw == NULL || ip4_addr_isany(gw)) {
+    return false;  // nothing to ask
+  }
+  absolute_time_t now = get_absolute_time();
+
+  if (!probeStarted) {
+    probeStarted = true;
+    nextProbeAt = delayed_by_ms(now, NETWORK_PROBE_INTERVAL_MS);
+    return false;
+  }
+
+  if (probeInFlight) {
+    if (network_gatewayKnown(nif)) {
+      probeInFlight = false;
+      probeFailures = 0;
+      nextProbeAt = delayed_by_ms(now, NETWORK_PROBE_INTERVAL_MS);
+      return false;
+    }
+    if (absolute_time_diff_us(now, probeDeadline) > 0) {
+      return false;  // still waiting for the reply
+    }
+    probeInFlight = false;
+    probeFailures++;
+    DPRINTF("WiFi probe: gateway did not answer (%lu/%u)\n",
+            (unsigned long)probeFailures, (unsigned)NETWORK_PROBE_FAILURES);
+    if (probeFailures >= NETWORK_PROBE_FAILURES) {
+      probeFailures = 0;
+      probeDeclaredDead++;
+      nextProbeAt = delayed_by_ms(now, NETWORK_PROBE_INTERVAL_MS);
+      DPRINTF(
+          "WiFi probe: network unreachable while the link claims to be up "
+          "-- forcing a rejoin\n");
+      return true;
+    }
+    // Ask again sooner than the full interval while it looks doubtful.
+    nextProbeAt = delayed_by_ms(now, NETWORK_PROBE_RETRY_MS);
+    return false;
+  }
+
+  if (absolute_time_diff_us(now, nextProbeAt) > 0) {
+    return false;  // not time yet
+  }
+
+  cyw43_arch_lwip_begin();
+  etharp_cleanup_netif(nif);
+  err_t err = etharp_request(nif, gw);
+  cyw43_arch_lwip_end();
+  if (err != ERR_OK) {
+    DPRINTF("WiFi probe: could not send the ARP request (%d)\n", (int)err);
+    nextProbeAt = delayed_by_ms(now, NETWORK_PROBE_RETRY_MS);
+    return false;
+  }
+  probeInFlight = true;
+  probeDeadline = delayed_by_ms(now, NETWORK_PROBE_TIMEOUT_MS);
+  return false;
+}
+
+static void network_resetGatewayProbe(void) {
+  probeInFlight = false;
+  probeStarted = false;
+  probeFailures = 0;
+}
+
+static absolute_time_t linkDownSince;
+static absolute_time_t nextRejoinAt;
+static bool linkSupervisorTripped = false;
+static uint32_t rejoinBackoffMs = NETWORK_REJOIN_BACKOFF_MIN_MS;
+static uint32_t rejoinAttempts = 0;
+
+uint32_t network_getRejoinAttempts(void) { return rejoinAttempts; }
+
+bool network_isLinkHealthy(void) {
+  if (!cyw43Initialized || wifiCurrentMode != WIFI_MODE_STA) {
+    return false;
+  }
+  return cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) ==
+         CYW43_LINK_UP;
+}
+
+void network_superviseLink(void) {
+  if (!cyw43Initialized || wifiCurrentMode != WIFI_MODE_STA) {
+    return;
+  }
+
+  struct netif *nif = &cyw43_state.netif[CYW43_ITF_STA];
+
+  if (network_isLinkHealthy()) {
+    if (linkSupervisorTripped) {
+      DPRINTF("WiFi supervisor: link healthy again after %lu attempt(s)\n",
+              (unsigned long)rejoinAttempts);
+      linkSupervisorTripped = false;
+      rejoinBackoffMs = NETWORK_REJOIN_BACKOFF_MIN_MS;
+      network_resetGatewayProbe();
+    }
+    // lwIP is satisfied, which is exactly what it was during the failure this
+    // story exists for. Ask the network itself.
+    if (!network_pollGatewayProbe(nif)) {
+      return;
+    }
+    // An unreachable network is treated as a link that is down.
+    snprintf(connectionStatusStr, sizeof(connectionStatusStr), "UNREACHABLE");
+    linkSupervisorTripped = true;
+    linkDownSince = get_absolute_time();
+    nextRejoinAt = get_absolute_time();
+    rejoinBackoffMs = NETWORK_REJOIN_BACKOFF_MIN_MS;
+    network_resetGatewayProbe();
+  }
+
+  absolute_time_t now = get_absolute_time();
+  if (!linkSupervisorTripped) {
+    // Give an ordinary reconnect a moment to finish before interfering: a
+    // rejoin in progress looks exactly like a link that is down.
+    linkSupervisorTripped = true;
+    linkDownSince = now;
+    nextRejoinAt = delayed_by_ms(now, NETWORK_LINK_DOWN_GRACE_MS);
+    rejoinBackoffMs = NETWORK_REJOIN_BACKOFF_MIN_MS;
+    DPRINTF("WiFi supervisor: link down (tcpip status %d)\n",
+            cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA));
+    snprintf(connectionStatusStr, sizeof(connectionStatusStr), "REJOINING");
+    return;
+  }
+
+  if (absolute_time_diff_us(now, nextRejoinAt) > 0) {
+    return;  // waiting out the grace period or the backoff
+  }
+
+  // A wrong key is worth retrying -- a router can come back with the right one
+  // -- but not every few seconds.
+  if (cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA) ==
+      CYW43_LINK_BADAUTH) {
+    rejoinBackoffMs = NETWORK_REJOIN_BACKOFF_MAX_MS;
+    snprintf(connectionStatusStr, sizeof(connectionStatusStr), "BAD AUTH");
+  }
+
+  rejoinAttempts++;
+  DPRINTF("WiFi supervisor: rejoin attempt %lu, down for %lld ms\n",
+          (unsigned long)rejoinAttempts,
+          absolute_time_diff_us(linkDownSince, now) / 1000);
+  // Tearing the interface down and arming the join takes tens of milliseconds
+  // of SPI traffic to the radio, so keep the watchdog fed across it.
+  health_feed();
+  wifi_sta_conn_process_status_t armed = network_beginStaConnect();
+  health_feed();
+  network_resetGatewayProbe();
+  if (armed != 0) {
+    DPRINTF("WiFi supervisor: rejoin could not be armed (%d)\n", (int)armed);
+  }
+
+  nextRejoinAt = delayed_by_ms(get_absolute_time(), rejoinBackoffMs);
+  rejoinBackoffMs *= 2;
+  if (rejoinBackoffMs > NETWORK_REJOIN_BACKOFF_MAX_MS) {
+    rejoinBackoffMs = NETWORK_REJOIN_BACKOFF_MAX_MS;
+  }
 }
 
 char *network_wifiConnStatusStr() { return connectionStatusStr; }

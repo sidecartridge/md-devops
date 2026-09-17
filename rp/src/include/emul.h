@@ -31,6 +31,16 @@ void emul_start();
 // Hold the given number of KB of heap (first payload word), to test what the
 // firmware does when memory runs out; 0 KB releases it again.
 #define DEVHOOKS_APP_HEAP_HOLD 3
+// Debug builds only. Disassociates the station, so the link supervisor's
+// rejoin can be tested without touching the access point (EPIC-14 STORY-01).
+#define DEVHOOKS_APP_WIFI_LEAVE 4
+// Debug builds only. Points the default gateway at TEST-NET-1 (192.0.2.1),
+// which nothing will ever answer for, while the association and the address
+// stay genuinely healthy. The link looks perfect to the driver and to lwIP and
+// the API keeps serving, so only the gateway probe can notice -- the closest
+// reachable stand-in for the silent failure, which cannot be produced on
+// demand (EPIC-14 STORY-01).
+#define DEVHOOKS_APP_WIFI_FAKE_GATEWAY 5
 
 /**
  * @brief Whether the user picked Runner mode at boot ([U] in the
