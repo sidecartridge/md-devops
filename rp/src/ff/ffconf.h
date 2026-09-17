@@ -210,7 +210,7 @@ function needs to implement /  GET_SECTOR_SIZE command. */
 /* The same value for every build type: a debug build must differ from a
 /  release build only by its traces, not by the size of every FIL object. */
 #define FF_FS_TINY 1
-/* 1 (EPIC-12 STORY-03): each open FIL keeps its own 512-byte sector buffer at
+/* 1: each open FIL keeps its own 512-byte sector buffer at
 /  0, which is 6 KB of RAM across the file slots this app opens. Measured with
 /  both settings: an 8 x 512 KB copy from the ST, which interleaves a read and
 /  a write through the shared buffer, took 47 s at 0 and 48 s at 1, and the
@@ -251,7 +251,7 @@ number.
 /  bit1=1: Do not trust last allocated cluster number in the FSINFO.
 */
 
-/* 28 = the worst case this firmware can reach at once (EPIC-13 STORY-06):
+/* 28 = the worst case this firmware can reach at once:
 /  GEMDRIVE_MAX_OPEN_FILES 8 open files, plus GEMDRIVE_MAX_DTAS 16 searches that
 /  each keep a DIR open between Fsfirst and Fsnext, plus the HTTP server's
 /  HTTP_SERVER_MAX_CONNECTIONS 2 connections holding a FIL and a DIR each.

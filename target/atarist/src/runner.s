@@ -20,8 +20,8 @@
 ;   3. Publish the RUNNER_HELLO magic + protocol version into the
 ;      Runner shared sub-region so the RP-side `GET /api/v1/runner`
 ;      handshake reports `active=true`.
-;   4. Loop forever (active foreground poll). Subsequent stories
-;      add the actual command dispatch (RESET / EXECUTE / CD).
+;   4. Loop forever (active foreground poll). Command dispatch
+;      (RESET / EXECUTE / CD) is layered on top of this loop.
 
 	section text
 

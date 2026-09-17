@@ -10,7 +10,7 @@
 static FATFS *mountedFsPtr = NULL;
 static bool sdMounted = false;
 
-// Remount state (EPIC-15 STORY-01). The card is mounted once at boot, so a card
+// Remount state. The card is mounted once at boot, so a card
 // pulled and put back stayed dead until a reset: FatFs keeps the volume
 // registered, and with card-detect disabled on this board nothing ever marks
 // the drive uninitialised, so mount_volume() sees a mounted volume and never

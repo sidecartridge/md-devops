@@ -48,10 +48,10 @@
 // How long the blocking connect loop may wait per turn. It must match the main
 // loop's SLEEP_LOOP_MS (emul.c): while a connect runs, that loop is not
 // running, and this loop's polling callback is the only thing servicing the ST,
-// the terminal, USB and the SELECT button (EPIC-14 STORY-04).
+// the terminal, USB and the SELECT button.
 #define NETWORK_CONNECT_POLL_MS 10
 
-// Link supervisor (EPIC-14 STORY-01). The grace period keeps it out of the way
+// Link supervisor. The grace period keeps it out of the way
 // of a connect that is still in progress; the backoff doubles from the minimum
 // to the maximum and stays there, so a network that is gone for hours costs one
 // attempt a minute.

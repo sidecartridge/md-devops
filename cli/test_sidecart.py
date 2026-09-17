@@ -774,7 +774,7 @@ class PutTests(unittest.TestCase):
 
 
 class RunnerStatusTests(unittest.TestCase):
-    """Epic 03 / S1 — `sidecart runner status`."""
+    """`sidecart runner status`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -829,7 +829,7 @@ class RunnerStatusTests(unittest.TestCase):
 
 
 class RunnerResetTests(unittest.TestCase):
-    """Epic 03 / S2 — `sidecart runner reset`."""
+    """`sidecart runner reset`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -861,7 +861,7 @@ class RunnerResetTests(unittest.TestCase):
 
 
 class RunnerRunTests(unittest.TestCase):
-    """Epic 03 / S3 — `sidecart runner run`."""
+    """`sidecart runner run`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -914,7 +914,7 @@ class RunnerRunTests(unittest.TestCase):
 
 
 class RunnerLoadTests(unittest.TestCase):
-    """Epic 06 / S5 — `sidecart runner load`."""
+    """`sidecart runner load`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -991,7 +991,7 @@ class RunnerLoadTests(unittest.TestCase):
 
 
 class RunnerExecTests(unittest.TestCase):
-    """Epic 06 / S6 — `sidecart runner exec`."""
+    """`sidecart runner exec`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1044,7 +1044,7 @@ class RunnerExecTests(unittest.TestCase):
 
 
 class RunnerUnloadTests(unittest.TestCase):
-    """Epic 06 / S7 — `sidecart runner unload`."""
+    """`sidecart runner unload`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1100,7 +1100,7 @@ class RunnerUnloadTests(unittest.TestCase):
 
 
 class RunnerCdTests(unittest.TestCase):
-    """Epic 03 / S4 — `sidecart runner cd`."""
+    """`sidecart runner cd`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1151,7 +1151,7 @@ class RunnerCdTests(unittest.TestCase):
 
 
 class RunnerResTests(unittest.TestCase):
-    """Epic 03 / S5 — `sidecart runner res`."""
+    """`sidecart runner res`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1199,7 +1199,7 @@ class RunnerResTests(unittest.TestCase):
 
 
 class RunnerMeminfoTests(unittest.TestCase):
-    """Epic 03 / S6 — `sidecart runner meminfo`."""
+    """`sidecart runner meminfo`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1277,7 +1277,7 @@ class RunnerMeminfoTests(unittest.TestCase):
 
 
 class RunnerAdvStatusTests(unittest.TestCase):
-    """Epic 04 / S1 — `sidecart runner adv status`."""
+    """`sidecart runner adv status`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1339,7 +1339,7 @@ class RunnerAdvStatusTests(unittest.TestCase):
 
 
 class RunnerAdvMeminfoTests(unittest.TestCase):
-    """Epic 04 / S6 — `sidecart runner adv meminfo`."""
+    """`sidecart runner adv meminfo`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1391,7 +1391,7 @@ class RunnerAdvMeminfoTests(unittest.TestCase):
 
 
 class RunnerAdvJumpTests(unittest.TestCase):
-    """Epic 04 / S7 — `sidecart runner adv jump`."""
+    """`sidecart runner adv jump`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1471,7 +1471,7 @@ class RunnerAdvJumpTests(unittest.TestCase):
 
 
 class RunnerAdvLoadTests(unittest.TestCase):
-    """Epic 04 / S8 — `sidecart runner adv load`."""
+    """`sidecart runner adv load`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1553,7 +1553,7 @@ class RunnerAdvLoadTests(unittest.TestCase):
 
 
 class DebugStatusTests(unittest.TestCase):
-    """Epic 05 v2 / S3 — `sidecart debug status`."""
+    """`sidecart debug status`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1624,7 +1624,7 @@ class DebugStatusTests(unittest.TestCase):
 
 
 class DebugTailTests(unittest.TestCase):
-    """Epic 05 v2 / S4 — `sidecart debug tail`.
+    """`sidecart debug tail`.
 
     Byte-level streaming of the response body is exercised on
     hardware (urllib + chunked transfer-encoding is stdlib
@@ -1724,7 +1724,7 @@ class _ResettingServer:
     Covers what the device does when it reboots under a command: a watchdog,
     a panic or a SELECT press all cut the socket without a reply, and urllib
     surfaces that as ConnectionResetError or RemoteDisconnected rather than
-    URLError (EPIC-15 STORY-03).
+    URLError.
     """
 
     def __init__(self, mode: str = "immediate") -> None:

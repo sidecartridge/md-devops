@@ -296,11 +296,11 @@ endif()
 # Pass the _DEBUG flag to the C compiler
 add_definitions(-D_DEBUG=${_DEBUG})
 
-# Guard the bottom of core 0's stack with the MPU (EPIC-12 STORY-05): an
+# Guard the bottom of core 0's stack with the MPU: an
 # overflow faults at the guard instead of writing down through the heap and,
 # past it, the cartridge window the ST reads. Both build types on purpose: in a
 # shipping build the alternative is silent corruption that surfaces later as a
-# mystery, while a fault reboots with a breadcrumb (D-03). Costs one of the
+# mystery, while a fault reboots with a breadcrumb. Costs one of the
 # eight MPU regions (nothing else here uses the MPU), the lowest 32 bytes of
 # the stack, and a few instructions per core at boot.
 add_definitions(-DPICO_USE_STACK_GUARDS=1)
@@ -331,7 +331,7 @@ add_definitions(-DPICO_FLASH_ASSUME_CORE0_SAFE=1)
 # undefined behaviour.
 add_definitions(-DCFG_TUD_CDC_TX_BUFSIZE=1024)
 
-# Print the RAM and flash budget after every link (EPIC-12 STORY-06), with the
+# Print the RAM and flash budget after every link, with the
 # same script that fills the CI job summary, so a local build and a CI build
 # report the same numbers. Skipped when no python3 is around.
 find_package(Python3 COMPONENTS Interpreter QUIET)

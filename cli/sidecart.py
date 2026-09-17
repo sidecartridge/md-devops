@@ -72,9 +72,9 @@ REQUEST_TIMEOUT_S = 10
 # The device dropping a connection is a normal thing to survive -- it reboots
 # on a watchdog, a panic or a SELECT press, and the HTTP server closes idle
 # connections on purpose. urllib only wraps some of that in URLError; the rest
-# escapes as a bare OSError and used to reach the user as a traceback
-# (EPIC-15 STORY-03). IncompleteRead is in here because a chunked body cut
-# short raises it rather than an OSError.
+# escapes as a bare OSError and used to reach the user as a traceback.
+# IncompleteRead is in here because a chunked body cut short raises it rather
+# than an OSError.
 CONNECTION_DROPPED = (
     ConnectionResetError,
     ConnectionAbortedError,
@@ -93,8 +93,8 @@ def _dropped(operation: str, exc: BaseException) -> int:
           file=sys.stderr)
     return EXIT_NETWORK
 
-# Granular exit-code map (see docs/epics/02-http-api.md "CLI / Exit code
-# map"). Lets shell scripts branch on category.
+# Granular exit-code map, so shell scripts can branch on the category of a
+# failure rather than parsing the message.
 EXIT_OK = 0
 EXIT_GENERIC = 1
 EXIT_USAGE = 2
@@ -928,7 +928,7 @@ def cmd_debug_tail(args: argparse.Namespace) -> int:
 
 
 def cmd_debug_status(args: argparse.Namespace) -> int:
-    """GET /api/v1/debug — fast-debug-traces diagnostics (Epic 05 v2)."""
+    """GET /api/v1/debug — fast-debug-traces diagnostics."""
     url = base_url(args.host) + "/api/v1/debug"
     try:
         status, parsed, raw = request_json("GET", url)
@@ -1077,7 +1077,7 @@ def cmd_runner_reset(args: argparse.Namespace) -> int:
 
 
 def cmd_runner_status(args: argparse.Namespace) -> int:
-    """GET /api/v1/runner — Epic 03 Runner state."""
+    """GET /api/v1/runner — Runner state."""
     url = base_url(args.host) + "/api/v1/runner"
     try:
         status, parsed, raw = request_json("GET", url)
@@ -1123,7 +1123,7 @@ def cmd_runner_status(args: argparse.Namespace) -> int:
     else:
         print(f"last     : {last_cmd} {last_path} (exit={last_exit})")
 
-    # Epic 06 / S5+S6 — Pexec load+exec split state. Print only
+    # Pexec load+exec split state. Print only
     # when there's a basepage pending or a load error to report,
     # so a fresh-boot status stays uncluttered.
     loaded_basepage = parsed.get("loaded_basepage")
@@ -1293,7 +1293,7 @@ def build_parser() -> argparse.ArgumentParser:
         "health",
         help="Device health: heap, stack, last reset reason, drops.")
 
-    # Epic 06 / S10 — file/folder management verbs grouped under
+    # File/folder management verbs grouped under
     # `gemdrive` so they nest at the same depth as `runner` and
     # `debug` instead of polluting the top level. The HTTP API
     # (/api/v1/gemdrive/files/*, /api/v1/gemdrive/folders/*, /api/v1/gemdrive/volume) is
@@ -1332,7 +1332,7 @@ def build_parser() -> argparse.ArgumentParser:
     put.add_argument("-f", "--force", action="store_true",
                      help="Overwrite if the remote file exists.")
 
-    runner = sub.add_parser("runner", help="Runner mode (Epic 03).")
+    runner = sub.add_parser("runner", help="Runner mode.")
     runner_sub = runner.add_subparsers(dest="runner_cmd", required=True)
     runner_sub.add_parser("status", help="Show Runner state and last completion.")
     runner_sub.add_parser("reset", help="Cold-reset the Atari ST.")
@@ -1349,7 +1349,7 @@ def build_parser() -> argparse.ArgumentParser:
         "meminfo",
         help="System memory snapshot from the live ST (synchronous).")
     adv_p = runner_sub.add_parser(
-        "adv", help="Advanced Runner (Epic 04) — VBL hook diagnostics.")
+        "adv", help="Advanced Runner — VBL hook diagnostics.")
     adv_sub = adv_p.add_subparsers(dest="adv_cmd", required=True)
     adv_sub.add_parser(
         "status",
@@ -1422,7 +1422,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     debug = sub.add_parser(
         "debug",
-        help="Fast-debug-traces (Epic 05) diagnostics + transports.")
+        help="Fast-debug-traces diagnostics + transports.")
     debug_sub = debug.add_subparsers(dest="debug_cmd", required=True)
     debug_sub.add_parser(
         "status",
@@ -1446,7 +1446,7 @@ def main(argv: list[str] | None = None) -> int:
         "health": cmd_health,
     }
     if args.cmd == "gemdrive":
-        # Epic 06 / S10 — file/folder verbs grouped under
+        # File/folder verbs grouped under
         # `gemdrive` so the CLI's nesting depth matches the
         # other subcommand families (runner, debug). HTTP API
         # endpoints are unchanged.

@@ -91,7 +91,7 @@ bool network_getPowerSaveMode(uint32_t *pm) {
 
 static char *network_trim_ascii_spaces(char *text);
 
-// --- Static TCP/IP validation (EPIC-14 STORY-03) ---
+// --- Static TCP/IP validation ---
 //
 // The static branch used to dereference settings_find_entry(...)->value for the
 // address, netmask and gateway with no NULL check, so a global config missing
@@ -599,7 +599,7 @@ int network_wifiInit(wifi_mode_t mode) {
     wifiCurrentMode = WIFI_MODE_AP;
   }
 
-  // PARAM_WIFI_POWER is deliberately ignored (EPIC-14 STORY-02, D-07). Two
+  // PARAM_WIFI_POWER is deliberately ignored. Two
   // reasons: it never reached the radio anyway, and no value of it is wanted.
   //
   // It never arrived because every connect calls network_resetStaInterface,
@@ -632,8 +632,8 @@ void network_safePoll() {
 }
 
 // Wi-Fi scanning lived here: network_scan(), network_scanIsActive() and
-// network_getFoundNetworks(), with a 100-entry result table. Removed in EPIC-14
-// STORY-07. Nothing ever called them -- scanning and Wi-Fi configuration belong
+// network_getFoundNetworks(), with a 100-entry result table. Removed in v1.1.
+// Nothing ever called them -- scanning and Wi-Fi configuration belong
 // to Booster, which this app only reads settings from -- and the scan callbacks
 // were GCC nested functions, which clang-based tooling cannot parse, so the
 // dead code also cost every editor check in the file.
@@ -696,7 +696,7 @@ static void srv_txt(struct mdns_service *service, void *txt_userdata) {
 
 // Everything up to and including arming the asynchronous join. Split out of
 // network_wifiStaConnect so the link supervisor can start a rejoin without the
-// 30 s wait loop, which must never run inside the main loop (EPIC-14 STORY-01).
+// 30 s wait loop, which must never run inside the main loop.
 static wifi_sta_conn_process_status_t network_beginStaConnect(void) {
   if (!cyw43Initialized) {
     DPRINTF("WiFi not initialized. Cancelling connection\n");
@@ -894,8 +894,8 @@ static wifi_sta_conn_process_status_t network_beginStaConnect(void) {
     DPRINTF(
         "No password found in config. Trying to connect without password\n");
   }
-  // Never the password itself: these logs get pasted into issues and chats
-  // (EPIC-14 STORY-05). Whether one is set is all that helps when debugging.
+  // Never the password itself: these logs get pasted into issues and chats.
+  // Whether one is set is all that helps when debugging.
   DPRINTF("Password: %s\n",
           (passwordValue != NULL && passwordValue[0] != '\0') ? "<set>"
                                                               : "<none>");
@@ -946,7 +946,7 @@ wifi_sta_conn_process_status_t network_wifiStaConnect() {
     network_safePoll();
     // The polling callback below is the only thing servicing the ST, the
     // terminal, USB and SELECT while this loop runs, so it has to turn at the
-    // main loop's rate rather than sleeping for seconds (EPIC-14 STORY-04).
+    // main loop's rate rather than sleeping for seconds.
     cyw43_arch_wait_for_work_until(make_timeout_time_ms(NETWORK_CONNECT_POLL_MS));
 #else
     sleep_ms(NETWORK_POLLING_INTERVAL);
@@ -977,7 +977,7 @@ wifi_sta_conn_process_status_t network_wifiStaConnect() {
   return 0;
 }
 
-// --- Link supervisor (EPIC-14 STORY-01) ---
+// --- Link supervisor ---
 //
 // Detection is deliberately based on the lwIP link status alone, after the
 // driver's join state was measured and ruled out.
@@ -1119,7 +1119,7 @@ void network_superviseLink(void) {
       network_resetGatewayProbe();
     }
     // lwIP is satisfied, which is exactly what it was during the failure this
-    // story exists for. Ask the network itself.
+    // supervisor exists for. Ask the network itself.
     if (!network_pollGatewayProbe(nif)) {
       return;
     }

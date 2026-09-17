@@ -4,8 +4,7 @@
 // writes them back (nothing here passes gconfig_getContext() to settings_save,
 // only aconfig). They are used only for keys missing from flash, so they matter
 // on a blank global config -- and there they should show the same values
-// Booster would. Kept in step with Booster v2.4.2 booster/src/gconfig.c
-// (EPIC-14 STORY-06).
+// Booster would. Kept in step with Booster v2.4.2 booster/src/gconfig.c.
 static SettingsConfigEntry defaultEntries[] = {
     {PARAM_APPS_FOLDER, SETTINGS_TYPE_STRING, "/apps"},
     {PARAM_APPS_CATALOG_URL, SETTINGS_TYPE_STRING,
@@ -25,7 +24,7 @@ static SettingsConfigEntry defaultEntries[] = {
     {PARAM_WIFI_NETMASK, SETTINGS_TYPE_STRING, ""},
     {PARAM_WIFI_PASSWORD, SETTINGS_TYPE_STRING, ""},
     // Matches Booster's default. md-devops ignores this setting entirely and
-    // always runs the radio with power saving off (EPIC-14 STORY-02); the value
+    // always runs the radio with power saving off; the value
     // is here only so a blank config reads the same in both.
     {PARAM_WIFI_POWER, SETTINGS_TYPE_INT, "4"},
     {PARAM_WIFI_RSSI, SETTINGS_TYPE_BOOL, "true"},

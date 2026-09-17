@@ -32,35 +32,34 @@ void emul_start();
 // firmware does when memory runs out; 0 KB releases it again.
 #define DEVHOOKS_APP_HEAP_HOLD 3
 // Debug builds only. Disassociates the station, so the link supervisor's
-// rejoin can be tested without touching the access point (EPIC-14 STORY-01).
+// rejoin can be tested without touching the access point.
 #define DEVHOOKS_APP_WIFI_LEAVE 4
 // Debug builds only. Points the default gateway at TEST-NET-1 (192.0.2.1),
 // which nothing will ever answer for, while the association and the address
 // stay genuinely healthy. The link looks perfect to the driver and to lwIP and
 // the API keeps serving, so only the gateway probe can notice -- the closest
 // reachable stand-in for the silent failure, which cannot be produced on
-// demand (EPIC-14 STORY-01).
+// demand.
 #define DEVHOOKS_APP_WIFI_FAKE_GATEWAY 5
 // Debug builds only. Puts the radio back into the PM2 power-save mode the
 // driver applies by default, so the cost of power saving can be measured
-// against the no-power-save default (EPIC-14 STORY-02).
+// against the no-power-save default.
 #define DEVHOOKS_APP_WIFI_POWERSAVE 6
 // Debug builds only. Overrides the global Wi-Fi settings **in memory only**
 // (settings_put_* does not touch flash; only settings_save does) so the static
 // TCP/IP validation can be exercised without rewriting the user's config -- a
 // reboot restores it. Payload word 0 picks the case: 0 invalid address,
-// 1 missing address, 2 non-contiguous netmask, 3 gateway off subnet
-// (EPIC-14 STORY-03).
+// 1 missing address, 2 non-contiguous netmask, 3 gateway off subnet.
 #define DEVHOOKS_APP_WIFI_BAD_STATIC 7
 // Debug builds only. Reproduces the boot connect: stages an SSID that does not
 // exist (in memory only, so a reboot restores the real one) and runs the same
 // blocking network_wifiStaConnect() with the same polling callback, which then
 // times out after NETWORK_CONNECT_TIMEOUT. Used to check that SELECT, the ST
-// and the terminal stay alive for the whole attempt (EPIC-14 STORY-04).
+// and the terminal stay alive for the whole attempt.
 #define DEVHOOKS_APP_WIFI_SLOW_CONNECT 8
 // Debug builds only. Makes the next N GEMDRIVE write chunks stall after the
 // data is committed but before the ST is answered, which is exactly the shape
-// of the failure in EPIC-15 STORY-05: the write happened, the answer was lost,
+// of the bug this guards against: the write happened, the answer was lost,
 // and the ST re-sends the chunk. Payload word 0 = how many chunks to stall.
 #define DEVHOOKS_APP_GEMDRIVE_STALL 9
 

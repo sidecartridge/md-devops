@@ -45,9 +45,8 @@ void select_configure() {
 bool select_detectPush() { return (gpio_get(SELECT_GPIO) != 0); }
 
 // The core-1 SELECT watcher lived here: select_waitPush(),
-// select_coreWaitPush() and select_coreWaitPushDisable(). Removed in EPIC-14
-// STORY-07. Nothing called them, and EPIC-07 STORY-01 had already backed core 1
-// out because running it froze the Wi-Fi poll loop the main loop depends on.
+// select_coreWaitPush() and select_coreWaitPushDisable(). Removed in v1.1.
+// Nothing called them, and core 1 had already been backed out earlier because running it froze the Wi-Fi poll loop the main loop depends on.
 // Using it again would also need Booster's flash lockout (its settings.c grew
 // select_flashLockoutBegin once core 1 executed from flash during an erase), so
 // a ready-made entry point into a known hazard was worth deleting rather than

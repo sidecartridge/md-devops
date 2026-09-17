@@ -48,9 +48,9 @@ extern unsigned char __rom_in_ram_start__[];
 // arrives in S5.
 #define HTTP_RESPONSE_BUF_BYTES 1024
 // The path buffers of the larger handlers are declared `static` rather than on
-// the stack (EPIC-12 STORY-03): they made single frames of up to 1,672 bytes,
+// the stack: they made single frames of up to 1,672 bytes,
 // and the deepest path through this file 3,784. Safe because the server is
-// single-threaded (C-09) and a handler runs to completion within one call --
+// single-threaded and a handler runs to completion within one call --
 // the Runner's spin-waits pump chandler_loop only, never lwIP, so no second
 // request can enter a handler while one is in progress.
 #define HTTP_PATH_BUF_BYTES 192
@@ -2979,7 +2979,7 @@ static void handle_system_health(http_conn_t *c) {
       (unsigned long)commemul_getOverruns(), (unsigned long)bytes_dropped,
       (unsigned long)usbcdc_dropped);
 
-  // Wi-Fi supervision (EPIC-14). power_save is read back from the radio, not
+  // Wi-Fi supervision. power_save is read back from the radio, not
   // the value we asked for: the driver reapplies its own default on every
   // bring-up, so the only honest answer is what the chip reports.
   uint32_t pm = 0;
@@ -4361,8 +4361,7 @@ static void route(http_conn_t *c) {
 
   // Everything under /gemdrive needs the card, and so does loading a program
   // from it. One check here is what keeps the answer identical across volume,
-  // listings, downloads, uploads, folder operations and the Runner
-  // (EPIC-15 STORY-02).
+  // listings, downloads, uploads, folder operations and the Runner.
   static const char gemdrive_prefix[] = "/api/v1/gemdrive";
   static const char runner_load_prefix[] = "/api/v1/runner/load";
   static const char runner_run_prefix[] = "/api/v1/runner/run";
@@ -4660,10 +4659,10 @@ static void write_error(http_conn_t *c, int status, const char *reason,
   write_response(c, status, reason, "application/json", body, (size_t)n);
 }
 
-// A FatFs call failed. With the malloc panic off (EPIC-11 STORY-01) FatFs can
+// A FatFs call failed. With the malloc panic off FatFs can
 // report FR_NOT_ENOUGH_CORE instead of the device dying, so report that apart
 // from a disk fault: the caller can retry when memory frees up.
-// Every SD endpoint answers a missing card the same way (EPIC-15 STORY-02).
+// Every SD endpoint answers a missing card the same way.
 // Before this, /volume said 503 "busy" while a listing said 500 "disk_error"
 // for the same missing card, and a listing could even answer 200 with an empty
 // directory from FatFs's cache.
@@ -4674,7 +4673,7 @@ static void write_no_card(http_conn_t *c) {
 
 static void write_fs_error(http_conn_t *c, FRESULT fr, const char *message) {
   // A disk error may mean the card is gone; let the SD layer start retrying
-  // the mount (EPIC-15 STORY-01).
+  // the mount.
   sdcard_noteResult(fr);
   // If that is what happened, say so rather than reporting a disk fault: the
   // card being out is a different thing from the card being broken.
@@ -4688,7 +4687,7 @@ static void write_fs_error(http_conn_t *c, FRESULT fr, const char *message) {
   }
   // FatFs's lock table is shared with GEMDRIVE (FF_FS_LOCK in ffconf.h). A
   // full table means the ST is holding its share right now, so this is also
-  // worth retrying rather than a disk fault (EPIC-13 STORY-06).
+  // worth retrying rather than a disk fault.
   if (fr == FR_TOO_MANY_OPEN_FILES) {
     write_error(c, 503, "Service Unavailable", "too_many_open_files", message);
     return;

@@ -350,7 +350,7 @@ old_handler:
 	even
 
 ; ====================================================================
-; write_seq — chunk sequence number for .Fwrite (EPIC-15 STORY-05).
+; write_seq — chunk sequence number for .Fwrite.
 ;
 ; Bumped once per chunk, never per retry, and never reset: every retry
 ; of a chunk carries the number the first attempt carried, and no two

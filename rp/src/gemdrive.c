@@ -49,7 +49,7 @@ static char dpathStr[GEMDRIVE_DEFAULT_PATH_LEN] = "\\";
 typedef struct {
   bool inUse;
   FIL fp;
-  // Last write chunk accepted on this handle (EPIC-15 STORY-05). The m68k
+  // Last write chunk accepted on this handle. The m68k
   // bumps its sequence once per chunk and re-sends the same one on every
   // retry, so a repeat means the ST never heard the answer -- not that there
   // is more data. Writing it again is what duplicated a chunk and lost the
@@ -875,8 +875,9 @@ static void __not_in_flash_func(handleFdatetimeCall)(uint16_t *payload) {
 }
 
 #if defined(_DEBUG) && (_DEBUG != 0)
-// Debug-only fault injection for EPIC-15 STORY-05: stall after committing a
-// chunk so the ST's synchronous wait times out and it re-sends that chunk.
+// Debug-only fault injection for the retried-chunk path: stall after
+// committing a chunk so the ST's synchronous wait times out and it re-sends
+// that chunk.
 static volatile uint16_t gemdriveWriteStallChunks = 0;
 static volatile uint16_t gemdriveWriteStallDs = 20;  // 100 ms units
 
@@ -908,7 +909,7 @@ static void __not_in_flash_func(handleWriteBuffCall)(uint16_t *payload) {
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   uint32_t bytes = TPROTO_GET_PAYLOAD_PARAM32(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
-  // d5 carries the chunk sequence number (EPIC-15 STORY-05).
+  // d5 carries the chunk sequence number.
   uint32_t seq = TPROTO_GET_PAYLOAD_PARAM32(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
 
@@ -931,7 +932,7 @@ static void __not_in_flash_func(handleWriteBuffCall)(uint16_t *payload) {
   }
 
   // Swap the chunk where it already sits, in the parser's payload buffer: a
-  // 1 KB copy on the stack for every chunk (EPIC-12 STORY-03).
+  // 1 KB copy on the stack for every chunk.
   uint8_t *tmp = (uint8_t *)payload;
   CHANGE_ENDIANESS_BLOCK16(tmp, (bytes + 1) & ~1u);
 
@@ -1049,7 +1050,7 @@ static void __not_in_flash_func(handleFopenCall)(uint16_t *payload) {
             (unsigned long)mode, (int)res);
     releaseFileSlot(slotIdx);
     // FatFs's lock table is shared with the HTTP server; a full one is out of
-    // handles, not a missing file (EPIC-13 STORY-06).
+    // handles, not a missing file.
     uint32_t err = (res == FR_TOO_MANY_OPEN_FILES) ? (uint32_t)-35   // ENHNDL
                                                    : (uint32_t)-33;  // EFILNF
     writeAppFreeLong(GEMDRIVE_FOPEN_HANDLE_OFFSET, err);
@@ -1130,7 +1131,7 @@ static void __not_in_flash_func(handleReadBuffCall)(uint16_t *payload) {
   }
 
   // Read into the window the ST reads from and swap there: a 4 KB copy on the
-  // stack was the deepest frame in the firmware (EPIC-12 STORY-03).
+  // stack was the deepest frame in the firmware.
   uint8_t *dst = (uint8_t *)(appFreeAddress() + GEMDRIVE_READ_BUFFER_OFFSET);
   UINT bytesRead = 0;
   FRESULT res = f_read(&slot->fp, dst, (UINT)bytesThisChunk, &bytesRead);
@@ -1343,7 +1344,7 @@ static void __not_in_flash_func(handleFsfirstCall)(uint16_t *payload) {
     releaseDtaSlot(dtaAddr);
     // Match md-drives-emulator: EPTHNF (-34) when path doesn't exist,
     // EFILNF (-33) when path exists but no entries match. A full lock table
-    // is neither -- it is out of handles (EPIC-13 STORY-06).
+    // is neither -- it is out of handles.
     uint16_t err = (res == FR_TOO_MANY_OPEN_FILES) ? 0xFFDD  // ENHNDL (-35)
                    : (res == FR_NO_PATH)           ? 0xFFDE
                                                    : 0xFFDF;

@@ -36,8 +36,8 @@
 #define MEM_OVERFLOW_CHECK 0
 
 #define MEMP_NUM_PBUF 8
-// Measured on hardware with DEVOPS_LWIP_STATS (EPIC-13 STORY-04, 2026-09-16,
-// build b7f138f): a 4 MB upload, a 4 MB download, a listing, a 40-request
+// Measured on hardware with DEVOPS_LWIP_STATS (2026-09-16, build b7f138f):
+// a 4 MB upload, a 4 MB download, a listing, a 40-request
 // burst, two concurrent clients and 20 aborted transfers, with no pool
 // reporting a single allocation failure.
 //
@@ -65,7 +65,7 @@
 #define TCP_MSS 1460
 // lwIP's default MSL is 60 s, so a closed connection holds its pcb for 2
 // minutes of TIME_WAIT and the 4-slot pool measured full after a handful of
-// requests (EPIC-13 STORY-04). 10 s matches Booster and drains it in 20 s. The
+// requests. 10 s matches Booster and drains it in 20 s. The
 // risk MSL guards against -- a delayed segment from an old connection landing
 // on a new one with the same port pair -- needs a reused ephemeral port within
 // the window, which a LAN client does not do.

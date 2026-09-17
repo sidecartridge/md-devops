@@ -544,7 +544,7 @@ fall into three behavioural buckets:
   wrong_hook` otherwise); `reset` and `adv meminfo` work on
   either vector.
 
-In addition to the foreground surface, Epic 04 adds an **Advanced
+In addition to the foreground surface there is an **Advanced
 Runner** layer at `/api/v1/runner/adv/...` whose handlers run from
 inside the m68k's VBL ISR (or `etv_timer`, depending on the setup
 menu's `ADV_HOOK_VECTOR` choice). VBL-driven commands keep working
@@ -928,7 +928,7 @@ Common error codes: `409 runner_inactive`, `503 busy`,
 
 ## Advanced Runner
 
-VBL-ISR-driven command surface (Epic 04). Handlers run from inside
+VBL-ISR-driven command surface. Handlers run from inside
 the m68k's level-4 autovector at `$70` (or `$400` if you flipped
 `ADV_HOOK_VECTOR` to `etv_timer` in the setup menu), so they keep
 firing even when the foreground poll loop is wedged. Two of the

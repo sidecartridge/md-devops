@@ -624,7 +624,7 @@ void term_init(void) {
 void __not_in_flash_func(term_loop)() {
   // Read the published slot in place. Copying it cost 4,184 bytes of stack,
   // the deepest frame in the firmware; the double buffer already keeps the
-  // producer off this slot, and both run on core 0 (C-09, EPIC-12 STORY-03).
+  // producer off this slot, and both run on core 0.
   const TransmissionProtocol *snapshot = NULL;
   bool protocolReady = false;
   uint32_t overwriteCountSnapshot = 0;

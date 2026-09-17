@@ -53,7 +53,8 @@ fi
 OUT="$HERE/builds/$NAME"
 mkdir -p "$OUT" "$HERE/builds/elf"
 
-# Same environment as rp/build.sh, without its submodule checkout (C-06).
+# Same environment as rp/build.sh, without its submodule checkout: this script
+# is for fast iteration and the pins are only verified, never changed.
 for pin in "pico-sdk tags/2.2.0" "pico-extras tags/sdk-2.2.0" \
            "fatfs-sdk 6c644cfc3ab03c161fee2dd7be4877e5b832fa71"; do
   set -- $pin

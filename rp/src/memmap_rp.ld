@@ -311,13 +311,13 @@ SECTIONS
      * ASSERT below) or an out-of-memory failure at runtime — both of
      * which are loud and easy to diagnose, instead of a mystery
      * cartridge boot failure later. */
-    /* Core 0's stack lives at the top of main RAM, not in SCRATCH_Y (D-02,
-     * porting Booster D-03). The SDK default put it at the end of the 4 KB
+    /* Core 0's stack lives at the top of main RAM, not in SCRATCH_Y, the
+     * same arrangement Booster uses. The SDK default put it at the end of the 4 KB
      * SCRATCH_Y bank with PICO_STACK_SIZE reserving 2 KB of it, and this
      * firmware's measured peak was already 2,564 bytes: it was running into
      * the rest of SCRATCH_Y and, past that, into core 1's SCRATCH_X.
      *
-     * Size is D-02's rule: largest measured peak on release and debug x 2 +
+     * Size follows one rule: largest measured peak on release and debug x 2 +
      * 1 KB of interrupt headroom, rounded up to 4 KB, never below 16 KB.
      * 2,564 x 2 + 1,024 = 6,152 -> 8 KB, so the 16 KB floor applies.
      *
@@ -335,9 +335,9 @@ SECTIONS
     PROVIDE(__stack = __StackTop);
 
     /* Budgets, so a change that eats the heap or the stack fails the link
-     * instead of failing on a desk (EPIC-12 STORY-06).
+     * instead of failing on a desk.
      *
-     * The floor is what this firmware measured after EPIC-12: 51,316 bytes of
+     * The floor is what this firmware measured in v1.1: 51,316 bytes of
      * heap on release and 47,164 on debug, with 15 KB the most ever claimed
      * and roughly 31 KB free at the worst moment of a smoke run. 40 KB leaves
      * both build types several KB of room to grow and still catches anything
@@ -350,9 +350,9 @@ SECTIONS
     ASSERT(__StackBottom >= __HeapLimit,
         "the core-0 stack overlaps the heap: see __Core0StackSize in memmap_rp.ld")
     ASSERT(__StackLimit - __end__ >= __MinHeapSize,
-        "heap is below __MinHeapSize: something new is eating RAM, see EPIC-12 STORY-06")
+        "heap is below __MinHeapSize: something new is eating RAM, see memmap_rp.ld")
     ASSERT(__Core0StackSize >= 16K,
-        "the core-0 stack is below the 16K floor of D-02")
+        "the core-0 stack is below its 16K floor")
 
     ASSERT( __binary_info_header_end - __logical_binary_start <= 256, "Binary info must be in first 256 bytes of the binary")
     /* todo assert on extra code */

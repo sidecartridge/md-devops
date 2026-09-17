@@ -107,7 +107,7 @@
  * @brief Debug-only: stall the answer to the next `chunks` write chunks.
  *
  * The data is committed first, so this reproduces a lost answer rather than a
- * lost write (EPIC-15 STORY-05).
+ * lost write.
  */
 void gemdrive_setWriteStall(uint16_t chunks, uint16_t deciseconds);
 #endif

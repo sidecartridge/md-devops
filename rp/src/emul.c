@@ -47,7 +47,7 @@
 // headroom, and so CDC bytes appear on the workstation with
 // minimal latency. Lower than this gets into busy-loop
 // territory; higher and we re-introduce the visibility / drop
-// problems that motivated the optimization stories. The full
+// problems that motivated the optimization work. The full
 // Core 1 worker plan (chandler + tud_task + usbcdc_drain on a
 // dedicated core) is parked in the backlog — escalate
 // there only if 100 Hz proves insufficient.
@@ -126,10 +126,9 @@ static int g_menuLastUsbCdcAttached = -1;
 //
 // Once active is set it stays set for the lifetime of the RP power
 // cycle: a `runner reset` cold-reboots the ST and auto-relaunches
-// straight back into Runner mode (no need to re-pick [U]) — that's
-// the dev-iteration UX described in docs/epics/03-runner.md. The
-// scheduled relaunch is driven from the main loop via
-// runnerRelaunchAtMs.
+// straight back into Runner mode (no need to re-pick [U]), which is
+// what makes edit-build-run iteration bearable. The scheduled
+// relaunch is driven from the main loop via runnerRelaunchAtMs.
 static bool runnerActive = false;
 static bool runnerBusy = false;
 static runner_last_command_t runnerLastCommand = RUNNER_LAST_NONE;
@@ -452,7 +451,7 @@ void emul_resetRunnerSession(void) {
   // the mirror across that left the RP certain a program was still loaded, so
   // every later load answered 409 and the unload that would have cleared it
   // answered 422 -- the ST rightly refuses to Mfree a basepage from a previous
-  // life (EPIC-13 STORY-08).
+  // life.
   runnerPendingBasepage = 0;
   runnerLoadHasErrno = false;
   runnerLoadErrno = 0;
@@ -553,7 +552,7 @@ static void emul_pollTick(void) {
   health_feed();
   chandler_loop();
   // SELECT too: this is what runs instead of the main loop for as long as a
-  // connect takes, and the button has to work throughout (EPIC-14 STORY-04).
+  // connect takes, and the button has to work throughout.
   select_checkPushReset();
   usbcdc_drain();
   term_loop();
@@ -632,8 +631,8 @@ static void drawSetupInfoLine(const char *message) {
 // Set when [G] or [U] was refused because no HELLO arrived since the RP
 // booted (see emul_canLaunch). Cleared when HELLO lands.
 static bool launchNeedsStReset = false;
-// Set when [G] or [U] was refused because no usable SD card is mounted
-// (EPIC-15 STORY-02). Cleared as soon as a card appears; the retry loop in
+// Set when [G] or [U] was refused because no usable SD card is mounted.
+// Cleared as soon as a card appears; the retry loop in
 // sdcard_pollRemount is what makes that happen without a reset.
 static bool launchNeedsSdCard = false;
 // Tracks the card state the menu was last drawn with, so the line is redrawn
@@ -645,7 +644,7 @@ static bool countdownLaunching = false;
 static bool restartCountdownOnHello = false;
 
 // Set when settings_save fails, which it can now that a failed allocation
-// returns NULL instead of panicking (EPIC-11). Cleared by the next save that
+// returns NULL instead of panicking. Cleared by the next save that
 // works.
 static bool settingsSaveFailed = false;
 
@@ -739,7 +738,7 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
     }
     case DEVHOOKS_APP_WIFI_LEAVE: {
       // A real disassociation, so the supervisor's rejoin can be tested
-      // without touching the access point (EPIC-14 STORY-01).
+      // without touching the access point.
       int rc = cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
       DPRINTF("devhooks: wifi leave -> %d\n", rc);
       return (rc == 0) ? 1u : 0u;
@@ -1141,8 +1140,8 @@ static bool foldersOnlyFilter(const char *name,
 static void pathUp(void) {
   char temp[MAX_FILENAME_LENGTH + 1];
   // One segment needs at least a separator and a character, so a path of
-  // MAX_FILENAME_LENGTH cannot have more than half that many (EPIC-12
-  // STORY-03; this array held 256 pointers, 1 KB of stack).
+  // MAX_FILENAME_LENGTH cannot have more than half that many. This array
+  // used to hold 256 pointers, 1 KB of stack for no reason.
   char *segments[(MAX_FILENAME_LENGTH / 2) + 1];
   int sp = 0;
 
@@ -1332,7 +1331,7 @@ static void menu(void) {
   // The card's state goes on the header line, not a row of its own: the
   // section dividers are at fixed pixel rows and the status icons are
   // right-aligned per header row, so an extra line shifts every section below
-  // into them (EPIC-15 STORY-02). Kept short to clear the drive icon on the
+  // into them. Kept short to clear the drive icon on the
   // right.
   term_printString(sdcard_isMounted() ? "GEMDRIVE   SD: mounted\n"
                                       : "GEMDRIVE   SD: NO CARD\n");
@@ -1465,7 +1464,7 @@ static void menu(void) {
            hostname);
   // A rejected static configuration has to be visible here: the menu is where
   // the setting gets fixed, so silently running on DHCP would hide the reason
-  // the chosen address never appeared (EPIC-14 STORY-03).
+  // the chosen address never appeared.
   const char *staticReason = NULL;
   bool staticRejected = network_getStaticConfigRejected(&staticReason);
   if (apiIp.addr != 0) {
@@ -1539,7 +1538,7 @@ static bool emul_canLaunch(void) {
   haltCountdown = true;
   // Without a card there is nothing to emulate a drive from, and both modes
   // would come up broken. Refuse and say so; sdcard_pollRemount keeps trying,
-  // so inserting one clears this within a couple of seconds (EPIC-15 STORY-02).
+  // so inserting one clears this within a couple of seconds.
   if (!sdcard_isMounted()) {
     DPRINTF("Launch refused: no SD card mounted\n");
     launchNeedsSdCard = true;
@@ -2093,7 +2092,7 @@ void emul_start() {
   //    connect can take three attempts of 30 s, and until the button is
   //    configured it does nothing at all. A device that cannot reach its
   //    access point was exactly the case where a factory reset was needed
-  //    and could not be asked for (EPIC-14 STORY-04).
+  //    and could not be asked for.
   select_configure();
   select_setResetCallback(reset_device);
   select_setLongResetCallback(reset_deviceAndEraseFlash);
@@ -2155,8 +2154,8 @@ void emul_start() {
         // per-conn pool was 47 KB of BSS, pushing the heap into the
         // ROM-in-RAM region). Shrinking the pool to ~5 KB fixed it;
         // the handlers were also moved to RAM at the time, which only
-        // added pressure and is undone in EPIC-12 STORY-01 (the
-        // download data path stays in RAM for speed). Idempotent —
+        // added pressure and has since been undone (the download data
+        // path stays in RAM for speed). Idempotent —
         // safe even if Wi-Fi connect timed out.
         http_server_init();
       }
@@ -2200,8 +2199,7 @@ void emul_start() {
 #if PICO_CYW43_ARCH_POLL
     network_safePoll();
     // Notice a link that has gone away and rejoin. Non-blocking, and the only
-    // thing that catches an association lost without a callback (EPIC-14
-    // STORY-01).
+    // thing that catches an association lost without a callback.
     network_superviseLink();
     cyw43_arch_wait_for_work_until(make_timeout_time_ms(SLEEP_LOOP_MS));
 #else
@@ -2220,12 +2218,12 @@ void emul_start() {
     // press (≥ SELECT_LONG_RESET ms) fires reset_deviceAndEraseFlash.
     select_checkPushReset();
 
-    // Bring a reinserted SD card back without a reset (EPIC-15 STORY-01).
+    // Bring a reinserted SD card back without a reset.
     // Cheap while the card is mounted.
     sdcard_pollRemount();
 
     // Follow the card's state on the menu, and lift the launch block as soon
-    // as a usable card appears (EPIC-15 STORY-02).
+    // as a usable card appears.
     bool sdMountedNow = sdcard_isMounted();
     if (sdMountedNow != lastDrawnSdMounted) {
       lastDrawnSdMounted = sdMountedNow;

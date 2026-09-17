@@ -19,7 +19,7 @@ static TransmissionProtocol pendingProtocol;
 static bool protocolPending = false;
 
 // Diagnostics for the ST's synchronous handshake, read over SWD by symbol so
-// a release build can be measured (EPIC-12 STORY-08). chandlerDropped counts
+// a release build can be measured. chandlerDropped counts
 // commands thrown away because another was still pending; chandlerRepeated
 // counts commands carrying the token of the command before them, which is what
 // the ST's retry after a timeout looks like.

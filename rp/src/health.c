@@ -113,7 +113,7 @@ static void health_paintRange(uint32_t from, uint32_t to) {
   }
 }
 
-// The core-0 stack is a plain region at the top of main RAM now (D-02), so
+// The core-0 stack is a plain region at the top of main RAM now, so
 // paint all of it below the current stack pointer. No code lives in it, unlike
 // the scratch banks it used to share.
 static uint32_t health_stackPaintFloor(void) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hardware smoke script for md-devops (EPIC-10 STORY-01, reused by EPIC-16).
+"""Hardware smoke script for md-devops.
 
 Runs what the HTTP API can reach, drives the setup menu through the Debug Probe
 (swd.py) and prompts only for what needs a person at the ST. Between steps it
@@ -22,10 +22,10 @@ menu text and the firmware's own state (swd.py app/select/text), so those steps
 need nobody at the ST. A debug build is needed for the mailbox commands; on a
 release build they fall back to prompts.
 
-Limits that follow known bugs, raise them when those epics land:
-    uploads stay at 256 KB  (for run time, not a bug: EPIC-13 STORY-02 fixed
-                             uploads up to the 4 MB cap)
-    no folder creation      (EPIC-11 STORY-03: mkdir panics on big-cluster cards)
+Limits that follow known bugs, raise them when those bugs are fixed:
+    uploads stay at 256 KB  (for run time, not a bug: uploads work up to the
+                             4 MB cap)
+    no folder creation      (mkdir panics on cards with big clusters)
     downloads stay at 256 KB (uploads are how the test file gets onto the card)
 """
 

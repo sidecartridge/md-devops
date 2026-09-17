@@ -4,7 +4,7 @@
 Usage: firmware_size_report.py <rp.elf> <rp.elf.map> <title>
 
 Used by the CI workflows to fill the job summary and printed after every local
-link (EPIC-12 STORY-06). Section sizes come from arm-none-eabi-size; the heap,
+link. Section sizes come from arm-none-eabi-size; the heap,
 the stack, the code copied to RAM and the flash use come from the linker map,
 so they follow memmap_rp.ld if it changes.
 """

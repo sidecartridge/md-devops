@@ -24,7 +24,7 @@
 // timestamp is refreshed on every sample, so this is a gap between samples,
 // not a deadline for a whole frame: a 1 KB payload arrives over tens of
 // milliseconds and used to be thrown away mid-frame, which cost the ST a full
-// command timeout and a resend (EPIC-12 STORY-08). Samples are timestamped
+// command timeout and a resend. Samples are timestamped
 // when they are parsed, in batches from the ring, so this must also cover the
 // main loop's own gap between two drains.
 #define PROTOCOL_READ_RESTART_MICROSECONDS 50000
