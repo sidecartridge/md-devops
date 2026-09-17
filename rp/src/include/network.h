@@ -46,6 +46,23 @@
 #define NETWORK_POLLING_INTERVAL 100  // 100 ms
 #define NETWORK_CONNECT_TIMEOUT 30    // 30 seconds
 
+// Link supervisor (EPIC-14 STORY-01). The grace period keeps it out of the way
+// of a connect that is still in progress; the backoff doubles from the minimum
+// to the maximum and stays there, so a network that is gone for hours costs one
+// attempt a minute.
+#define NETWORK_LINK_DOWN_GRACE_MS 5000u
+#define NETWORK_REJOIN_BACKOFF_MIN_MS 5000u
+#define NETWORK_REJOIN_BACKOFF_MAX_MS 60000u
+
+// Gateway reachability probe. The driver and lwIP can both report a healthy
+// link while the radio is off the network, so the supervisor asks the gateway
+// to answer an ARP request. The interval is long because each probe flushes the
+// ARP cache for the interface.
+#define NETWORK_PROBE_INTERVAL_MS 60000u
+#define NETWORK_PROBE_RETRY_MS 5000u
+#define NETWORK_PROBE_TIMEOUT_MS 3000u
+#define NETWORK_PROBE_FAILURES 3u
+
 #define NETWORK_POWER_MGMT_DISABLED 0xa11140
 #define NETWORK_POWER_MGMT_MAX_OPTIONS 5
 
@@ -228,6 +245,31 @@ wifi_sta_conn_status_t network_wifiConnStatus(
  * @return Pointer to a string summarizing connection status.
  */
 char* network_wifiConnStatusStr();
+
+/**
+ * @brief Notice a lost association and rejoin, without blocking.
+ *
+ * Call once per main-loop iteration. Checks the driver's full join state as
+ * well as the lwIP link status -- neither public status call alone reports an
+ * association that has gone away -- and rearms the join with a backoff when it
+ * has. Never waits for the result.
+ */
+void network_superviseLink(void);
+
+/**
+ * @brief True when the station is associated and lwIP has an address.
+ */
+bool network_isLinkHealthy(void);
+
+/**
+ * @brief How many rejoins the supervisor has armed since boot.
+ */
+uint32_t network_getRejoinAttempts(void);
+
+/**
+ * @brief How many times the gateway probe has declared the network gone.
+ */
+uint32_t network_getProbeFailures(void);
 
 /**
  * @brief Returns the configured WiFi mode as text.

@@ -723,6 +723,25 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
               (block != NULL) ? "ok" : "refused");
       return (block != NULL) ? 1u : 0u;
     }
+    case DEVHOOKS_APP_WIFI_LEAVE: {
+      // A real disassociation, so the supervisor's rejoin can be tested
+      // without touching the access point (EPIC-14 STORY-01).
+      int rc = cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+      DPRINTF("devhooks: wifi leave -> %d\n", rc);
+      return (rc == 0) ? 1u : 0u;
+    }
+    case DEVHOOKS_APP_WIFI_FAKE_GATEWAY: {
+      // Leave the association alone and just make the gateway unanswerable, so
+      // everything above the probe still reports a healthy link.
+      struct netif *nif = &cyw43_state.netif[CYW43_ITF_STA];
+      ip4_addr_t bogus;
+      IP4_ADDR(&bogus, 192, 0, 2, 1);  // TEST-NET-1, never routed
+      cyw43_arch_lwip_begin();
+      netif_set_gw(nif, &bogus);
+      cyw43_arch_lwip_end();
+      DPRINTF("devhooks: gateway pointed at 192.0.2.1\n");
+      return 1;
+    }
     case DEVHOOKS_APP_COUNTDOWN_STOP:
       haltCountdown = true;
       return 1;
@@ -2069,6 +2088,10 @@ void emul_start() {
 
 #if PICO_CYW43_ARCH_POLL
     network_safePoll();
+    // Notice a link that has gone away and rejoin. Non-blocking, and the only
+    // thing that catches an association lost without a callback (EPIC-14
+    // STORY-01).
+    network_superviseLink();
     cyw43_arch_wait_for_work_until(make_timeout_time_ms(SLEEP_LOOP_MS));
 #else
     sleep_ms(SLEEP_LOOP_MS);
