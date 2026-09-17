@@ -16,6 +16,8 @@ import contextlib
 import io
 import json
 import os
+import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -198,6 +200,129 @@ class PingTests(unittest.TestCase):
         # almost always closed).
         code, _out, err = _run_cli(
             ["--host", "127.0.0.1:1", "ping"])
+        self.assertEqual(code, sidecart.EXIT_NETWORK)
+        self.assertIn("cannot reach", err)
+
+
+def _health_payload(**overrides: object) -> dict:
+    payload = {
+        "ok": True,
+        "version": "v1.1.0",
+        "build": "b9b53cc-dirty.1a2b3c4",
+        "debug": True,
+        "uptime_s": 42,
+        "heap": {"total": 180000, "free": 120000, "min_free": 90000,
+                 "sbrk_high_water": 70000},
+        "stack": {"reserved": 2048, "high_water": 5120, "painted": 8192,
+                  "overflow": False},
+        "code_in_ram": 65536,
+        "reset": {"reason": "power_on", "phase": None, "pc": None,
+                  "lr": None, "sp": None, "crash_count": 0,
+                  "crash_loop": False},
+        "watchdog": True,
+        "rom3_overruns": 3,
+        "debugcap_dropped": 0,
+        "usbcdc_dropped": 17,
+    }
+    payload.update(overrides)
+    return payload
+
+
+class HealthTests(unittest.TestCase):
+    """`sidecart health` — GET /api/v1/system/health."""
+
+    def setUp(self) -> None:
+        self.server = _FakeServer()
+        self.addCleanup(self.server.close)
+
+    def _set_response(self, status: int, payload: dict) -> None:
+        self.server.state.next_status = status
+        self.server.state.next_body = json.dumps(payload).encode("utf-8")
+        self.server.state.next_headers = {
+            "Content-Type": "application/json"}
+
+    def test_health_human_prints_every_field(self) -> None:
+        self._set_response(200, _health_payload())
+        code, out, err = _run_cli(["--host", self.server.host, "health"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(err, "")
+        self.assertEqual(self.server.state.last_method, "GET")
+        self.assertEqual(self.server.state.last_path, "/api/v1/system/health")
+        for text in ("v1.1.0", "b9b53cc-dirty.1a2b3c4 (debug)", "42 s", "120000 / 180000", "90000", "70000",
+                     "5120 bytes, 2048 reserved, 8192 measured", "65536",
+                     "power_on", "watchdog        : on",
+                     "rom3 overruns   : 3", "usbcdc dropped  : 17"):
+            self.assertIn(text, out)
+        self.assertNotIn("OVERFLOW", out)
+        self.assertNotIn("lwip", out)
+
+    def test_health_panic_shows_pc_and_sp(self) -> None:
+        self._set_response(200, _health_payload(
+            reset={"reason": "panic", "phase": None, "pc": "0x10001234",
+                   "lr": None, "sp": "0x20041f00", "crash_count": 3,
+                   "crash_loop": True}))
+        code, out, _err = _run_cli(["--host", self.server.host, "health"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("panic at 0x10001234", out)
+        self.assertIn("sp=0x20041f00", out)
+        self.assertIn("crash loop", out)
+
+    def test_health_hardfault_shows_lr(self) -> None:
+        self._set_response(200, _health_payload(
+            reset={"reason": "hardfault", "phase": None, "pc": "0x10002000",
+                   "lr": "0x10003001", "sp": "0x20041e00", "crash_count": 1,
+                   "crash_loop": False}))
+        code, out, _err = _run_cli(["--host", self.server.host, "health"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("hardfault at 0x10002000  lr=0x10003001", out)
+
+    def test_health_hang_shows_phase(self) -> None:
+        self._set_response(200, _health_payload(
+            reset={"reason": "hang", "phase": "http_wait", "pc": None,
+                   "lr": None, "sp": None, "crash_count": 1,
+                   "crash_loop": False}))
+        code, out, _err = _run_cli(["--host", self.server.host, "health"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("hang in http_wait", out)
+
+    def test_health_stack_overflow_flagged(self) -> None:
+        self._set_response(200, _health_payload(
+            stack={"reserved": 2048, "high_water": 8192, "painted": 8192,
+                   "overflow": True}))
+        code, out, _err = _run_cli(["--host", self.server.host, "health"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("OVERFLOW", out)
+
+    def test_health_lwip_counters(self) -> None:
+        self._set_response(200, _health_payload(
+            lwip={"mem": [100, 2000, 0], "pbuf_pool": [2, 12, 5]}))
+        code, out, _err = _run_cli(["--host", self.server.host, "health"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertIn("lwip pbuf_pool  : used 2  max 12  err 5", out)
+
+    def test_health_json(self) -> None:
+        self._set_response(200, _health_payload())
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "--json", "health"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(json.loads(out)["heap"]["min_free"], 90000)
+
+    def test_health_quiet(self) -> None:
+        self._set_response(200, _health_payload())
+        code, out, _err = _run_cli(
+            ["--host", self.server.host, "-q", "health"])
+        self.assertEqual(code, sidecart.EXIT_OK)
+        self.assertEqual(out, "")
+
+    def test_health_404_on_older_firmware(self) -> None:
+        self._set_response(404, {"ok": False, "code": "not_found",
+                                 "message": "Route not found"})
+        code, _out, err = _run_cli(["--host", self.server.host, "health"])
+        self.assertEqual(code, sidecart.EXIT_NOT_FOUND)
+        self.assertIn("not_found", err)
+
+    def test_health_unreachable(self) -> None:
+        code, _out, err = _run_cli(["--host", "127.0.0.1:1", "health"])
         self.assertEqual(code, sidecart.EXIT_NETWORK)
         self.assertIn("cannot reach", err)
 
@@ -649,7 +774,7 @@ class PutTests(unittest.TestCase):
 
 
 class RunnerStatusTests(unittest.TestCase):
-    """Epic 03 / S1 — `sidecart runner status`."""
+    """`sidecart runner status`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -704,7 +829,7 @@ class RunnerStatusTests(unittest.TestCase):
 
 
 class RunnerResetTests(unittest.TestCase):
-    """Epic 03 / S2 — `sidecart runner reset`."""
+    """`sidecart runner reset`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -736,7 +861,7 @@ class RunnerResetTests(unittest.TestCase):
 
 
 class RunnerRunTests(unittest.TestCase):
-    """Epic 03 / S3 — `sidecart runner run`."""
+    """`sidecart runner run`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -789,7 +914,7 @@ class RunnerRunTests(unittest.TestCase):
 
 
 class RunnerLoadTests(unittest.TestCase):
-    """Epic 06 / S5 — `sidecart runner load`."""
+    """`sidecart runner load`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -866,7 +991,7 @@ class RunnerLoadTests(unittest.TestCase):
 
 
 class RunnerExecTests(unittest.TestCase):
-    """Epic 06 / S6 — `sidecart runner exec`."""
+    """`sidecart runner exec`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -919,7 +1044,7 @@ class RunnerExecTests(unittest.TestCase):
 
 
 class RunnerUnloadTests(unittest.TestCase):
-    """Epic 06 / S7 — `sidecart runner unload`."""
+    """`sidecart runner unload`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -975,7 +1100,7 @@ class RunnerUnloadTests(unittest.TestCase):
 
 
 class RunnerCdTests(unittest.TestCase):
-    """Epic 03 / S4 — `sidecart runner cd`."""
+    """`sidecart runner cd`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1026,7 +1151,7 @@ class RunnerCdTests(unittest.TestCase):
 
 
 class RunnerResTests(unittest.TestCase):
-    """Epic 03 / S5 — `sidecart runner res`."""
+    """`sidecart runner res`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1074,7 +1199,7 @@ class RunnerResTests(unittest.TestCase):
 
 
 class RunnerMeminfoTests(unittest.TestCase):
-    """Epic 03 / S6 — `sidecart runner meminfo`."""
+    """`sidecart runner meminfo`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1152,7 +1277,7 @@ class RunnerMeminfoTests(unittest.TestCase):
 
 
 class RunnerAdvStatusTests(unittest.TestCase):
-    """Epic 04 / S1 — `sidecart runner adv status`."""
+    """`sidecart runner adv status`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1214,7 +1339,7 @@ class RunnerAdvStatusTests(unittest.TestCase):
 
 
 class RunnerAdvMeminfoTests(unittest.TestCase):
-    """Epic 04 / S6 — `sidecart runner adv meminfo`."""
+    """`sidecart runner adv meminfo`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1266,7 +1391,7 @@ class RunnerAdvMeminfoTests(unittest.TestCase):
 
 
 class RunnerAdvJumpTests(unittest.TestCase):
-    """Epic 04 / S7 — `sidecart runner adv jump`."""
+    """`sidecart runner adv jump`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1346,7 +1471,7 @@ class RunnerAdvJumpTests(unittest.TestCase):
 
 
 class RunnerAdvLoadTests(unittest.TestCase):
-    """Epic 04 / S8 — `sidecart runner adv load`."""
+    """`sidecart runner adv load`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1428,7 +1553,7 @@ class RunnerAdvLoadTests(unittest.TestCase):
 
 
 class DebugStatusTests(unittest.TestCase):
-    """Epic 05 v2 / S3 — `sidecart debug status`."""
+    """`sidecart debug status`."""
 
     def setUp(self) -> None:
         self.server = _FakeServer()
@@ -1499,7 +1624,7 @@ class DebugStatusTests(unittest.TestCase):
 
 
 class DebugTailTests(unittest.TestCase):
-    """Epic 05 v2 / S4 — `sidecart debug tail`.
+    """`sidecart debug tail`.
 
     Byte-level streaming of the response body is exercised on
     hardware (urllib + chunked transfer-encoding is stdlib
@@ -1591,3 +1716,96 @@ class StatusMappingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _ResettingServer:
+    """A server that accepts a connection and then drops it mid-response.
+
+    Covers what the device does when it reboots under a command: a watchdog,
+    a panic or a SELECT press all cut the socket without a reply, and urllib
+    surfaces that as ConnectionResetError or RemoteDisconnected rather than
+    URLError.
+    """
+
+    def __init__(self, mode: str = "immediate") -> None:
+        self.mode = mode
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(4)
+        self.port = self.sock.getsockname()[1]
+        self.host = f"127.0.0.1:{self.port}"
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.running = True
+        self.thread.start()
+
+    def _serve(self) -> None:
+        while self.running:
+            try:
+                conn, _addr = self.sock.accept()
+            except OSError:
+                return
+            try:
+                conn.recv(65536)
+                if self.mode == "partial":
+                    # Headers promising a body, then the socket dies: this is
+                    # what a reboot mid-download looks like.
+                    conn.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: 1000\r\n\r\n" + b"x" * 10)
+                # Reset rather than a clean close, so the client sees ECONNRESET.
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                struct.pack("ii", 1, 0))
+            except OSError:
+                pass
+            finally:
+                with contextlib.suppress(OSError):
+                    conn.close()
+
+    def close(self) -> None:
+        self.running = False
+        with contextlib.suppress(OSError):
+            self.sock.close()
+        self.thread.join(timeout=2)
+
+
+class DroppedConnectionTests(unittest.TestCase):
+    """A device that drops the connection must never print a traceback."""
+
+    def _assert_clean_network_error(self, code: int, out: str, err: str) -> None:
+        self.assertEqual(code, sidecart.EXIT_NETWORK)
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn("Traceback", out)
+        # Exactly one line, and it is an error line.
+        lines = [ln for ln in err.strip().splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 1, f"expected one line, got: {lines!r}")
+        self.assertTrue(lines[0].startswith("error:"), lines[0])
+
+    def test_reset_before_reply(self) -> None:
+        server = _ResettingServer("immediate")
+        self.addCleanup(server.close)
+        code, out, err = _run_cli(["--host", server.host, "ping"])
+        self._assert_clean_network_error(code, out, err)
+
+    def test_reset_on_json_command(self) -> None:
+        server = _ResettingServer("immediate")
+        self.addCleanup(server.close)
+        code, out, err = _run_cli(
+            ["--host", server.host, "gemdrive", "ls", "/"])
+        self._assert_clean_network_error(code, out, err)
+
+    def test_reset_mid_download(self) -> None:
+        server = _ResettingServer("partial")
+        self.addCleanup(server.close)
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "out.bin")
+            code, out, err = _run_cli(
+                ["--host", server.host, "-q", "gemdrive", "get", "/A.BIN",
+                 dest])
+        self._assert_clean_network_error(code, out, err)
+
+    def test_reset_on_health(self) -> None:
+        server = _ResettingServer("immediate")
+        self.addCleanup(server.close)
+        code, out, err = _run_cli(["--host", server.host, "health"])
+        self._assert_clean_network_error(code, out, err)

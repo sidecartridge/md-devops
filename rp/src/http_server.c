@@ -8,27 +8,35 @@
 #include <string.h>
 
 #include "aconfig.h"
+#include "build_id.h"
 #include "chandler.h"
+#include "commemul.h"
 #include "debug.h"
 #include "debugcap.h"
 #include "display.h"
 #include "emul.h"
 #include "ff.h"
 #include "gconfig.h"
+#include "health.h"
 #include "memfunc.h"
+#include "network.h"
 #include "lwip/err.h"
+#include "lwip/memp.h"
 #include "lwip/pbuf.h"
+#include "lwip/stats.h"
 #include "lwip/tcp.h"
 #include "pico/cyw43_arch.h"
 #include "pico/time.h"
 #include "runner.h"
+#include "sdcard.h"
+#include "select.h"
 #include "settings.h"
 #include "usbcdc.h"
 
 // Cartridge shared-region mirror in RP RAM (memmap_rp.ld). Used by
 // the Runner endpoints to write path / cmdline buffers the m68k
 // Runner reads directly via cartridge bus.
-extern unsigned int __rom_in_ram_start__;
+extern unsigned char __rom_in_ram_start__[];
 
 // Per-conn response buffer. Sized to comfortably hold a full status
 // line + headers + the largest non-streaming body we emit. RAM is
@@ -39,12 +47,17 @@ extern unsigned int __rom_in_ram_start__;
 // truncating large JSON responses; chunked streaming for big bodies
 // arrives in S5.
 #define HTTP_RESPONSE_BUF_BYTES 1024
+// The path buffers of the larger handlers are declared `static` rather than on
+// the stack: they made single frames of up to 1,672 bytes,
+// and the deepest path through this file 3,784. Safe because the server is
+// single-threaded and a handler runs to completion within one call --
+// the Runner's spin-waits pump chandler_loop only, never lwIP, so no second
+// request can enter a handler while one is in progress.
 #define HTTP_PATH_BUF_BYTES 192
 #define HTTP_QUERY_BUF_BYTES 192
 
-// Listing cap. Spec says 1000, but the response buffer is the real
-// constraint — at ~80 bytes per entry the 1 KB resp lets us fit
-// roughly 8-10 entries before truncated:true.
+// Listing cap. The listing streams in chunks of up to 1 KB, so the response
+// buffer only limits entries per chunk, not the listing.
 #define HTTP_LISTING_MAX_ENTRIES 1000
 
 // FatFs absolute-path buffer. Smaller than FF_MAX_LFN (255) because
@@ -59,11 +72,21 @@ extern unsigned int __rom_in_ram_start__;
 // Hard cap on a single upload (PUT) body. Per the locked spec.
 #define HTTP_MAX_UPLOAD_BYTES (4u * 1024u * 1024u)
 
-// Idle-connection sweeper: tcp_poll fires every (4 × tcp_poll_interval) /
-// 2 seconds. With interval 8, that's 16 seconds per tick; we close on
-// the first tick, so a connection that never sends a complete request
-// is closed in ~16 s.
+// Idle-connection sweeper. tcp_poll fires every HTTP_POLL_INTERVAL slow
+// ticks, and a slow tick is 500 ms, so interval 8 is one call every 4 s --
+// not the 16 s an earlier comment here claimed.
+//
+// A poll is not evidence of an idle connection. lwIP restarts a pcb's poll
+// timer only when the peer acknowledges data the server sent
+// (core/tcp_in.c), and during an upload or a Runner advanced-load body the
+// server sends nothing, so the timer keeps running however fast the data
+// arrives. Closing on the first tick therefore killed every transfer that
+// lasted more than about 4 s: a 4 MB upload, a slow client, or a fast one
+// whose burst outran a reply. The sweeper now closes a connection only
+// after HTTP_IDLE_TIMEOUT_MS with no traffic in either direction, which is
+// what "idle" was meant to mean.
 #define HTTP_POLL_INTERVAL 8
+#define HTTP_IDLE_TIMEOUT_MS 20000u
 
 typedef enum {
   HC_FREE = 0,
@@ -114,6 +137,7 @@ typedef struct http_conn {
   char resp[HTTP_RESPONSE_BUF_BYTES];
   size_t resp_len;
   size_t resp_sent;
+  bool resp_queued;  // resp is in lwIP's send queue; false means retry it
 
   // Streaming directory listing state. Active while state ==
   // HC_STREAM_LISTING; the dir handle outlives a single TCP recv/sent
@@ -133,6 +157,7 @@ typedef struct http_conn {
   uint32_t stream_end;       // one-past-last byte to send (file size or
                              // Range slice end)
   bool holds_body_lock;      // this conn holds the body-stream lock
+  uint32_t last_activity_ms;  // last traffic either way; the sweeper's clock
 
   // Streaming file upload state. Active while state == HC_STREAM_UPLOAD;
   // FIL handle released by conn_close (and the partial file unlinked
@@ -183,10 +208,13 @@ static bool g_body_stream_busy = false;
 static http_conn_t *conn_alloc(void);
 static void conn_free(http_conn_t *c);
 static void conn_close(http_conn_t *c);
+static bool conn_takeAborted(void);
 
-static void parse_and_dispatch(http_conn_t *c);
+static void parse_and_dispatch(http_conn_t *c, struct pbuf *seg,
+                               size_t body_off);
 static void route(http_conn_t *c);
-static void send_buffered(http_conn_t *c);
+static void __not_in_flash_func(send_buffered)(http_conn_t *c);
+static void __not_in_flash_func(send_buffered_try)(http_conn_t *c);
 
 static void write_response(http_conn_t *c, int status, const char *reason,
                            const char *content_type, const char *body,
@@ -197,37 +225,43 @@ static void write_response_ex(http_conn_t *c, int status, const char *reason,
                               size_t body_len);
 static void write_error(http_conn_t *c, int status, const char *reason,
                         const char *code_symbol, const char *message);
+static void write_fs_error(http_conn_t *c, FRESULT fr, const char *message);
 static void write_405(http_conn_t *c, const char *allow);
+static void write_no_card(http_conn_t *c);
 
 static err_t srv_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err);
-static err_t srv_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p,
+static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, struct pbuf *p,
                          err_t err);
-static err_t srv_sent_cb(void *arg, struct tcp_pcb *pcb, u16_t len);
+static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u16_t len);
 static err_t srv_poll_cb(void *arg, struct tcp_pcb *pcb);
 static void srv_err_cb(void *arg, err_t err);
 
 // Streaming-handler forward decls; bodies live alongside the
 // download / listing / upload route handlers further down.
 static void stream_listing_drive(http_conn_t *c);
-static void stream_download_drive(http_conn_t *c);
+static void __not_in_flash_func(stream_download_drive)(http_conn_t *c);
 static void stream_debug_drive(http_conn_t *c);
+static void __not_in_flash_func(stream_download_drive)(http_conn_t *c);
+static void stream_listing_drive(http_conn_t *c);
 // Chunked-encoding helpers (definitions further down).
-static err_t stream_send_chunk(http_conn_t *c, const char *body,
+static err_t __not_in_flash_func(stream_send_chunk)(http_conn_t *c, const char *body,
                                size_t body_len);
 static err_t stream_send_terminator(http_conn_t *c);
-static bool handle_file_upload_init(http_conn_t *c, const char *body_start,
-                                    size_t leftover);
+static bool upload_drain_pbuf(http_conn_t *c, struct pbuf *seg, size_t off,
+                              size_t n, FRESULT *fr_out);
+static bool handle_file_upload_init(http_conn_t *c, struct pbuf *seg,
+                                    size_t body_off, size_t leftover);
 static void upload_finish_ok(http_conn_t *c);
-static bool handle_runner_adv_load_init(http_conn_t *c, const char *body_start,
-                                        size_t leftover);
-static void adv_load_drain_pbuf(http_conn_t *c, struct pbuf *p, size_t off,
+static bool handle_runner_adv_load_init(http_conn_t *c, struct pbuf *seg,
+                                        size_t body_off, size_t leftover);
+static bool adv_load_drain_pbuf(http_conn_t *c, struct pbuf *p, size_t off,
                                 size_t n);
 static bool adv_load_dispatch_chunk(http_conn_t *c);
 static void adv_load_finish_ok(http_conn_t *c);
 
 // --- Public API ---
 
-void __not_in_flash_func(http_server_init)(void) {
+void http_server_init(void) {
   DPRINTF("http_server: init entered (g_listen_pcb=%p)\n",
           (void *)g_listen_pcb);
   if (g_listen_pcb != NULL) {
@@ -261,7 +295,7 @@ void __not_in_flash_func(http_server_init)(void) {
   DPRINTF("http_server: listening on :%d\n", HTTP_SERVER_PORT);
 }
 
-void __not_in_flash_func(http_server_deinit)(void) {
+void http_server_deinit(void) {
   if (g_listen_pcb != NULL) {
     tcp_close(g_listen_pcb);
     g_listen_pcb = NULL;
@@ -271,11 +305,14 @@ void __not_in_flash_func(http_server_deinit)(void) {
       conn_close(&g_conns[i]);
     }
   }
+  // Not inside a callback, so there is nobody to return ERR_ABRT: drop the
+  // flag rather than leave it for the next one.
+  (void)conn_takeAborted();
 }
 
 // --- Connection lifecycle ---
 
-static http_conn_t *__not_in_flash_func(conn_alloc)(void) {
+static http_conn_t *conn_alloc(void) {
   for (int i = 0; i < HTTP_SERVER_MAX_CONNECTIONS; i++) {
     if (g_conns[i].state == HC_FREE) {
       memset(&g_conns[i], 0, sizeof(g_conns[i]));
@@ -286,12 +323,66 @@ static http_conn_t *__not_in_flash_func(conn_alloc)(void) {
   return NULL;
 }
 
-static void __not_in_flash_func(conn_free)(http_conn_t *c) {
+static void conn_free(http_conn_t *c) {
   c->pcb = NULL;
   c->state = HC_FREE;
 }
 
-static void __not_in_flash_func(conn_close)(http_conn_t *c) {
+// Copy n body bytes out of seg (starting at off) into the upload file,
+// in chunks of the response buffer. Returns false and the FatFs error on
+// a short or failed write.
+static bool upload_drain_pbuf(http_conn_t *c, struct pbuf *seg, size_t off,
+                              size_t n, FRESULT *fr_out) {
+  size_t done = 0;
+  while (done < n) {
+    size_t chunk = n - done;
+    if (chunk > sizeof(c->resp)) chunk = sizeof(c->resp);
+    pbuf_copy_partial(seg, c->resp, (u16_t)chunk, (u16_t)(off + done));
+    UINT written = 0;
+    // Extending a multi-megabyte file makes FatFs walk the cluster chain, so
+    // a single write can outlast the watchdog. Feed it either side, the way
+    // the GEMDRIVE write path does, and name the phase so a real hang here
+    // is still reported as one (CLAUDE.md).
+    health_setPhase(HEALTH_PHASE_HTTP_REQUEST);
+    health_feed();
+    FRESULT fr = f_write(&c->upload_file, c->resp, (UINT)chunk, &written);
+    health_feed();
+    if (fr != FR_OK || written != chunk) {
+      DPRINTF("http_server: upload f_write failed (%d, %u/%zu)\n", (int)fr,
+              (unsigned)written, chunk);
+      *fr_out = fr;
+      return false;
+    }
+    done += chunk;
+  }
+  return true;
+}
+
+// What a spin-wait owes the rest of the firmware. Six HTTP handlers block
+// inside srv_recv_cb while the ST answers -- up to 10 s for a Runner load --
+// and nothing else runs meanwhile, so each turn of those loops has to feed the
+// watchdog, drain the cartridge ring the ST is waiting on, poll SELECT so the
+// button still resets the device, and push queued console bytes out of USB.
+static void http_spinTick(void) {
+  health_feed();
+  health_setPhase(HEALTH_PHASE_HTTP_WAIT);
+  chandler_loop();
+  select_checkPushReset();
+  usbcdc_drain();
+}
+
+// Traffic in either direction keeps a connection alive for the sweeper.
+static void conn_touch(http_conn_t *c) {
+  c->last_activity_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+}
+
+// Everything this connection holds that is not the pcb. Split out of
+// conn_close so the error path can release it too: lwIP frees the pcb itself
+// and calls srv_err_cb, which used to drop the slot and leak the rest -- the
+// body-stream lock (every later transfer answering 503 busy until a reset),
+// FatFs handles counted against FF_FS_LOCK and shared with GEMDRIVE, and a
+// half-written upload left on the card.
+static void conn_release_resources(http_conn_t *c) {
   if (c->stream_dir_open) {
     f_closedir(&c->stream_dir);
     c->stream_dir_open = false;
@@ -316,6 +407,23 @@ static void __not_in_flash_func(conn_close)(http_conn_t *c) {
     g_body_stream_busy = false;
     c->holds_body_lock = false;
   }
+}
+
+// Set when conn_close had to abort a pcb. lwIP requires the callback that
+// caused the abort to return ERR_ABRT (core/tcp.c, tcp_abort docs), and
+// conn_close is called from deep inside the response writers, so it reports
+// through this flag rather than a return value threaded through every call
+// site. Each callback clears it with conn_takeAborted() on the way out.
+static bool g_conn_aborted;
+
+static bool conn_takeAborted(void) {
+  bool aborted = g_conn_aborted;
+  g_conn_aborted = false;
+  return aborted;
+}
+
+static void conn_close(http_conn_t *c) {
+  conn_release_resources(c);
   if (c->pcb != NULL) {
     struct tcp_pcb *pcb = c->pcb;
     tcp_arg(pcb, NULL);
@@ -323,9 +431,13 @@ static void __not_in_flash_func(conn_close)(http_conn_t *c) {
     tcp_sent(pcb, NULL);
     tcp_poll(pcb, NULL, 0);
     tcp_err(pcb, NULL);
+    // tcp_close only fails on a NULL pcb in this lwIP (ERR_MEM is deferred
+    // through TF_CLOSEPEND), so the abort is unreachable today -- but if it
+    // ever runs, the callback we are inside has to return ERR_ABRT.
     err_t err = tcp_close(pcb);
     if (err != ERR_OK) {
       tcp_abort(pcb);
+      g_conn_aborted = true;
     }
   }
   conn_free(c);
@@ -333,7 +445,7 @@ static void __not_in_flash_func(conn_close)(http_conn_t *c) {
 
 // --- TCP callbacks ---
 
-static err_t __not_in_flash_func(srv_accept_cb)(void *arg, struct tcp_pcb *newpcb, err_t err) {
+static err_t srv_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
   (void)arg;
   if (err != ERR_OK || newpcb == NULL) {
     return ERR_VAL;
@@ -345,6 +457,7 @@ static err_t __not_in_flash_func(srv_accept_cb)(void *arg, struct tcp_pcb *newpc
     return ERR_ABRT;
   }
   c->pcb = newpcb;
+  conn_touch(c);
   tcp_arg(newpcb, c);
   tcp_recv(newpcb, srv_recv_cb);
   tcp_sent(newpcb, srv_sent_cb);
@@ -357,10 +470,14 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
                          err_t err) {
   http_conn_t *c = (http_conn_t *)arg;
   if (c == NULL) {
+    // Nobody owns this pcb. Returning any other error would make lwIP keep
+    // the pbuf we just freed and deliver it again (core/tcp_in.c), so abort
+    // and report the abort, which is the one contract-legal way out.
     if (p != NULL) {
       pbuf_free(p);
     }
-    return ERR_VAL;
+    tcp_abort(pcb);
+    return ERR_ABRT;
   }
   if (err != ERR_OK || p == NULL) {
     // Peer closed or error; either way the connection is done.
@@ -368,10 +485,22 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
       pbuf_free(p);
     }
     conn_close(c);
-    return ERR_OK;
+    return conn_takeAborted() ? ERR_ABRT : ERR_OK;
   }
+  conn_touch(c);
+  // Account for the segment here, once. A response writer can close the
+  // connection (a failed write, a FatFs error, a Runner timeout), and
+  // tcp_recved() on a closed pcb touches one lwIP has already purged and
+  // queued to be freed.
+  tcp_recved(pcb, p->tot_len);
 
   if (c->state == HC_READ_HEADERS) {
+    // Only the headers go into c->hdr. Body bytes that shared this
+    // segment with them stay in the pbuf and are handed to the
+    // dispatcher by offset: copying them into c->hdr would drop
+    // everything past HTTP_HEADER_BUF_BYTES while the tcp_recved above
+    // still tells the peer they arrived.
+    size_t hdr_before = c->hdr_len;
     size_t to_copy = p->tot_len;
     size_t remaining =
         (c->hdr_len < HTTP_HEADER_BUF_BYTES - 1)
@@ -385,14 +514,18 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
       c->hdr_len += to_copy;
       c->hdr[c->hdr_len] = '\0';
     }
-    tcp_recved(pcb, p->tot_len);
-    pbuf_free(p);
 
-    if (strstr(c->hdr, "\r\n\r\n") != NULL) {
-      parse_and_dispatch(c);
+    char *eoh = strstr(c->hdr, "\r\n\r\n");
+    if (eoh != NULL) {
+      // The terminator completed in this segment, so the first body
+      // byte is that many bytes into it.
+      size_t header_bytes = (size_t)(eoh + 4 - c->hdr);
+      size_t body_off = header_bytes - hdr_before;
+      parse_and_dispatch(c, p, body_off);
     } else if (c->hdr_len >= HTTP_HEADER_BUF_BYTES - 1) {
       write_error(c, 400, "Bad Request", "bad_request", "Headers too large");
     }
+    pbuf_free(p);
   } else if (c->state == HC_READ_BODY) {
     size_t need = c->content_length - c->body_received;
     size_t take = (p->tot_len < need) ? p->tot_len : need;
@@ -400,7 +533,6 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
       pbuf_copy_partial(p, c->body + c->body_received, (u16_t)take, 0);
       c->body_received += take;
     }
-    tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
     if (c->body_received >= c->content_length) {
       route(c);
@@ -411,30 +543,16 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
     // success response and close.
     size_t want = c->content_length - c->upload_received;
     size_t take = (p->tot_len < want) ? p->tot_len : want;
-    size_t off = 0;
-    while (off < take) {
-      size_t chunk = take - off;
-      if (chunk > sizeof(c->resp)) chunk = sizeof(c->resp);
-      pbuf_copy_partial(p, c->resp, (u16_t)chunk, (u16_t)off);
-      UINT written = 0;
-      FRESULT fr =
-          f_write(&c->upload_file, c->resp, (UINT)chunk, &written);
-      if (fr != FR_OK || written != chunk) {
-        DPRINTF("http_server: upload f_write failed (%d, %u/%zu)\n",
-                (int)fr, (unsigned)written, chunk);
-        // Surface 500 to the client; conn_close closes the FIL and
-        // unlinks the partial file when the response has been drained.
-        write_error(c, 500, "Internal Server Error", "disk_error",
-                    "f_write failed mid-upload");
-        tcp_recved(pcb, p->tot_len);
-        pbuf_free(p);
-        return ERR_OK;
-      }
-      off += chunk;
+    FRESULT fr = FR_OK;
+    bool written = upload_drain_pbuf(c, p, 0, take, &fr);
+    pbuf_free(p);
+    if (!written) {
+      // Surface 500 to the client; conn_close closes the FIL and
+      // unlinks the partial file when the response has been drained.
+      write_fs_error(c, fr, "f_write failed mid-upload");
+      return conn_takeAborted() ? ERR_ABRT : ERR_OK;
     }
     c->upload_received += take;
-    tcp_recved(pcb, p->tot_len);
-    pbuf_free(p);
     if (c->upload_received >= c->content_length) {
       upload_finish_ok(c);
     }
@@ -445,21 +563,22 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
     // client may have sent more than we'll honour.
     size_t want = (size_t)(c->adv_load_total - c->adv_load_received);
     size_t take = (p->tot_len < want) ? p->tot_len : want;
-    if (take > 0) {
-      adv_load_drain_pbuf(c, p, 0, take);
-    }
-    tcp_recved(pcb, p->tot_len);
+    bool drained = (take == 0) || adv_load_drain_pbuf(c, p, 0, take);
     pbuf_free(p);
+    if (!drained) {
+      // A chunk dispatch timed out; the 504 is already written and the
+      // load is over. Finishing it here would re-fire the failed chunk.
+      return conn_takeAborted() ? ERR_ABRT : ERR_OK;
+    }
     if (c->adv_load_received >= c->adv_load_total) {
       adv_load_finish_ok(c);
     }
   } else {
     // Already writing the response (or draining); discard any extra
     // bytes the client sent.
-    tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
   }
-  return ERR_OK;
+  return conn_takeAborted() ? ERR_ABRT : ERR_OK;
 }
 
 static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u16_t len) {
@@ -468,6 +587,7 @@ static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u1
   if (c == NULL) {
     return ERR_OK;
   }
+  conn_touch(c);
   c->resp_sent += len;
   if (c->state == HC_WRITE_RESPONSE && c->resp_sent >= c->resp_len) {
     c->state = HC_DRAINING;
@@ -484,10 +604,10 @@ static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u1
     // ack'd; safe to close.
     conn_close(c);
   }
-  return ERR_OK;
+  return conn_takeAborted() ? ERR_ABRT : ERR_OK;
 }
 
-static err_t __not_in_flash_func(srv_poll_cb)(void *arg, struct tcp_pcb *pcb) {
+static err_t srv_poll_cb(void *arg, struct tcp_pcb *pcb) {
   (void)pcb;
   http_conn_t *c = (http_conn_t *)arg;
   if (c == NULL) {
@@ -498,26 +618,53 @@ static err_t __not_in_flash_func(srv_poll_cb)(void *arg, struct tcp_pcb *pcb) {
   // Try to push any bytes that may have arrived since the last drive.
   if (c->state == HC_STREAM_DEBUG) {
     stream_debug_drive(c);
+    return conn_takeAborted() ? ERR_ABRT : ERR_OK;
+  }
+  // Anything lwIP had no room for is still owed to the client, and a writer
+  // that stopped on ERR_MEM with nothing unacknowledged never gets a sent
+  // callback to wake it -- poll is the only thing that can retry. Falls
+  // through to the idle check below, so a peer that has really gone away is
+  // still swept.
+  if (c->state == HC_WRITE_RESPONSE && !c->resp_queued) {
+    send_buffered_try(c);
+  } else if (c->state == HC_STREAM_DOWNLOAD) {
+    stream_download_drive(c);
+  } else if (c->state == HC_STREAM_LISTING) {
+    stream_listing_drive(c);
+  }
+  if (c->state == HC_FREE) {
+    return conn_takeAborted() ? ERR_ABRT : ERR_OK;  // the retry closed it
+  }
+  uint32_t idle_ms =
+      (uint32_t)to_ms_since_boot(get_absolute_time()) - c->last_activity_ms;
+  if (idle_ms < HTTP_IDLE_TIMEOUT_MS) {
     return ERR_OK;
   }
-  DPRINTF("http_server: idle timeout, closing connection\n");
+  DPRINTF(
+      "http_server: idle for %lu ms, closing connection (state %d, "
+      "upload %lu/%lu)\n",
+      (unsigned long)idle_ms, (int)c->state, (unsigned long)c->upload_received,
+      (unsigned long)c->content_length);
   conn_close(c);
-  return ERR_OK;
+  return conn_takeAborted() ? ERR_ABRT : ERR_OK;
 }
 
-static void __not_in_flash_func(srv_err_cb)(void *arg, err_t err) {
-  (void)err;
+static void srv_err_cb(void *arg, err_t err) {
   http_conn_t *c = (http_conn_t *)arg;
   if (c != NULL) {
-    // pcb is already gone per lwIP contract; just release the slot.
+    // The pcb is already gone per lwIP's contract, but everything else this
+    // connection holds is ours to release.
+    DPRINTF("http_server: connection killed by lwIP (err %d), releasing\n",
+            (int)err);
     c->pcb = NULL;
+    conn_release_resources(c);
     conn_free(c);
   }
 }
 
 // --- Request parsing ---
 
-static int __not_in_flash_func(strncasecmp_n)(const char *a, const char *b, size_t n) {
+static int strncasecmp_n(const char *a, const char *b, size_t n) {
   for (size_t i = 0; i < n; i++) {
     char ca = a[i];
     char cb = b[i];
@@ -537,7 +684,7 @@ static int __not_in_flash_func(strncasecmp_n)(const char *a, const char *b, size
   return 0;
 }
 
-static hc_method_t __not_in_flash_func(parse_method)(const char *s, size_t n) {
+static hc_method_t parse_method(const char *s, size_t n) {
   if (n == 3 && memcmp(s, "GET", 3) == 0) return HM_GET;
   if (n == 4 && memcmp(s, "HEAD", 4) == 0) return HM_HEAD;
   if (n == 4 && memcmp(s, "POST", 4) == 0) return HM_POST;
@@ -546,7 +693,8 @@ static hc_method_t __not_in_flash_func(parse_method)(const char *s, size_t n) {
   return HM_UNKNOWN;
 }
 
-static void __not_in_flash_func(parse_and_dispatch)(http_conn_t *c) {
+static void parse_and_dispatch(http_conn_t *c, struct pbuf *seg,
+                               size_t body_off) {
   // Request line
   char *eol = strstr(c->hdr, "\r\n");
   if (eol == NULL) {
@@ -679,15 +827,12 @@ static void __not_in_flash_func(parse_and_dispatch)(http_conn_t *c) {
 
   c->is_head = (c->method == HM_HEAD);
 
-  // Compute the body-segment bytes that fell after the headers in the
-  // same TCP segment. Used both by the upload streaming path (which
-  // writes them straight to the file) and by the generic JSON-body
-  // path (which buffers them into c->body).
-  char *body_start = p + 2;
-  size_t header_consumed_total = (size_t)(body_start - c->hdr);
-  size_t body_leftover = (c->hdr_len > header_consumed_total)
-                             ? c->hdr_len - header_consumed_total
-                             : 0;
+  // Body bytes that fell after the headers in the same TCP segment are
+  // still in the pbuf at body_off. Used both by the streaming paths
+  // (which drain them straight to their destination) and by the
+  // generic JSON-body path (which buffers them into c->body).
+  size_t body_leftover =
+      (seg != NULL && seg->tot_len > body_off) ? seg->tot_len - body_off : 0;
 
   // Special-case PUT-on-/api/v1/gemdrive/files/ for streaming upload — it
   // bypasses the small JSON-body buffer (which has a 256-byte cap)
@@ -698,7 +843,7 @@ static void __not_in_flash_func(parse_and_dispatch)(http_conn_t *c) {
       strncmp(c->path, files_prefix, files_prefix_len) == 0) {
     size_t leftover = body_leftover;
     if (leftover > c->content_length) leftover = c->content_length;
-    if (!handle_file_upload_init(c, body_start, leftover)) {
+    if (!handle_file_upload_init(c, seg, body_off, leftover)) {
       return;  // upload_init already wrote the error response
     }
     if (c->upload_received >= c->content_length) {
@@ -718,7 +863,7 @@ static void __not_in_flash_func(parse_and_dispatch)(http_conn_t *c) {
       strcmp(c->path, "/api/v1/runner/adv/load") == 0) {
     size_t leftover = body_leftover;
     if (leftover > c->content_length) leftover = c->content_length;
-    if (!handle_runner_adv_load_init(c, body_start, leftover)) {
+    if (!handle_runner_adv_load_init(c, seg, body_off, leftover)) {
       return;  // init wrote the error response
     }
     if (c->adv_load_received >= c->adv_load_total) {
@@ -741,14 +886,10 @@ static void __not_in_flash_func(parse_and_dispatch)(http_conn_t *c) {
                   "Body too large for this route");
       return;
     }
-    // body_start / body_leftover were computed above. The header
-    // parser nul-terminated each header it walked but c->hdr_len is
-    // the original byte count copied off the wire, so anything past
-    // body_start is body that arrived in the same segment.
     size_t leftover = body_leftover;
     if (leftover > c->content_length) leftover = c->content_length;
     if (leftover > 0) {
-      memcpy(c->body, body_start, leftover);
+      pbuf_copy_partial(seg, c->body, (u16_t)leftover, (u16_t)body_off);
       c->body_received = leftover;
     }
     if (c->body_received >= c->content_length) {
@@ -764,7 +905,7 @@ static void __not_in_flash_func(parse_and_dispatch)(http_conn_t *c) {
 
 // --- URL decoding + query parsing ---
 
-static int __not_in_flash_func(hex_digit)(int c) {
+static int hex_digit(int c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
@@ -775,7 +916,7 @@ static int __not_in_flash_func(hex_digit)(int c) {
 // (we don't accept form-encoded query strings as space-encoded).
 // Returns false on bad encoding, NUL byte in result, or buffer
 // overflow.
-static bool __not_in_flash_func(url_decode)(const char *src, char *dst, size_t dst_cap) {
+static bool url_decode(const char *src, char *dst, size_t dst_cap) {
   size_t out = 0;
   while (*src != '\0') {
     if (out + 1 >= dst_cap) return false;
@@ -801,7 +942,7 @@ static bool __not_in_flash_func(url_decode)(const char *src, char *dst, size_t d
 // Find `key` in a URL-encoded query string `?a=1&b=2&...`. Writes the
 // URL-decoded value into `out`. Returns true on hit (even when value
 // is empty), false if key not present or buffer would overflow.
-static bool __not_in_flash_func(query_get)(const char *query, const char *key, char *out,
+static bool query_get(const char *query, const char *key, char *out,
                       size_t out_cap) {
   size_t key_len = strlen(key);
   const char *p = query;
@@ -830,7 +971,7 @@ static bool __not_in_flash_func(query_get)(const char *query, const char *key, c
 // Reads gconfig PARAM_HOSTNAME (used for the API's mDNS name); we
 // don't actually need it here but the GEMDRIVE_FOLDER lookup is the
 // real prize.
-static const char *__not_in_flash_func(get_gemdrive_folder)(void) {
+static const char *get_gemdrive_folder(void) {
   SettingsConfigEntry *entry =
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER);
   if (entry == NULL || entry->value[0] == '\0') return "/devops";
@@ -847,7 +988,7 @@ typedef enum {
   NORM_TOO_LONG,
 } norm_status_t;
 
-static norm_status_t __not_in_flash_func(normalize_rel)(const char *rel, char *out,
+static norm_status_t normalize_rel(const char *rel, char *out,
                                    size_t out_cap) {
   if (out_cap < 2) return NORM_TOO_LONG;
   out[0] = '/';
@@ -909,7 +1050,7 @@ static norm_status_t __not_in_flash_func(normalize_rel)(const char *rel, char *o
 
 // Build absolute on-disk path: GEMDRIVE_FOLDER + normalised rel.
 // rel can be NULL/empty (treated as "/").
-static norm_status_t __not_in_flash_func(resolve_jail)(const char *rel, char *out,
+static norm_status_t resolve_jail(const char *rel, char *out,
                                   size_t out_cap) {
   char norm[HTTP_PATH_BUF_BYTES];
   norm_status_t s = normalize_rel(rel, norm, sizeof(norm));
@@ -941,7 +1082,7 @@ static norm_status_t __not_in_flash_func(resolve_jail)(const char *rel, char *ou
 // historically rejected ('+', ',', ';', '=', '[', ']'). Lower-case
 // letters are allowed at validation time and case-folded by FatFs;
 // our jail returns the canonical uppercase form to clients.
-static bool __not_in_flash_func(fat_illegal_char)(unsigned char ch) {
+static bool fat_illegal_char(unsigned char ch) {
   if (ch < 0x20) return true;
   if (ch >= 0x80) return true;
   static const char banned[] = "\"*/:<>?\\|+,;=[]";
@@ -960,7 +1101,7 @@ static bool __not_in_flash_func(fat_illegal_char)(unsigned char ch) {
 // `norm` is the leading-slash form produced by normalize_rel (e.g.
 // "/foo/bar.txt"). This function only inspects the segment after the
 // last '/'.
-static norm_status_t __not_in_flash_func(validate_8_3_last)(const char *norm) {
+static norm_status_t validate_8_3_last(const char *norm) {
   const char *last_slash = strrchr(norm, '/');
   const char *seg = (last_slash != NULL) ? last_slash + 1 : norm;
   size_t seg_len = strlen(seg);
@@ -1008,14 +1149,14 @@ typedef enum {
   JSON_KEY_MISSING,   // syntactically valid but key absent / not a string
 } json_status_t;
 
-static const char *__not_in_flash_func(skip_ws)(const char *p, const char *end) {
+static const char *skip_ws(const char *p, const char *end) {
   while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) {
     p++;
   }
   return p;
 }
 
-static json_status_t __not_in_flash_func(json_extract_string)(const char *body, size_t body_len,
+static json_status_t json_extract_string(const char *body, size_t body_len,
                                          const char *key, char *out,
                                          size_t out_cap) {
   const char *p = body;
@@ -1124,7 +1265,7 @@ static json_status_t __not_in_flash_func(json_extract_string)(const char *body, 
 // FAT date+time → ISO-8601 "YYYY-MM-DDTHH:MM:SS". Returns false if
 // the date field is zero (FatFs uses 0 for "no date set") so the
 // caller can emit `null`.
-static bool __not_in_flash_func(fat_to_iso8601)(WORD fdate, WORD ftime, char *out,
+static bool fat_to_iso8601(WORD fdate, WORD ftime, char *out,
                            size_t out_cap) {
   if (fdate == 0) return false;
   unsigned year = 1980u + ((fdate >> 9) & 0x7F);
@@ -1140,7 +1281,7 @@ static bool __not_in_flash_func(fat_to_iso8601)(WORD fdate, WORD ftime, char *ou
 
 // --- Route handlers ---
 
-static void __not_in_flash_func(handle_ping)(http_conn_t *c) {
+static void handle_ping(http_conn_t *c) {
   uint64_t uptime_us =
       (uint64_t)absolute_time_diff_us(g_boot_time, get_absolute_time());
   uint64_t uptime_s = uptime_us / 1000000ULL;
@@ -1152,7 +1293,7 @@ static void __not_in_flash_func(handle_ping)(http_conn_t *c) {
   write_response(c, 200, "OK", "application/json", body, (size_t)n);
 }
 
-static const char *__not_in_flash_func(fat_type_name)(BYTE fs_type) {
+static const char *fat_type_name(BYTE fs_type) {
   switch (fs_type) {
     case FS_FAT12: return "FAT12";
     case FS_FAT16: return "FAT16";
@@ -1162,14 +1303,13 @@ static const char *__not_in_flash_func(fat_type_name)(BYTE fs_type) {
   }
 }
 
-static void __not_in_flash_func(handle_volume)(http_conn_t *c) {
+static void handle_volume(http_conn_t *c) {
   FATFS *fs = NULL;
   DWORD free_clusters = 0;
   FRESULT res = f_getfree("", &free_clusters, &fs);
   if (res != FR_OK || fs == NULL) {
     DPRINTF("http_server: /volume f_getfree failed (%d)\n", (int)res);
-    write_error(c, 503, "Service Unavailable", "busy",
-                "SD filesystem unavailable");
+    write_fs_error(c, res, "f_getfree failed");
     return;
   }
   uint64_t bytes_per_sector =
@@ -1220,7 +1360,7 @@ static const char *runner_last_command_str(runner_last_command_t cmd) {
 //
 // busy / cwd / exit-code fields are populated as RUNNER_EXECUTE / CD
 // commands land.
-static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
+static void handle_runner_status(http_conn_t *c) {
   bool active = emul_isRunnerActive();
   bool busy = emul_isRunnerBusy();
   const char *last_cmd = runner_last_command_str(emul_getRunnerLastCommand());
@@ -1292,7 +1432,7 @@ static void __not_in_flash_func(handle_runner_status)(http_conn_t *c) {
     snprintf(last_load_errno_buf, sizeof(last_load_errno_buf), "null");
   }
 
-  char body[640];
+  static char body[640];
   int n = snprintf(
       body, sizeof(body),
       "{\"ok\":true,\"active\":%s,\"busy\":%s,\"cwd\":\"%s\","
@@ -1340,7 +1480,7 @@ static bool finfo_is_dir(const FILINFO *info);
 // into `out`. Absolute paths and paths with no cwd in effect are
 // copied verbatim. Returns true on success, false if the resolved
 // string would overflow `out_cap`.
-static bool __not_in_flash_func(runner_resolve_relative)(const char *input,
+static bool runner_resolve_relative(const char *input,
                                                           char *out,
                                                           size_t out_cap) {
   if (input == NULL || out == NULL || out_cap == 0) return false;
@@ -1372,7 +1512,7 @@ static bool __not_in_flash_func(runner_resolve_relative)(const char *input,
 // Runner sub-region writers. m68k can only READ the cartridge area;
 // the RP populates path / cmdline buffers in APP_FREE so the m68k
 // Runner can dereference them directly when it runs Pexec.
-static uint32_t __not_in_flash_func(runner_app_free_address)(void) {
+static uint32_t runner_app_free_address(void) {
   return (uint32_t)&__rom_in_ram_start__ + CHANDLER_APP_FREE_OFFSET;
 }
 
@@ -1382,7 +1522,7 @@ static uint32_t __not_in_flash_func(runner_app_free_address)(void) {
 // for byte reads. We pre-swap each pair so the m68k's byte reads
 // land in the right order. Same idea as writeAppFreeBytesSwapped in
 // gemdrive.c.
-static void __not_in_flash_func(runner_memcpy_swapped)(uint8_t *dst,
+static void runner_memcpy_swapped(uint8_t *dst,
                                                        const char *src,
                                                        size_t n) {
   for (size_t i = 0; i < n; i++) {
@@ -1390,7 +1530,7 @@ static void __not_in_flash_func(runner_memcpy_swapped)(uint8_t *dst,
   }
 }
 
-static void __not_in_flash_func(runner_write_path)(const char *path) {
+static void runner_write_path(const char *path) {
   uint8_t *dst = (uint8_t *)(runner_app_free_address() + RUNNER_PATH_OFFSET);
   size_t n = strlen(path);
   if (n >= RUNNER_PATH_LEN - 1) n = RUNNER_PATH_LEN - 2;
@@ -1404,7 +1544,7 @@ static void __not_in_flash_func(runner_write_path)(const char *path) {
 // TOS Pexec cmdline format: <u8 length><bytes...>, no NUL. The
 // length byte is BYTE 0; the m68k passes a pointer to this buffer
 // straight to GEMDOS Pexec. Same byte-pair swap as the path.
-static void __not_in_flash_func(runner_write_cmdline)(const char *cmdline) {
+static void runner_write_cmdline(const char *cmdline) {
   uint8_t *dst =
       (uint8_t *)(runner_app_free_address() + RUNNER_CMDLINE_OFFSET);
   size_t n = strlen(cmdline);
@@ -1427,7 +1567,7 @@ static void __not_in_flash_func(runner_write_cmdline)(const char *cmdline) {
 // the Runner busy, fires RUNNER_CMD_EXECUTE on the cartridge
 // sentinel. The m68k's Pexec result is reported asynchronously via
 // the chandler RUNNER_CMD_DONE_EXECUTE callback (runner.c).
-static void __not_in_flash_func(handle_runner_run)(http_conn_t *c) {
+static void handle_runner_run(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -1452,7 +1592,7 @@ static void __not_in_flash_func(handle_runner_run)(http_conn_t *c) {
     return;
   }
 
-  char path[RUNNER_PATH_LEN];
+  static char path[RUNNER_PATH_LEN];
   json_status_t js = json_extract_string(c->body, c->body_received, "path",
                                          path, sizeof(path));
   if (js == JSON_BAD) {
@@ -1490,14 +1630,14 @@ static void __not_in_flash_func(handle_runner_run)(http_conn_t *c) {
   // for the m68k stays in user-supplied form (see below) so a bare
   // filename gets resolved by GEMDOS against the m68k's TOS cwd
   // (which the previous Dsetpath kept in sync with our cwd mirror).
-  char rebased[RUNNER_PATH_LEN];
+  static char rebased[RUNNER_PATH_LEN];
   if (!runner_resolve_relative(path, rebased, sizeof(rebased))) {
     write_error(c, 400, "Bad Request", "name_too_long",
                 "Path too long after cwd resolution");
     return;
   }
-  char norm[HTTP_PATH_BUF_BYTES];
-  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  static char norm[HTTP_PATH_BUF_BYTES];
+  static char abs_path[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(rebased, norm, sizeof(norm), abs_path,
                                  sizeof(abs_path));
   if (s != NORM_OK) {
@@ -1516,8 +1656,7 @@ static void __not_in_flash_func(handle_runner_run)(http_conn_t *c) {
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   }
   if (finfo_is_dir(&info)) {
@@ -1532,7 +1671,7 @@ static void __not_in_flash_func(handle_runner_run)(http_conn_t *c) {
   // paths still work — they just don't depend on cwd. The Runner
   // Dsetdrvs to the emulated drive before each Pexec, so a bare
   // backslash form (no drive letter) resolves on our drive.
-  char st_path[RUNNER_PATH_LEN];
+  static char st_path[RUNNER_PATH_LEN];
   size_t out = 0;
   for (size_t i = 0; path[i] != '\0' && out < sizeof(st_path) - 1; i++) {
     char ch = path[i];
@@ -1570,7 +1709,7 @@ static void __not_in_flash_func(handle_runner_run)(http_conn_t *c) {
 // under 1 s for normal-sized TOS programs; uses the same 10 s
 // outer timeout as a generous worst-case.
 #define RUNNER_LOAD_TIMEOUT_US 10000000
-static void __not_in_flash_func(handle_runner_load)(http_conn_t *c) {
+static void handle_runner_load(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -1600,7 +1739,7 @@ static void __not_in_flash_func(handle_runner_load)(http_conn_t *c) {
     return;
   }
 
-  char path[RUNNER_PATH_LEN];
+  static char path[RUNNER_PATH_LEN];
   json_status_t js = json_extract_string(c->body, c->body_received, "path",
                                          path, sizeof(path));
   if (js == JSON_BAD) {
@@ -1632,14 +1771,14 @@ static void __not_in_flash_func(handle_runner_load)(http_conn_t *c) {
   }
 
   // Same path-resolution + jail-check + f_stat as /runner/run.
-  char rebased[RUNNER_PATH_LEN];
+  static char rebased[RUNNER_PATH_LEN];
   if (!runner_resolve_relative(path, rebased, sizeof(rebased))) {
     write_error(c, 400, "Bad Request", "name_too_long",
                 "Path too long after cwd resolution");
     return;
   }
-  char norm[HTTP_PATH_BUF_BYTES];
-  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  static char norm[HTTP_PATH_BUF_BYTES];
+  static char abs_path[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(rebased, norm, sizeof(norm), abs_path,
                                  sizeof(abs_path));
   if (s != NORM_OK) {
@@ -1658,8 +1797,7 @@ static void __not_in_flash_func(handle_runner_load)(http_conn_t *c) {
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   }
   if (finfo_is_dir(&info)) {
@@ -1669,7 +1807,7 @@ static void __not_in_flash_func(handle_runner_load)(http_conn_t *c) {
   }
 
   // Same backslash-form path translation as /runner/run.
-  char st_path[RUNNER_PATH_LEN];
+  static char st_path[RUNNER_PATH_LEN];
   size_t out = 0;
   for (size_t i = 0; path[i] != '\0' && out < sizeof(st_path) - 1; i++) {
     char ch = path[i];
@@ -1690,7 +1828,7 @@ static void __not_in_flash_func(handle_runner_load)(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_LOAD_TIMEOUT_US);
   while (emul_isRunnerBusy()) {
-    chandler_loop();
+    http_spinTick();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
       // Treat the timeout as a load failure with a synthetic
@@ -1737,7 +1875,7 @@ static void __not_in_flash_func(handle_runner_load)(http_conn_t *c) {
 // soon as RUNNER_CMD_EXEC is on the sentinel. The exit code
 // arrives asynchronously via DONE_EXEC and surfaces on the
 // next /runner/status as last_exit_code.
-static void __not_in_flash_func(handle_runner_exec)(http_conn_t *c) {
+static void handle_runner_exec(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -1790,7 +1928,7 @@ static void __not_in_flash_func(handle_runner_exec)(http_conn_t *c) {
 // usually means the basepage was never allocated). 409
 // no_program_loaded if nothing to free.
 #define RUNNER_UNLOAD_TIMEOUT_US 5000000
-static void __not_in_flash_func(handle_runner_unload)(http_conn_t *c) {
+static void handle_runner_unload(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -1819,7 +1957,7 @@ static void __not_in_flash_func(handle_runner_unload)(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_UNLOAD_TIMEOUT_US);
   while (emul_isRunnerBusy()) {
-    chandler_loop();
+    http_spinTick();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
       // Synthetic timeout failure — keeps state consistent
@@ -1863,7 +2001,7 @@ static void __not_in_flash_func(handle_runner_unload)(http_conn_t *c) {
 // Runner busy and fires RUNNER_CMD_CD on the cartridge sentinel; the
 // m68k's Dsetpath result lands asynchronously via the chandler
 // RUNNER_CMD_DONE_CD callback (runner.c).
-static void __not_in_flash_func(handle_runner_cd)(http_conn_t *c) {
+static void handle_runner_cd(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -1888,7 +2026,7 @@ static void __not_in_flash_func(handle_runner_cd)(http_conn_t *c) {
     return;
   }
 
-  char path[RUNNER_PATH_LEN];
+  static char path[RUNNER_PATH_LEN];
   json_status_t js = json_extract_string(c->body, c->body_received, "path",
                                          path, sizeof(path));
   if (js == JSON_BAD) {
@@ -1904,14 +2042,14 @@ static void __not_in_flash_func(handle_runner_cd)(http_conn_t *c) {
 
   // Resolve relative paths against the current cwd so e.g. `cd SUB`
   // from /TEST lands on /TEST/SUB.
-  char rebased[RUNNER_PATH_LEN];
+  static char rebased[RUNNER_PATH_LEN];
   if (!runner_resolve_relative(path, rebased, sizeof(rebased))) {
     write_error(c, 400, "Bad Request", "name_too_long",
                 "Path too long after cwd resolution");
     return;
   }
-  char norm[HTTP_PATH_BUF_BYTES];
-  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  static char norm[HTTP_PATH_BUF_BYTES];
+  static char abs_path[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(rebased, norm, sizeof(norm), abs_path,
                                  sizeof(abs_path));
   if (s != NORM_OK) {
@@ -1927,8 +2065,7 @@ static void __not_in_flash_func(handle_runner_cd)(http_conn_t *c) {
       return;
     }
     if (fr != FR_OK) {
-      write_error(c, 500, "Internal Server Error", "disk_error",
-                  "f_stat failed");
+      write_fs_error(c, fr, "f_stat failed");
       return;
     }
     if (!finfo_is_dir(&info)) {
@@ -1945,7 +2082,7 @@ static void __not_in_flash_func(handle_runner_cd)(http_conn_t *c) {
   // m68k on /TEST/ARKANOID just like our mirror. Absolute inputs work
   // independently of cwd. The Runner Dsetdrvs before Dsetpath so a
   // bare backslash path resolves on the GEMDRIVE drive.
-  char st_path[RUNNER_PATH_LEN];
+  static char st_path[RUNNER_PATH_LEN];
   size_t out = 0;
   for (size_t i = 0; path[i] != '\0' && out < sizeof(st_path) - 1; i++) {
     char ch = path[i];
@@ -1975,7 +2112,7 @@ static void __not_in_flash_func(handle_runner_cd)(http_conn_t *c) {
 // m68k-readable cartridge slot. Byte-pair-swapped so the m68k's
 // `move.l RUNNER_BASEPAGE, ...` lands the right value, same
 // cartridge-bus quirk as runner_write_path.
-static void __not_in_flash_func(runner_write_u32)(uint32_t offset,
+static void runner_write_u32(uint32_t offset,
                                                    uint32_t value) {
   uint8_t *dst = (uint8_t *)(runner_app_free_address() + offset);
   uint8_t b0 = (uint8_t)((value >> 24) & 0xFF);
@@ -1991,7 +2128,7 @@ static void __not_in_flash_func(runner_write_u32)(uint32_t offset,
 // APP_FREE so the m68k handler can read it. u16 in the low half of
 // the longword. Byte-pair-swapped so the m68k's word-load lands
 // the right value (cartridge-bus quirk — same as runner_write_path).
-static void __not_in_flash_func(runner_write_rez)(uint16_t rez) {
+static void runner_write_rez(uint16_t rez) {
   uint8_t *dst = (uint8_t *)(runner_app_free_address() + RUNNER_REZ_OFFSET);
   // Zero the 4-byte slot, then write the u16 swapped.
   uint8_t hi = (uint8_t)((rez >> 8) & 0xFF);
@@ -2009,7 +2146,7 @@ static void __not_in_flash_func(runner_write_rez)(uint16_t rez) {
 // detect monochrome (rez == 2) and refuse, otherwise XBIOS Setscreen
 // with the requested rez. Errno (i32) returns via RUNNER_CMD_DONE_RES
 // and surfaces as `last_res_errno` in the status envelope.
-static void __not_in_flash_func(handle_runner_res)(http_conn_t *c) {
+static void handle_runner_res(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -2100,7 +2237,7 @@ static void __not_in_flash_func(handle_runner_res)(http_conn_t *c) {
 // to the patched PC.
 //
 // No busy-lock gate — escaping wedged state is the whole point.
-static void __not_in_flash_func(handle_runner_adv_jump)(http_conn_t *c) {
+static void handle_runner_adv_jump(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -2202,7 +2339,7 @@ static void __not_in_flash_func(handle_runner_adv_jump)(http_conn_t *c) {
 #define ADV_LOAD_CHUNK_SIZE   8192u
 #define ADV_LOAD_TIMEOUT_US   1000000
 
-static uint8_t *__not_in_flash_func(adv_load_buf_base)(void) {
+static uint8_t *adv_load_buf_base(void) {
   // RUNNER_ADV_LOAD_BUF_OFFSET in runner.s. Mirrors at APP_FREE +
   // 0x4000; APP_FREE is 46 KB so 0x4000..0x6000 (8 KB) is comfortably
   // inside the arena and clear of the GEMDRIVE / Runner-meta block
@@ -2216,9 +2353,8 @@ static uint8_t *__not_in_flash_func(adv_load_buf_base)(void) {
 // dispatch the chunk and reset the cursor for the next one. The
 // final partial chunk (chunk_pos > 0 at end-of-content) is flushed
 // by adv_load_finish_ok().
-static void __not_in_flash_func(adv_load_drain_pbuf)(http_conn_t *c,
-                                                     struct pbuf *p,
-                                                     size_t off, size_t n) {
+static bool adv_load_drain_pbuf(http_conn_t *c, struct pbuf *p, size_t off,
+                                size_t n) {
   uint8_t *base = adv_load_buf_base();
   // Walk pbuf segments to avoid an O(n) intermediate copy through
   // pbuf_copy_partial. Same shape as pbuf_get_at, but we can't use
@@ -2241,10 +2377,11 @@ static void __not_in_flash_func(adv_load_drain_pbuf)(http_conn_t *c,
       // will keep draining bytes into nowhere; the response is
       // already a 504 so the client sees the failure.
       if (!adv_load_dispatch_chunk(c)) {
-        return;
+        return false;
       }
     }
   }
+  return true;
 }
 
 // Publish (target, len) in shared-var slots 18/19, fire
@@ -2253,7 +2390,7 @@ static void __not_in_flash_func(adv_load_drain_pbuf)(http_conn_t *c,
 // runner_command_cb -> emul_recordRunnerAdvLoadAck), then advance
 // the destination cursor and reset the chunk cursor. Returns false
 // on per-chunk timeout (1 s).
-static bool __not_in_flash_func(adv_load_dispatch_chunk)(http_conn_t *c) {
+static bool adv_load_dispatch_chunk(http_conn_t *c) {
   uint32_t base = (uint32_t)&__rom_in_ram_start__;
   uint32_t len = c->adv_load_chunk_pos;
   if (len == 0) return true;
@@ -2266,7 +2403,7 @@ static bool __not_in_flash_func(adv_load_dispatch_chunk)(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), ADV_LOAD_TIMEOUT_US);
   while (!emul_isRunnerAdvLoadAcked()) {
-    chandler_loop();
+    http_spinTick();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       DPRINTF("adv_load: chunk dispatch timed out at target=0x%lX len=%lu\n",
               (unsigned long)c->adv_load_target, (unsigned long)len);
@@ -2282,7 +2419,7 @@ static bool __not_in_flash_func(adv_load_dispatch_chunk)(http_conn_t *c) {
 
 // End of body — flush the final partial chunk (if any) and send
 // the success envelope.
-static void __not_in_flash_func(adv_load_finish_ok)(http_conn_t *c) {
+static void adv_load_finish_ok(http_conn_t *c) {
   if (c->adv_load_chunk_pos > 0) {
     if (!adv_load_dispatch_chunk(c)) {
       return;
@@ -2305,8 +2442,8 @@ static void __not_in_flash_func(adv_load_finish_ok)(http_conn_t *c) {
 // body bytes that arrived in the same TCP segment as the headers.
 // Returns false if any validation failed (an error response was
 // already written).
-static bool __not_in_flash_func(handle_runner_adv_load_init)(
-    http_conn_t *c, const char *body_start, size_t leftover) {
+static bool handle_runner_adv_load_init(http_conn_t *c, struct pbuf *seg,
+                                        size_t body_off, size_t leftover) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -2386,7 +2523,7 @@ static bool __not_in_flash_func(handle_runner_adv_load_init)(
     absolute_time_t deadline =
         delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
     while (!emul_isRunnerMeminfoReady()) {
-      chandler_loop();
+      http_spinTick();
       if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
         runner_meminfo_t empty = {0};
         uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
@@ -2422,20 +2559,11 @@ static bool __not_in_flash_func(handle_runner_adv_load_init)(
   c->adv_load_chunk_pos = 0;
 
   // Pump the leftover bytes that arrived in the same TCP segment as
-  // the headers directly into the chunk buffer. pbuf-free isn't
-  // available here (no pbuf to walk); instead loop byte-by-byte.
+  // the headers directly into the chunk buffer.
   size_t pump = leftover;
   if (pump > c->adv_load_total) pump = c->adv_load_total;
-  uint8_t *base = adv_load_buf_base();
-  for (size_t i = 0; i < pump; i++) {
-    base[c->adv_load_chunk_pos ^ 1u] = (uint8_t)body_start[i];
-    c->adv_load_chunk_pos++;
-    c->adv_load_received++;
-    if (c->adv_load_chunk_pos >= ADV_LOAD_CHUNK_SIZE) {
-      if (!adv_load_dispatch_chunk(c)) {
-        return false;
-      }
-    }
+  if (pump > 0 && !adv_load_drain_pbuf(c, seg, body_off, pump)) {
+    return false;  // dispatch timed out; the 504 is already written
   }
   return true;
 }
@@ -2452,7 +2580,7 @@ static bool __not_in_flash_func(handle_runner_adv_load_init)(
 //
 // Intentionally skips the busy-lock gate — the busy state is what
 // we want to escape (a wedged Pexec'd program holds it set forever).
-static void __not_in_flash_func(handle_runner_adv_meminfo)(http_conn_t *c) {
+static void handle_runner_adv_meminfo(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -2466,7 +2594,7 @@ static void __not_in_flash_func(handle_runner_adv_meminfo)(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
   while (!emul_isRunnerMeminfoReady()) {
-    chandler_loop();
+    http_spinTick();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
       runner_meminfo_t empty = {0};
@@ -2508,7 +2636,7 @@ static void __not_in_flash_func(handle_runner_adv_meminfo)(http_conn_t *c) {
 // at $400 — chosen via the ACONFIG_PARAM_ADV_HOOK_VECTOR setting in
 // the setup menu). The flag and vector ID arrive together in the
 // HELLO payload; both clear on emul_resetRunnerSession.
-static void __not_in_flash_func(handle_runner_adv_status)(http_conn_t *c) {
+static void handle_runner_adv_status(http_conn_t *c) {
   bool active = emul_isRunnerActive();
   bool installed = active && emul_isRunnerAdvancedInstalled();
   uint8_t vec = installed ? emul_getRunnerAdvHookVector()
@@ -2551,7 +2679,7 @@ static void __not_in_flash_func(handle_runner_adv_status)(http_conn_t *c) {
 //                       wrapped past the cursor while the host's
 //                       TX FIFO stalled. Cumulative since boot.>
 //   }
-static void __not_in_flash_func(handle_debug_status)(http_conn_t *c) {
+static void handle_debug_status(http_conn_t *c) {
   uint32_t ring_used = 0;
   uint32_t ring_capacity = 0;
   uint32_t bytes_dropped = 0;
@@ -2592,7 +2720,7 @@ static void __not_in_flash_func(handle_debug_status)(http_conn_t *c) {
 // us to encode binary or non-printable bytes; the contract for
 // the public ABI is "you get exactly what was emitted", so
 // octet-stream is honest.
-static void __not_in_flash_func(stream_debug_drive)(http_conn_t *c) {
+static void stream_debug_drive(http_conn_t *c) {
   // Pull as many bytes as we can fit in c->resp (re-used as a
   // scratch buffer for the chunk body).
   uint8_t *buf = (uint8_t *)c->resp;
@@ -2615,7 +2743,7 @@ static void __not_in_flash_func(stream_debug_drive)(http_conn_t *c) {
   }
 }
 
-static void __not_in_flash_func(handle_debug_log)(http_conn_t *c) {
+static void handle_debug_log(http_conn_t *c) {
   // Send status line + headers (chunked encoding, no Content-Length).
   int hn = snprintf(c->resp, sizeof(c->resp),
                     "HTTP/1.1 200 OK\r\n"
@@ -2669,7 +2797,7 @@ static void __not_in_flash_func(handle_debug_log)(http_conn_t *c) {
 // addresses, the two decoded bank sizes (0/0 = unrecognised MMU
 // config), and a simple "decoded" boolean derived from the banks.
 #define RUNNER_MEMINFO_TIMEOUT_US 1000000
-static void __not_in_flash_func(handle_runner_meminfo)(http_conn_t *c) {
+static void handle_runner_meminfo(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -2691,7 +2819,7 @@ static void __not_in_flash_func(handle_runner_meminfo)(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
   while (!emul_isRunnerMeminfoReady()) {
-    chandler_loop();
+    http_spinTick();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       // Timeout — clear busy and report.
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
@@ -2741,7 +2869,7 @@ static void __not_in_flash_func(handle_runner_meminfo)(http_conn_t *c) {
 // Intentionally no busy-lock gate — the busy state is exactly what
 // we want to escape. 409 runner_inactive when the user hasn't
 // picked [U] at boot.
-static void __not_in_flash_func(handle_runner_reset)(http_conn_t *c) {
+static void handle_runner_reset(http_conn_t *c) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -2770,7 +2898,7 @@ static void __not_in_flash_func(handle_runner_reset)(http_conn_t *c) {
 static bool body_appendf(char *body, size_t cap, size_t *len,
                          const char *fmt, ...) __attribute__((format(printf, 4, 5)));
 
-static bool __not_in_flash_func(body_appendf)(char *body, size_t cap, size_t *len,
+static bool body_appendf(char *body, size_t cap, size_t *len,
                          const char *fmt, ...) {
   if (*len >= cap) return false;
   va_list args;
@@ -2783,6 +2911,150 @@ static bool __not_in_flash_func(body_appendf)(char *body, size_t cap, size_t *le
   *len += (size_t)n;
   return true;
 }
+
+// GET /api/v1/system/health — device health without a console.
+//
+// Heap and stack high-water marks, code copied to RAM, why the RP last
+// rebooted, ROM3 ring overruns and debug-byte drops. With a debug build
+// and DEVOPS_LWIP_STATS, also lwIP's pool counters as [used, max, err].
+// See docs/api.md for the field reference. Not time-critical, so it stays
+// in flash, unlike the rest of this file.
+static void handle_system_health(http_conn_t *c) {
+  health_report_t r;
+  health_getReport(&r);
+
+  uint32_t ring_used = 0;
+  uint32_t ring_capacity = 0;
+  uint32_t bytes_dropped = 0;
+  debugcap_getRingStats(&ring_used, &ring_capacity, &bytes_dropped);
+  uint32_t usbcdc_dropped = 0;
+  usbcdc_getStats(&usbcdc_dropped, NULL);
+
+  bool crashed = r.boot == HEALTH_BOOT_PANIC ||
+                 r.boot == HEALTH_BOOT_HARDFAULT || r.boot == HEALTH_BOOT_HANG;
+  char phase[24] = "null";
+  if (r.boot == HEALTH_BOOT_HANG) {
+    snprintf(phase, sizeof(phase), "\"%s\"", health_phaseName(r.boot_phase));
+  }
+  char pc[16] = "null";
+  char lr[16] = "null";
+  char sp[16] = "null";
+  if (crashed && r.boot != HEALTH_BOOT_HANG) {
+    snprintf(pc, sizeof(pc), "\"0x%08lx\"", (unsigned long)r.boot_pc);
+    snprintf(sp, sizeof(sp), "\"0x%08lx\"", (unsigned long)r.boot_sp);
+    if (r.boot == HEALTH_BOOT_HARDFAULT) {
+      snprintf(lr, sizeof(lr), "\"0x%08lx\"", (unsigned long)r.boot_lr);
+    }
+  }
+
+  // Static: the body is too big for the 2 KB core-0 stack. Sized for the
+  // longest possible report (567 bytes, 803 with the lwIP counters).
+#if LWIP_STATS && MEM_STATS && MEMP_STATS
+  static char body[816];
+#else
+  static char body[576];
+#endif
+  size_t len = 0;
+  bool fits = body_appendf(
+      body, sizeof(body), &len,
+      "{\"ok\":true,\"version\":\"%s\",\"build\":\"%s\",\"debug\":%s,"
+      "\"uptime_s\":%lu,"
+      "\"heap\":{\"total\":%lu,\"free\":%lu,\"min_free\":%lu,"
+      "\"sbrk_high_water\":%lu},"
+      "\"stack\":{\"reserved\":%lu,\"high_water\":%lu,\"painted\":%lu,"
+      "\"overflow\":%s},"
+      "\"code_in_ram\":%lu,"
+      "\"reset\":{\"reason\":\"%s\",\"phase\":%s,\"pc\":%s,\"lr\":%s,"
+      "\"sp\":%s,\"crash_count\":%u,\"crash_loop\":%s},"
+      "\"watchdog\":%s,\"rom3_overruns\":%lu,\"debugcap_dropped\":%lu,"
+      "\"usbcdc_dropped\":%lu",
+      RELEASE_VERSION, RELEASE_BUILD_ID, (_DEBUG != 0) ? "true" : "false",
+      (unsigned long)(r.uptime_ms / 1000u), (unsigned long)r.heap_total,
+      (unsigned long)r.heap_free, (unsigned long)r.heap_min_free,
+      (unsigned long)r.sbrk_high_water, (unsigned long)r.stack_reserved,
+      (unsigned long)r.stack_high_water, (unsigned long)r.stack_painted,
+      r.stack_overflow ? "true" : "false", (unsigned long)r.code_in_ram,
+      health_bootName(r.boot), phase, pc, lr, sp, (unsigned)r.crash_count,
+      r.crash_loop ? "true" : "false", r.watchdog_enabled ? "true" : "false",
+      (unsigned long)commemul_getOverruns(), (unsigned long)bytes_dropped,
+      (unsigned long)usbcdc_dropped);
+
+  // Wi-Fi supervision. power_save is read back from the radio, not
+  // the value we asked for: the driver reapplies its own default on every
+  // bring-up, so the only honest answer is what the chip reports.
+  uint32_t pm = 0;
+  char pm_str[16];
+  if (network_getPowerSaveMode(&pm)) {
+    snprintf(pm_str, sizeof(pm_str), "%lu", (unsigned long)pm);
+  } else {
+    snprintf(pm_str, sizeof(pm_str), "null");
+  }
+  fits = fits && body_appendf(body, sizeof(body), &len,
+                              ",\"wifi\":{\"link_up\":%s,\"power_save\":%s,"
+                              "\"rejoins\":%lu,\"unreachable\":%lu}",
+                              network_isLinkHealthy() ? "true" : "false",
+                              pm_str,
+                              (unsigned long)network_getRejoinAttempts(),
+                              (unsigned long)network_getProbeFailures());
+#if LWIP_STATS && MEM_STATS && MEMP_STATS
+  const struct stats_mem *pools[] = {
+      &lwip_stats.mem, lwip_stats.memp[MEMP_PBUF_POOL],
+      lwip_stats.memp[MEMP_TCP_PCB], lwip_stats.memp[MEMP_TCP_SEG],
+      lwip_stats.memp[MEMP_SYS_TIMEOUT]};
+  const char *names[] = {"mem", "pbuf_pool", "tcp_pcb", "tcp_seg",
+                         "sys_timeout"};
+  fits = fits && body_appendf(body, sizeof(body), &len, ",\"lwip\":{");
+  for (size_t i = 0; fits && i < sizeof(pools) / sizeof(pools[0]); i++) {
+    fits = body_appendf(
+        body, sizeof(body), &len, "%s\"%s\":[%lu,%lu,%lu]", (i == 0) ? "" : ",",
+        names[i], (unsigned long)pools[i]->used, (unsigned long)pools[i]->max,
+        (unsigned long)pools[i]->err);
+  }
+  fits = fits && body_appendf(body, sizeof(body), &len, "}");
+#endif
+  fits = fits && body_appendf(body, sizeof(body), &len, "}\n");
+  if (!fits) {
+    write_error(c, 500, "Internal Server Error", "internal",
+                "Health report does not fit the response buffer");
+    return;
+  }
+  write_response(c, 200, "OK", "application/json", body, len);
+}
+
+#if defined(_DEBUG) && (_DEBUG != 0)
+// POST /api/v1/debug/test/<panic|hardfault|hang|stall|stack-overflow|http-hang> —
+// debug builds only. Injects a fault to verify crash and hang recovery.
+// All but http-hang answer 202 and fire from the main loop shortly
+// after; http-hang never answers and hangs inside this handler.
+static void handle_debug_test(http_conn_t *c) {
+  static const char prefix[] = "/api/v1/debug/test/";
+  const char *what = c->path + sizeof(prefix) - 1;
+  health_test_t test = HEALTH_TEST_NONE;
+  if (strcmp(what, "panic") == 0) {
+    test = HEALTH_TEST_PANIC;
+  } else if (strcmp(what, "hardfault") == 0) {
+    test = HEALTH_TEST_HARDFAULT;
+  } else if (strcmp(what, "hang") == 0) {
+    test = HEALTH_TEST_HANG;
+  } else if (strcmp(what, "stall") == 0) {
+    test = HEALTH_TEST_STALL;
+  } else if (strcmp(what, "stack-overflow") == 0) {
+    test = HEALTH_TEST_STACK_OVERFLOW;
+  } else if (strcmp(what, "http-hang") == 0) {
+    DPRINTF("health: test hang inside an HTTP handler\n");
+    for (;;) tight_loop_contents();
+  }
+  if (test == HEALTH_TEST_NONE) {
+    write_error(c, 404, "Not Found", "not_found", "Unknown test");
+    return;
+  }
+  health_requestTest(test);
+  char body[64];
+  int n = snprintf(body, sizeof(body), "{\"ok\":true,\"test\":\"%s\"}\n", what);
+  if (n < 0) n = 0;
+  write_response(c, 202, "Accepted", "application/json", body, (size_t)n);
+}
+#endif
 
 // --- Streaming directory listing (chunked transfer-encoding) ---
 //
@@ -2798,9 +3070,14 @@ static bool __not_in_flash_func(body_appendf)(char *body, size_t cap, size_t *le
 // chunk turns out to be the last.
 #define STREAM_CLOSE_RESERVE 32
 
+// Room one entry can need: a 255-character long name plus the JSON around
+// it (about 85 bytes). Checked before f_readdir, because an entry that has
+// been read and then does not fit cannot be put back.
+#define STREAM_MAX_ENTRY_BYTES (FF_MAX_LFN + 96)
+
 // Append one entry (with its leading comma when needed) to `out`.
 // Returns false if the formatted entry didn't fit.
-static bool __not_in_flash_func(stream_append_entry)(http_conn_t *c,
+static bool stream_append_entry(http_conn_t *c,
                                                      char *out,
                                                      size_t out_cap,
                                                      size_t *out_len,
@@ -2850,7 +3127,7 @@ static bool __not_in_flash_func(stream_append_entry)(http_conn_t *c,
 // envelope opener for the first chunk; NULL for subsequent chunks).
 // Returns the body length. Side effects: may set
 // c->stream_truncated and c->stream_body_done.
-static size_t __not_in_flash_func(stream_build_body)(http_conn_t *c,
+static size_t stream_build_body(http_conn_t *c,
                                                      const char *prefix,
                                                      char *out,
                                                      size_t out_cap) {
@@ -2867,10 +3144,10 @@ static size_t __not_in_flash_func(stream_build_body)(http_conn_t *c,
       c->stream_truncated = true;
       break;
     }
-    if (out_len + STREAM_CLOSE_RESERVE >= out_cap) {
-      // No room for one more entry plus closing envelope; stop here
-      // and let the next chunk pick up. (Not done — body_done stays
-      // false so we'll come back.)
+    if (out_len + STREAM_MAX_ENTRY_BYTES + STREAM_CLOSE_RESERVE >= out_cap) {
+      // No room for the largest possible entry plus the closing
+      // envelope; stop here and let the next chunk pick up. (Not done —
+      // body_done stays false so we'll come back.)
       return out_len;
     }
     FILINFO finfo;
@@ -2902,6 +3179,11 @@ static err_t __not_in_flash_func(stream_send_chunk)(http_conn_t *c,
   char hdr[16];
   int hn = snprintf(hdr, sizeof(hdr), "%lX\r\n", (unsigned long)body_len);
   if (hn < 0 || hn >= (int)sizeof(hdr)) return ERR_VAL;
+  // A chunk is three writes, and a client cannot make sense of a size line
+  // with no body after it. Only start one the send buffer can hold whole.
+  if (tcp_sndbuf(c->pcb) < (u16_t)hn + body_len + 2) {
+    return ERR_MEM;
+  }
   err_t err = tcp_write(c->pcb, hdr, (u16_t)hn,
                         TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE);
   if (err != ERR_OK) return err;
@@ -2917,7 +3199,7 @@ static err_t __not_in_flash_func(stream_send_chunk)(http_conn_t *c,
 }
 
 // Send the chunked-encoding terminator (zero-length chunk).
-static err_t __not_in_flash_func(stream_send_terminator)(http_conn_t *c) {
+static err_t stream_send_terminator(http_conn_t *c) {
   err_t err = tcp_write(c->pcb, "0\r\n\r\n", 5, TCP_WRITE_FLAG_COPY);
   if (err != ERR_OK) return err;
   tcp_output(c->pcb);
@@ -2928,7 +3210,7 @@ static err_t __not_in_flash_func(stream_send_terminator)(http_conn_t *c) {
 // chunk, decide whether to also send the terminator and close.
 // Called both from handle_files_list (initial round) and from
 // srv_sent_cb (subsequent rounds, driven by peer acks).
-static void __not_in_flash_func(stream_listing_drive)(http_conn_t *c) {
+static void stream_listing_drive(http_conn_t *c) {
   // Worst-case bytes we'd queue this round: chunk header + body +
   // CRLF + terminator. Need send buffer headroom for it.
   size_t needed = HTTP_RESPONSE_BUF_BYTES + 16 + 8;
@@ -2962,9 +3244,9 @@ static void __not_in_flash_func(stream_listing_drive)(http_conn_t *c) {
   }
 }
 
-static void __not_in_flash_func(handle_files_list)(http_conn_t *c) {
+static void handle_files_list(http_conn_t *c) {
   // Extract ?path=, default to "/".
-  char rel[HTTP_PATH_BUF_BYTES];
+  static char rel[HTTP_PATH_BUF_BYTES];
   rel[0] = '\0';
   if (c->query[0] != '\0') {
     if (!query_get(c->query, "path", rel, sizeof(rel))) {
@@ -2976,7 +3258,7 @@ static void __not_in_flash_func(handle_files_list)(http_conn_t *c) {
     }
   }
 
-  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  static char abs_path[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_jail(rel, abs_path, sizeof(abs_path));
   if (s == NORM_BAD_PATH) {
     write_error(c, 400, "Bad Request", "bad_path", "Path not allowed");
@@ -2996,8 +3278,7 @@ static void __not_in_flash_func(handle_files_list)(http_conn_t *c) {
       return;
     }
   } else if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   } else if (!(info.fattrib & AM_DIR)) {
     write_error(c, 422, "Unprocessable Entity", "is_file",
@@ -3008,8 +3289,7 @@ static void __not_in_flash_func(handle_files_list)(http_conn_t *c) {
   // Open the directory for streaming. conn_close releases it.
   fr = f_opendir(&c->stream_dir, abs_path);
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_opendir failed");
+    write_fs_error(c, fr, "f_opendir failed");
     return;
   }
   c->stream_dir_open = true;
@@ -3019,7 +3299,7 @@ static void __not_in_flash_func(handle_files_list)(http_conn_t *c) {
   c->stream_body_done = false;
 
   // Canonical normalised path to echo in the envelope.
-  char norm[HTTP_PATH_BUF_BYTES];
+  static char norm[HTTP_PATH_BUF_BYTES];
   if (normalize_rel(rel, norm, sizeof(norm)) != NORM_OK) {
     norm[0] = '/';
     norm[1] = '\0';
@@ -3083,7 +3363,7 @@ static void __not_in_flash_func(handle_files_list)(http_conn_t *c) {
 // still containing percent-encoded bytes. The handlers URL-decode,
 // normalise, jail, validate 8.3 on the last segment, then call FatFs.
 
-static void __not_in_flash_func(write_path_error)(http_conn_t *c, norm_status_t s) {
+static void write_path_error(http_conn_t *c, norm_status_t s) {
   if (s == NORM_TOO_LONG) {
     write_error(c, 400, "Bad Request", "name_too_long",
                 "Path or name exceeds FAT 8.3 limits");
@@ -3095,7 +3375,7 @@ static void __not_in_flash_func(write_path_error)(http_conn_t *c, norm_status_t 
 // Resolve a URL-decoded relative path into normalised form (norm) and
 // FatFs absolute form (abs). Returns NORM_OK on success or a status
 // the caller maps to the right HTTP error.
-static norm_status_t __not_in_flash_func(resolve_pair)(const char *url_rel, char *norm,
+static norm_status_t resolve_pair(const char *url_rel, char *norm,
                                   size_t norm_cap, char *abs,
                                   size_t abs_cap) {
   char decoded[HTTP_PATH_BUF_BYTES];
@@ -3108,13 +3388,13 @@ static norm_status_t __not_in_flash_func(resolve_pair)(const char *url_rel, char
 
 // Test whether the FILINFO returned by f_stat indicates a directory.
 // Only valid when f_stat returned FR_OK.
-static bool __not_in_flash_func(finfo_is_dir)(const FILINFO *info) {
+static bool finfo_is_dir(const FILINFO *info) {
   return (info->fattrib & AM_DIR) != 0;
 }
 
-static void __not_in_flash_func(handle_folder_create)(http_conn_t *c, const char *url_rel) {
-  char norm[HTTP_PATH_BUF_BYTES];
-  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+static void handle_folder_create(http_conn_t *c, const char *url_rel) {
+  static char norm[HTTP_PATH_BUF_BYTES];
+  static char abs_path[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(url_rel, norm, sizeof(norm), abs_path,
                                  sizeof(abs_path));
   if (s != NORM_OK) {
@@ -3147,8 +3427,7 @@ static void __not_in_flash_func(handle_folder_create)(http_conn_t *c, const char
     return;
   }
   if (fr != FR_NO_FILE && fr != FR_NO_PATH) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   }
   fr = f_mkdir(abs_path);
@@ -3162,7 +3441,7 @@ static void __not_in_flash_func(handle_folder_create)(http_conn_t *c, const char
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error", "f_mkdir failed");
+    write_fs_error(c, fr, "f_mkdir failed");
     return;
   }
 
@@ -3178,7 +3457,7 @@ static void __not_in_flash_func(handle_folder_create)(http_conn_t *c, const char
                     (extra[0] != '\0') ? extra : NULL, body, (size_t)n);
 }
 
-static void __not_in_flash_func(handle_folder_delete)(http_conn_t *c, const char *url_rel) {
+static void handle_folder_delete(http_conn_t *c, const char *url_rel) {
   char norm[HTTP_PATH_BUF_BYTES];
   char abs_path[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(url_rel, norm, sizeof(norm), abs_path,
@@ -3199,8 +3478,7 @@ static void __not_in_flash_func(handle_folder_delete)(http_conn_t *c, const char
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   }
   if (!finfo_is_dir(&info)) {
@@ -3217,15 +3495,14 @@ static void __not_in_flash_func(handle_folder_delete)(http_conn_t *c, const char
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_unlink failed");
+    write_fs_error(c, fr, "f_unlink failed");
     return;
   }
   // 204 No Content — body intentionally empty.
   write_response(c, 204, "No Content", "application/json", NULL, 0);
 }
 
-static void __not_in_flash_func(handle_folder_rename)(http_conn_t *c, const char *url_rel) {
+static void handle_folder_rename(http_conn_t *c, const char *url_rel) {
   if (c->content_length == 0) {
     write_error(c, 411, "Length Required", "length_required",
                 "JSON body required");
@@ -3240,7 +3517,7 @@ static void __not_in_flash_func(handle_folder_rename)(http_conn_t *c, const char
     return;
   }
 
-  char to_url[HTTP_PATH_BUF_BYTES];
+  static char to_url[HTTP_PATH_BUF_BYTES];
   json_status_t js = json_extract_string(c->body, c->body_received, "to",
                                          to_url, sizeof(to_url));
   if (js == JSON_BAD) {
@@ -3255,8 +3532,8 @@ static void __not_in_flash_func(handle_folder_rename)(http_conn_t *c, const char
   }
 
   // Resolve source.
-  char src_norm[HTTP_PATH_BUF_BYTES];
-  char src_abs[HTTP_FAT_PATH_BUF_BYTES];
+  static char src_norm[HTTP_PATH_BUF_BYTES];
+  static char src_abs[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(url_rel, src_norm, sizeof(src_norm), src_abs,
                                  sizeof(src_abs));
   if (s != NORM_OK) {
@@ -3269,13 +3546,13 @@ static void __not_in_flash_func(handle_folder_rename)(http_conn_t *c, const char
   }
 
   // Resolve target. `to` is taken as-is (already-decoded JSON string).
-  char dst_norm[HTTP_PATH_BUF_BYTES];
+  static char dst_norm[HTTP_PATH_BUF_BYTES];
   s = normalize_rel(to_url, dst_norm, sizeof(dst_norm));
   if (s != NORM_OK) {
     write_path_error(c, s);
     return;
   }
-  char dst_abs[HTTP_FAT_PATH_BUF_BYTES];
+  static char dst_abs[HTTP_FAT_PATH_BUF_BYTES];
   s = resolve_jail(dst_norm, dst_abs, sizeof(dst_abs));
   if (s != NORM_OK) {
     write_path_error(c, s);
@@ -3320,8 +3597,7 @@ static void __not_in_flash_func(handle_folder_rename)(http_conn_t *c, const char
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   }
   if (!finfo_is_dir(&info)) {
@@ -3337,8 +3613,7 @@ static void __not_in_flash_func(handle_folder_rename)(http_conn_t *c, const char
     return;
   }
   if (fr != FR_NO_FILE && fr != FR_NO_PATH) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed (target)");
+    write_fs_error(c, fr, "f_stat failed (target)");
     return;
   }
 
@@ -3353,8 +3628,7 @@ static void __not_in_flash_func(handle_folder_rename)(http_conn_t *c, const char
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_rename failed");
+    write_fs_error(c, fr, "f_rename failed");
     return;
   }
 
@@ -3421,7 +3695,7 @@ static void __not_in_flash_func(stream_download_drive)(http_conn_t *c) {
   }
 }
 
-static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
+static void handle_file_download(http_conn_t *c,
                                                       const char *url_rel) {
   // Body-stream lock. A streaming GET counts as a body request; if
   // another download or upload is already in flight, return 503.
@@ -3436,8 +3710,8 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
     return;
   }
 
-  char norm[HTTP_PATH_BUF_BYTES];
-  char abs_path[HTTP_FAT_PATH_BUF_BYTES];
+  static char norm[HTTP_PATH_BUF_BYTES];
+  static char abs_path[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(url_rel, norm, sizeof(norm), abs_path,
                                  sizeof(abs_path));
   if (s != NORM_OK) {
@@ -3456,8 +3730,7 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   }
   if (finfo_is_dir(&info)) {
@@ -3535,8 +3808,7 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
   // Open the file. Released on close (normal or aborted).
   fr = f_open(&c->stream_file, abs_path, FA_READ);
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_open failed");
+    write_fs_error(c, fr, "f_open failed");
     return;
   }
   c->stream_file_open = true;
@@ -3545,8 +3817,7 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
     if (fr != FR_OK) {
       f_close(&c->stream_file);
       c->stream_file_open = false;
-      write_error(c, 500, "Internal Server Error", "disk_error",
-                  "f_lseek failed");
+      write_fs_error(c, fr, "f_lseek failed");
       return;
     }
   }
@@ -3617,6 +3888,10 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
       g_body_stream_busy = false;
       c->holds_body_lock = false;
     }
+    // Nothing follows the headers, so the peer's ack of them is the end of
+    // the response. Without this srv_sent_cb's HC_DRAINING branch never
+    // fires and the connection sits on a slot until the idle sweep.
+    c->stream_body_done = true;
     c->state = HC_DRAINING;
     return;
   }
@@ -3643,7 +3918,7 @@ static void __not_in_flash_func(handle_file_download)(http_conn_t *c,
 // the partial file — leaving the upload's lock entry in FatFs's
 // lock table (FF_FS_LOCK in ffconf.h) would block any future delete
 // or overwrite of the same name until the next power cycle.
-static void __not_in_flash_func(upload_finish_ok)(http_conn_t *c) {
+static void upload_finish_ok(http_conn_t *c) {
   FRESULT close_fr = FR_OK;
   if (c->upload_file_open) {
     close_fr = f_close(&c->upload_file);
@@ -3686,8 +3961,8 @@ static void __not_in_flash_func(upload_finish_ok)(http_conn_t *c) {
 // upload was already complete after the leftover write, calls
 // upload_finish_ok); false means upload_init wrote the error response
 // itself and the caller should just return.
-static bool __not_in_flash_func(handle_file_upload_init)(
-    http_conn_t *c, const char *body_start, size_t leftover) {
+static bool handle_file_upload_init(http_conn_t *c, struct pbuf *seg,
+                                    size_t body_off, size_t leftover) {
   // Single-streamer lock.
   if (g_body_stream_busy) {
     char body[160];
@@ -3779,8 +4054,7 @@ static bool __not_in_flash_func(handle_file_upload_init)(
     return false;
   }
   if (fr != FR_OK && fr != FR_NO_FILE && fr != FR_NO_PATH) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return false;
   }
 
@@ -3792,8 +4066,7 @@ static bool __not_in_flash_func(handle_file_upload_init)(
     return false;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_open failed");
+    write_fs_error(c, fr, "f_open failed");
     return false;
   }
   c->upload_file_open = true;
@@ -3818,15 +4091,10 @@ static bool __not_in_flash_func(handle_file_upload_init)(
   // Write any leftover bytes that arrived in the same TCP segment as
   // the headers.
   if (leftover > 0) {
-    UINT written = 0;
-    fr = f_write(&c->upload_file, body_start, (UINT)leftover, &written);
-    if (fr != FR_OK || written != leftover) {
-      DPRINTF("http_server: upload leftover f_write failed (%d, %u/%zu)\n",
-              (int)fr, (unsigned)written, leftover);
+    if (!upload_drain_pbuf(c, seg, body_off, leftover, &fr)) {
       // Close + unlink happens in conn_close. Surface the error to
       // the client first.
-      write_error(c, 500, "Internal Server Error", "disk_error",
-                  "f_write failed");
+      write_fs_error(c, fr, "f_write failed");
       return false;
     }
     c->upload_received = (uint32_t)leftover;
@@ -3841,7 +4109,7 @@ static bool __not_in_flash_func(handle_file_upload_init)(
 // return 404 with an `is_directory` code so the client can detect it
 // and switch namespace.
 
-static void __not_in_flash_func(handle_file_delete)(http_conn_t *c,
+static void handle_file_delete(http_conn_t *c,
                                                     const char *url_rel) {
   char norm[HTTP_PATH_BUF_BYTES];
   char abs_path[HTTP_FAT_PATH_BUF_BYTES];
@@ -3862,8 +4130,7 @@ static void __not_in_flash_func(handle_file_delete)(http_conn_t *c,
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   }
   if (finfo_is_dir(&info)) {
@@ -3883,15 +4150,14 @@ static void __not_in_flash_func(handle_file_delete)(http_conn_t *c,
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_unlink failed");
+    write_fs_error(c, fr, "f_unlink failed");
     return;
   }
   // 204 No Content.
   write_response(c, 204, "No Content", "application/json", NULL, 0);
 }
 
-static void __not_in_flash_func(handle_file_rename)(http_conn_t *c,
+static void handle_file_rename(http_conn_t *c,
                                                     const char *url_rel) {
   if (c->content_length == 0) {
     write_error(c, 411, "Length Required", "length_required",
@@ -3904,7 +4170,7 @@ static void __not_in_flash_func(handle_file_rename)(http_conn_t *c,
     return;
   }
 
-  char to_url[HTTP_PATH_BUF_BYTES];
+  static char to_url[HTTP_PATH_BUF_BYTES];
   json_status_t js = json_extract_string(c->body, c->body_received, "to",
                                          to_url, sizeof(to_url));
   if (js == JSON_BAD) {
@@ -3919,8 +4185,8 @@ static void __not_in_flash_func(handle_file_rename)(http_conn_t *c,
   }
 
   // Resolve source.
-  char src_norm[HTTP_PATH_BUF_BYTES];
-  char src_abs[HTTP_FAT_PATH_BUF_BYTES];
+  static char src_norm[HTTP_PATH_BUF_BYTES];
+  static char src_abs[HTTP_FAT_PATH_BUF_BYTES];
   norm_status_t s = resolve_pair(url_rel, src_norm, sizeof(src_norm), src_abs,
                                  sizeof(src_abs));
   if (s != NORM_OK) {
@@ -3934,13 +4200,13 @@ static void __not_in_flash_func(handle_file_rename)(http_conn_t *c,
 
   // Resolve target. `to` was JSON-decoded already so we run it through
   // normalize_rel directly (no URL-decoding needed).
-  char dst_norm[HTTP_PATH_BUF_BYTES];
+  static char dst_norm[HTTP_PATH_BUF_BYTES];
   s = normalize_rel(to_url, dst_norm, sizeof(dst_norm));
   if (s != NORM_OK) {
     write_path_error(c, s);
     return;
   }
-  char dst_abs[HTTP_FAT_PATH_BUF_BYTES];
+  static char dst_abs[HTTP_FAT_PATH_BUF_BYTES];
   s = resolve_jail(dst_norm, dst_abs, sizeof(dst_abs));
   if (s != NORM_OK) {
     write_path_error(c, s);
@@ -3965,8 +4231,7 @@ static void __not_in_flash_func(handle_file_rename)(http_conn_t *c,
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed");
+    write_fs_error(c, fr, "f_stat failed");
     return;
   }
   if (finfo_is_dir(&info)) {
@@ -3993,8 +4258,7 @@ static void __not_in_flash_func(handle_file_rename)(http_conn_t *c,
     return;
   }
   if (fr != FR_NO_FILE && fr != FR_NO_PATH) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_stat failed (target)");
+    write_fs_error(c, fr, "f_stat failed (target)");
     return;
   }
 
@@ -4009,8 +4273,7 @@ static void __not_in_flash_func(handle_file_rename)(http_conn_t *c,
     return;
   }
   if (fr != FR_OK) {
-    write_error(c, 500, "Internal Server Error", "disk_error",
-                "f_rename failed");
+    write_fs_error(c, fr, "f_rename failed");
     return;
   }
 
@@ -4045,12 +4308,21 @@ static const route_t g_routes[] = {
     {"/api/v1/runner", M_GET | M_HEAD, handle_runner_status},
     {"/api/v1/debug", M_GET | M_HEAD, handle_debug_status},
     {"/api/v1/debug/log", M_GET | M_HEAD, handle_debug_log},
+    {"/api/v1/system/health", M_GET | M_HEAD, handle_system_health},
+#if defined(_DEBUG) && (_DEBUG != 0)
+    {"/api/v1/debug/test/panic", M_POST, handle_debug_test},
+    {"/api/v1/debug/test/hardfault", M_POST, handle_debug_test},
+    {"/api/v1/debug/test/hang", M_POST, handle_debug_test},
+    {"/api/v1/debug/test/stall", M_POST, handle_debug_test},
+    {"/api/v1/debug/test/stack-overflow", M_POST, handle_debug_test},
+    {"/api/v1/debug/test/http-hang", M_POST, handle_debug_test},
+#endif
 };
 
 #define ROUTES_COUNT (sizeof(g_routes) / sizeof(g_routes[0]))
 
 // Build an "Allow:" header value string from a methods mask.
-static void __not_in_flash_func(format_allow)(uint8_t mask, char *out, size_t out_cap) {
+static void format_allow(uint8_t mask, char *out, size_t out_cap) {
   out[0] = '\0';
   size_t off = 0;
   const struct {
@@ -4073,7 +4345,7 @@ static void __not_in_flash_func(format_allow)(uint8_t mask, char *out, size_t ou
 // Detect a trailing "/rename" action suffix and (if present) chop it
 // off in place by NUL-terminating before the slash. Returns true if
 // the action was chopped.
-static bool __not_in_flash_func(strip_rename_action)(char *rel) {
+static bool strip_rename_action(char *rel) {
   size_t len = strlen(rel);
   static const char suffix[] = "/rename";
   static const size_t suffix_len = sizeof(suffix) - 1;
@@ -4084,7 +4356,25 @@ static bool __not_in_flash_func(strip_rename_action)(char *rel) {
   return false;
 }
 
-static void __not_in_flash_func(route)(http_conn_t *c) {
+static void route(http_conn_t *c) {
+  health_setPhase(HEALTH_PHASE_HTTP_REQUEST);
+
+  // Everything under /gemdrive needs the card, and so does loading a program
+  // from it. One check here is what keeps the answer identical across volume,
+  // listings, downloads, uploads, folder operations and the Runner.
+  static const char gemdrive_prefix[] = "/api/v1/gemdrive";
+  static const char runner_load_prefix[] = "/api/v1/runner/load";
+  static const char runner_run_prefix[] = "/api/v1/runner/run";
+  if (!sdcard_isMounted() &&
+      (strncmp(c->path, gemdrive_prefix, sizeof(gemdrive_prefix) - 1) == 0 ||
+       strncmp(c->path, runner_load_prefix, sizeof(runner_load_prefix) - 1) ==
+           0 ||
+       strncmp(c->path, runner_run_prefix, sizeof(runner_run_prefix) - 1) ==
+           0)) {
+    write_no_card(c);
+    return;
+  }
+
   // HEAD is treated as GET for matching purposes (the dispatcher
   // suppresses the body during write).
   uint8_t method_bit =
@@ -4282,23 +4572,41 @@ static void __not_in_flash_func(route)(http_conn_t *c) {
 
 // --- Response writers ---
 
+// Try to hand the buffered response to lwIP. ERR_MEM means it queued
+// nothing (core/tcp_out.c) and the application is expected to wait for the
+// peer to acknowledge what is already in flight and try again -- so leave
+// resp_queued false and let the poll callback come back to it. Dropping the
+// response and closing, as this used to do, loses a reply the client is
+// still waiting for.
+static void __not_in_flash_func(send_buffered_try)(http_conn_t *c) {
+  if (c->pcb == NULL || c->resp_queued) {
+    return;
+  }
+  err_t err =
+      tcp_write(c->pcb, c->resp, (u16_t)c->resp_len, TCP_WRITE_FLAG_COPY);
+  if (err == ERR_OK) {
+    c->resp_queued = true;
+    tcp_output(c->pcb);
+    return;
+  }
+  if (err == ERR_MEM) {
+    return;  // nothing queued; srv_poll_cb retries, the idle sweep gives up
+  }
+  DPRINTF("http_server: tcp_write failed: %d\n", err);
+  conn_close(c);
+}
+
 static void __not_in_flash_func(send_buffered)(http_conn_t *c) {
   c->state = HC_WRITE_RESPONSE;
   c->resp_sent = 0;
-  err_t err = tcp_write(c->pcb, c->resp, (u16_t)c->resp_len,
-                        TCP_WRITE_FLAG_COPY);
-  if (err == ERR_OK) {
-    tcp_output(c->pcb);
-  } else {
-    DPRINTF("http_server: tcp_write failed: %d\n", err);
-    conn_close(c);
-  }
+  c->resp_queued = false;
+  send_buffered_try(c);
 }
 
 // Write a response with optional extra header lines (each must end
 // with "\r\n"). Pass NULL for no extras. Used for 201 Created (which
 // also emits a Location header) and 405 (which emits Allow:).
-static void __not_in_flash_func(write_response_ex)(http_conn_t *c, int status, const char *reason,
+static void write_response_ex(http_conn_t *c, int status, const char *reason,
                               const char *content_type,
                               const char *extra_headers, const char *body,
                               size_t body_len) {
@@ -4333,13 +4641,13 @@ static void __not_in_flash_func(write_response_ex)(http_conn_t *c, int status, c
   send_buffered(c);
 }
 
-static void __not_in_flash_func(write_response)(http_conn_t *c, int status, const char *reason,
+static void write_response(http_conn_t *c, int status, const char *reason,
                            const char *content_type, const char *body,
                            size_t body_len) {
   write_response_ex(c, status, reason, content_type, NULL, body, body_len);
 }
 
-static void __not_in_flash_func(write_error)(http_conn_t *c, int status, const char *reason,
+static void write_error(http_conn_t *c, int status, const char *reason,
                         const char *code_symbol, const char *message) {
   char body[256];
   int n = snprintf(body, sizeof(body),
@@ -4351,7 +4659,43 @@ static void __not_in_flash_func(write_error)(http_conn_t *c, int status, const c
   write_response(c, status, reason, "application/json", body, (size_t)n);
 }
 
-static void __not_in_flash_func(write_405)(http_conn_t *c, const char *allow) {
+// A FatFs call failed. With the malloc panic off FatFs can
+// report FR_NOT_ENOUGH_CORE instead of the device dying, so report that apart
+// from a disk fault: the caller can retry when memory frees up.
+// Every SD endpoint answers a missing card the same way.
+// Before this, /volume said 503 "busy" while a listing said 500 "disk_error"
+// for the same missing card, and a listing could even answer 200 with an empty
+// directory from FatFs's cache.
+static void write_no_card(http_conn_t *c) {
+  write_error(c, 503, "Service Unavailable", "no_sd_card",
+              "No SD card mounted");
+}
+
+static void write_fs_error(http_conn_t *c, FRESULT fr, const char *message) {
+  // A disk error may mean the card is gone; let the SD layer start retrying
+  // the mount.
+  sdcard_noteResult(fr);
+  // If that is what happened, say so rather than reporting a disk fault: the
+  // card being out is a different thing from the card being broken.
+  if (!sdcard_isMounted()) {
+    write_no_card(c);
+    return;
+  }
+  if (fr == FR_NOT_ENOUGH_CORE) {
+    write_error(c, 503, "Service Unavailable", "insufficient_memory", message);
+    return;
+  }
+  // FatFs's lock table is shared with GEMDRIVE (FF_FS_LOCK in ffconf.h). A
+  // full table means the ST is holding its share right now, so this is also
+  // worth retrying rather than a disk fault.
+  if (fr == FR_TOO_MANY_OPEN_FILES) {
+    write_error(c, 503, "Service Unavailable", "too_many_open_files", message);
+    return;
+  }
+  write_error(c, 500, "Internal Server Error", "disk_error", message);
+}
+
+static void write_405(http_conn_t *c, const char *allow) {
   char body[160];
   int bn = snprintf(body, sizeof(body),
                     "{\"ok\":false,\"code\":\"method_not_allowed\","

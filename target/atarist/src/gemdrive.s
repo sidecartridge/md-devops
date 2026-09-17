@@ -37,9 +37,14 @@ RANDOM_TOKEN_SEED_ADDR	equ (SHARED_BLOCK_ADDR + 8)		; $FA2808
 RANDOM_TOKEN_POST_WAIT	equ $1
 ROMCMD_START_ADDR	equ $FB0000
 CMD_MAGIC_NUMBER	equ $ABCD
-CMD_RETRIES_COUNT	equ 3
+CMD_RETRIES_COUNT	equ 5
 CMD_SET_SHARED_VAR	equ 1
-COMMAND_TIMEOUT		equ $0000FFFF
+; The RP answers a command after it has done the work, and an SD write that
+; allocates a cluster and updates the FAT can block for tens of milliseconds
+; (70 ms measured on a 29 GB FAT32 card). $FFFF gave up far too early and the
+; ST then retried the chunk, which the RP had already written. These are the
+; values md-drives-emulator ships for the same protocol: about 800 ms.
+COMMAND_TIMEOUT		equ $0006FFFF
 COMMAND_WRITE_TIMEOUT	equ COMMAND_TIMEOUT
 
 ; --- Macros + GEMDOS sysvar / function constants. ---
@@ -341,6 +346,20 @@ hello_msg:
 	dc.l	'XBRA'
 	dc.l	'SDGD'
 old_handler:
+	dc.l	0
+	even
+
+; ====================================================================
+; write_seq — chunk sequence number for .Fwrite.
+;
+; Bumped once per chunk, never per retry, and never reset: every retry
+; of a chunk carries the number the first attempt carried, and no two
+; distinct chunks ever share one. That is what lets the RP tell "you
+; did not hear my answer, here is the same data again" from "here is
+; the next chunk", which it could not do from the data alone -- a
+; retried chunk and a new one look identical on the wire.
+	cnop	0,4
+write_seq:
 	dc.l	0
 	even
 
@@ -700,21 +719,31 @@ gemdrive_trap:
 	ble.s	.fwrite_chunk_size_ok
 	move.l	#BUFFER_WRITE_SIZE, d5
 .fwrite_chunk_size_ok:
+	; One new sequence number per chunk. a1/d1 are scratch under the
+	; GEMDOS calling convention, and d1 is inside the movem below, so
+	; it survives every retry of this chunk.
+	lea	write_seq(pc), a1
+	addq.l	#1, (a1)
+	move.l	(a1), d1
 	move.w	#CMD_RETRIES_COUNT, d7
 .fwrite_retry:
 	movem.l	d1-d7/a4, -(sp)
 	move.w	#CMD_WRITE_BUFF_CALL, d0
-	move.l	d5, d6
+	move.l	d5, d6				; payload size = chunk size
+	move.l	d1, d5				; d5 = sequence (RP reads it here)
 	bsr	send_sync_write_command_to_sidecart
 	movem.l	(sp)+, d1-d7/a4
 	tst.w	d0
 	beq.s	.fwrite_chunk_ok
 	dbf	d7, .fwrite_retry
+.fwrite_failed:
 	moveq.l	#GEMDOS_EIO_WRITE, d0
 	return_rte
 
 .fwrite_chunk_ok:
 	move.l	GEMDRIVE_WRITE_BYTES, d2	; bytes RP actually wrote
+	tst.l	d2				; nothing written: the RP failed
+	ble.s	.fwrite_failed			; (0 would loop here for ever)
 	add.l	d2, a4
 	add.l	d2, d6
 	sub.l	d2, d4

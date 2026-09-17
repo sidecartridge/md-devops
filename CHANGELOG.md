@@ -1,5 +1,82 @@
 # Changelog
 
+## v1.1.0 (2026-09-17) — robustness
+
+No new features. Things that used to fail now work, and when something does
+go wrong the cartridge recovers by itself instead of waiting for you to
+unplug it.
+
+### Copying files over Wi-Fi, whatever the size
+
+Anything much beyond 200 KB never arrived. A 4 MB file now goes up and comes
+back down identical, and a slow connection is no longer cut off part way
+through.
+
+### A transfer that dies no longer blocks the next one
+
+If the other end vanished mid-transfer — laptop asleep, cable out, Ctrl-C —
+every later upload or download answered *busy* until the cartridge was
+reset, and a half-written file was left on the card. Transfers now clean up
+after themselves.
+
+### The SD card
+
+- **Take the card out and put it back**: it is picked up again in about two
+  seconds. No reset needed.
+- **With no card in**, the cartridge says so instead of pretending. The setup
+  menu shows `SD: NO CARD`, `[G]` and `[U]` refuse to start, and the API
+  answers *no SD card*. Before, it would report the last card's free space
+  and show you an empty, cheerful, non-existent directory.
+
+### Files written from the Atari arrive whole
+
+When a write took too long and the Atari sent the same block again, that
+block was written twice and the end of the file was lost. Retried blocks are
+now recognised and written once.
+
+### Wi-Fi
+
+- **Faster and steadier.** The radio was always in power-saving mode,
+  whatever the setting said. On the bench network, response time dropped
+  from 99 ms to 27 ms and lost packets from 15% to 5%.
+- **It rejoins on its own** after the router reboots or you walk out of
+  range. Before, it stayed off the network until someone reset the
+  cartridge.
+- **A wrong fixed IP address no longer locks you out.** It used to crash
+  before the setup menu appeared — the one place where you could correct it.
+  Anything invalid now falls back to DHCP and tells you why on the menu.
+- **Your Wi-Fi password is no longer printed** on the debug console at every
+  boot.
+
+### It recovers from its own crashes
+
+If the firmware crashes or freezes, the cartridge reboots and tells you on
+the top line of the menu — for example `Recovered: hang in main_loop x2` —
+rather than sitting there dead. It will not fall back into the same crash
+over and over: after a repeat it stays in the menu, where you can change
+whatever caused it.
+
+### The command-line tool
+
+`sidecart.py` printed a page of Python errors when the cartridge rebooted
+under a command. It now prints one line and stops.
+
+### Known limitations
+
+- **A program that traces heavily while running under the Runner can crash
+  the Atari.** Reading more than a few thousand bytes through the cartridge
+  debug window during `runner exec` bombs the machine, more often the bigger
+  the burst. We have not found the cause yet, so keep tracing to short
+  bursts for now.
+- Wi-Fi recovery has been tested with faults we injected ourselves, not
+  against a real access point going down.
+
+### For developers
+
+This is the first release built with full optimisation (`Release`);
+everything up to `v1.0.1beta` shipped `MinSizeRel`, because `Release` did not
+survive on hardware. Both build types now pass the same hardware gate.
+
 ## v1.0.1beta (2026-05-05) — stability fixes
 
 Patch release. Recovery paths and visibility upgrades; no new

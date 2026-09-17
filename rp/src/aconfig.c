@@ -1,7 +1,7 @@
 #include "include/aconfig.h"
 
 static SettingsConfigEntry defaultEntries[] = {
-    {ACONFIG_PARAM_FOLDER, SETTINGS_TYPE_STRING, "/test"},
+    {ACONFIG_PARAM_FOLDER, SETTINGS_TYPE_STRING, "/devops"},
     {ACONFIG_PARAM_MODE, SETTINGS_TYPE_INT, "255"},  // 255: Menu mode
     // GEMDRIVE — RELOC_ADDR / DEVOPS_MEMTOP "0" = auto
     // (screen_base - 16 KB, computed from the screen_base the m68k

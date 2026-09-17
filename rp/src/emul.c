@@ -21,11 +21,13 @@
 #include "commemul.h"
 #include "constants.h"
 #include "debug.h"
+#include "devhooks.h"
 #include "display.h"
 #include "display_term.h"
 #include "ff.h"
 #include "gconfig.h"
 #include "gemdrive.h"
+#include "health.h"
 #include "http_server.h"
 #include "memfunc.h"
 #include "runner.h"
@@ -45,10 +47,11 @@
 // headroom, and so CDC bytes appear on the workstation with
 // minimal latency. Lower than this gets into busy-loop
 // territory; higher and we re-introduce the visibility / drop
-// problems that motivated the optimization stories. The full
-// Core 1 worker plan (chandler + tud_task + usbcdc_drain on a
-// dedicated core) is parked in the backlog — escalate
-// there only if 100 Hz proves insufficient.
+// problems that motivated the optimization work. Moving
+// chandler + tud_task + usbcdc_drain to core 1 is the next step
+// if 100 Hz ever proves insufficient; it has not been needed.
+// Main loop cadence. NETWORK_CONNECT_POLL_MS (network.h) must match: the
+// blocking connect loop stands in for this loop while it runs.
 #define SLEEP_LOOP_MS 10
 
 enum {
@@ -64,6 +67,7 @@ static void cmdGemdriveRelocAddr(const char *arg);
 static void cmdGemdriveMemtop(const char *arg);
 static void cmdAdvHookVector(const char *arg);
 static void cmdRunner(const char *arg);
+static void clearLaunchBlock(void);
 
 // Command table. Every key here corresponds to a label on the on-screen
 // setup menu — keys that aren't advertised in the UI used to live here
@@ -121,10 +125,9 @@ static int g_menuLastUsbCdcAttached = -1;
 //
 // Once active is set it stays set for the lifetime of the RP power
 // cycle: a `runner reset` cold-reboots the ST and auto-relaunches
-// straight back into Runner mode (no need to re-pick [U]) — that's
-// the dev-iteration UX described in docs/epics/03-runner.md. The
-// scheduled relaunch is driven from the main loop via
-// runnerRelaunchAtMs.
+// straight back into Runner mode (no need to re-pick [U]), which is
+// what makes edit-build-run iteration bearable. The scheduled
+// relaunch is driven from the main loop via runnerRelaunchAtMs.
 static bool runnerActive = false;
 static bool runnerBusy = false;
 static runner_last_command_t runnerLastCommand = RUNNER_LAST_NONE;
@@ -442,6 +445,15 @@ void emul_resetRunnerSession(void) {
   runnerLastCdErrno = 0;
   runnerLastHasResErrno = false;
   runnerLastResErrno = 0;
+  // The session resets on the Runner's HELLO, which means the ST has cold
+  // booted and owns nothing: no basepage, no failed unload to report. Keeping
+  // the mirror across that left the RP certain a program was still loaded, so
+  // every later load answered 409 and the unload that would have cleared it
+  // answered 422 -- the ST rightly refuses to Mfree a basepage from a previous
+  // life.
+  runnerPendingBasepage = 0;
+  runnerLoadHasErrno = false;
+  runnerLoadErrno = 0;
   runnerMeminfoPending = false;
   runnerMeminfoHasSnapshot = false;
   runnerAdvancedInstalled = false;
@@ -474,6 +486,7 @@ void emul_onGemdriveHello(void) {
   // each refresh helper gates on menuScreenActive internally.
   refreshPhystopLine();
   refreshScreenmemLine();
+  clearLaunchBlock();
 
   if (!runnerActive) return;
   // The m68k just cold-booted (HELLO is sent from gemdrive_init,
@@ -534,8 +547,12 @@ static absolute_time_t lastCountdownTick;
 
 // Polling tick used as the network poll callback so command handling stays
 // alive during multi-second WiFi operations.
-static void __not_in_flash_func(emul_pollTick)(void) {
+static void emul_pollTick(void) {
+  health_feed();
   chandler_loop();
+  // SELECT too: this is what runs instead of the main loop for as long as a
+  // connect takes, and the button has to work throughout.
+  select_checkPushReset();
   usbcdc_drain();
   term_loop();
 }
@@ -548,7 +565,7 @@ static bool resetDeviceAtBoot = true;
 
 // Returns the last n chars of str, prefixed with ".." if truncated.
 // Caller frees. NULL on bad input.
-static char *__not_in_flash_func(right)(const char *str, int n) {
+static char *right(const char *str, int n) {
   if (str == NULL || n < 0) return NULL;
   int len = (int)strlen(str);
   if (n == 0) return strdup("");
@@ -563,7 +580,7 @@ static char *__not_in_flash_func(right)(const char *str, int n) {
 }
 
 // "C".."Z" only; identical predicate to source's GEMDRIVE drive validator.
-static bool __not_in_flash_func(isValidDrive)(const char *drive) {
+static bool isValidDrive(const char *drive) {
   if (drive == NULL || drive[0] == '\0') {
     return false;
   }
@@ -592,7 +609,7 @@ static void showTitle(void) {
       "DevOps Microfirmware - " RELEASE_VERSION "\n\x1Bq");
 }
 
-static void __not_in_flash_func(showCounter)(int cdown);
+static void showCounter(int cdown);
 
 // Bottom-of-OLED info strip rendered with the smaller squeezed font —
 // this is the "second font size" referenced by the source. Inverts a 1px
@@ -610,13 +627,215 @@ static void drawSetupInfoLine(const char *message) {
   u8g2_SetFont(display_getU8g2Ref(), u8g2_font_amstrad_cpc_extended_8f);
 }
 
+// Set when [G] or [U] was refused because no HELLO arrived since the RP
+// booted (see emul_canLaunch). Cleared when HELLO lands.
+static bool launchNeedsStReset = false;
+// Set when [G] or [U] was refused because no usable SD card is mounted.
+// Cleared as soon as a card appears; the retry loop in
+// sdcard_pollRemount is what makes that happen without a reset.
+static bool launchNeedsSdCard = false;
+// Tracks the card state the menu was last drawn with, so the line is redrawn
+// when it changes rather than on every pass.
+static bool lastDrawnSdMounted = false;
+// True while the countdown itself is launching, so a refusal can restart the
+// countdown once HELLO lands instead of leaving it stopped.
+static bool countdownLaunching = false;
+static bool restartCountdownOnHello = false;
+
+// Set when settings_save fails, which it can now that a failed allocation
+// returns NULL instead of panicking. Cleared by the next save that
+// works.
+static bool settingsSaveFailed = false;
+
+static void drawHaltedInfoLine(void) {
+  drawSetupInfoLine(
+      settingsSaveFailed
+          ? "Saving the settings failed: the change was not stored."
+      : launchNeedsSdCard
+          ? "Insert a working microSD card: GEMDRIVE needs one."
+      : launchNeedsStReset
+          ? "Reset the Atari ST first: no HELLO since RP boot."
+          : "Countdown stopped. Press [G], [U] or [X] to continue.");
+}
+
+// Save the app settings and report a failure on the menu. The countdown stops
+// so the message stays on screen; the caller's own redraw happens first, so
+// the line survives it.
+static bool saveAppSettings(void) {
+  bool saved = settings_save(aconfig_getContext(), true) == 0;
+  settingsSaveFailed = !saved;
+  if (!saved) {
+    DPRINTF("Saving the app settings failed\n");
+    haltCountdown = true;
+  }
+  return saved;
+}
+
+static void refreshSetupInfoLine(void);
+
+// HELLO landed: [G] and [U] can launch again.
+static void clearLaunchBlock(void) {
+  if (!launchNeedsStReset) return;
+  launchNeedsStReset = false;
+  if (restartCountdownOnHello) {
+    restartCountdownOnHello = false;
+    // Drop keystrokes that arrived while the countdown was halted (the ST
+    // sends some while it boots). The main loop only consumes them while
+    // the countdown runs, so a stale one would halt it again at once.
+    (void)term_consumeAnyKeyPressed();
+    countdown = BOOT_COUNTDOWN_SECONDS;
+    lastCountdownTick = get_absolute_time();
+    haltCountdown = false;
+  }
+  if (menuScreenActive) {
+    refreshSetupInfoLine();
+    display_refresh();
+  }
+}
+
 static void refreshSetupInfoLine(void) {
   if (haltCountdown) {
-    drawSetupInfoLine("Countdown stopped. Press [G], [U] or [X] to continue.");
+    drawHaltedInfoLine();
   } else {
     showCounter(countdown);
   }
 }
+
+#if defined(_DEBUG) && (_DEBUG != 0)
+// Debug mailbox app commands (devhooks.h): stop or restart the boot countdown
+// from a host tool. Returns 1 when done, 0 for an unknown command.
+// Blocks held by DEVHOOKS_APP_HEAP_HOLD, so a test can squeeze the heap in
+// steps; holding 0 KB frees them all.
+typedef struct DevhooksHeldBlock {
+  struct DevhooksHeldBlock *next;
+} DevhooksHeldBlock;
+static DevhooksHeldBlock *devhooksHeldHeap = NULL;
+
+static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
+                                 uint16_t payloadSize) {
+  switch (commandId) {
+    case DEVHOOKS_APP_HEAP_HOLD: {
+      uint32_t kb = (payloadSize >= 2u) ? payload[0] : 0u;
+      if (kb == 0u) {
+        while (devhooksHeldHeap != NULL) {
+          DevhooksHeldBlock *next = devhooksHeldHeap->next;
+          free(devhooksHeldHeap);
+          devhooksHeldHeap = next;
+        }
+        DPRINTF("devhooks: heap hold released\n");
+        return 1;
+      }
+      DevhooksHeldBlock *block =
+          malloc(sizeof(DevhooksHeldBlock) + kb * 1024u);
+      if (block != NULL) {
+        block->next = devhooksHeldHeap;
+        devhooksHeldHeap = block;
+      }
+      DPRINTF("devhooks: holding %lu KB more heap: %s\n", (unsigned long)kb,
+              (block != NULL) ? "ok" : "refused");
+      return (block != NULL) ? 1u : 0u;
+    }
+    case DEVHOOKS_APP_WIFI_LEAVE: {
+      // A real disassociation, so the supervisor's rejoin can be tested
+      // without touching the access point.
+      int rc = cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+      DPRINTF("devhooks: wifi leave -> %d\n", rc);
+      return (rc == 0) ? 1u : 0u;
+    }
+    case DEVHOOKS_APP_WIFI_FAKE_GATEWAY: {
+      // Leave the association alone and just make the gateway unanswerable, so
+      // everything above the probe still reports a healthy link.
+      struct netif *nif = &cyw43_state.netif[CYW43_ITF_STA];
+      ip4_addr_t bogus;
+      IP4_ADDR(&bogus, 192, 0, 2, 1);  // TEST-NET-1, never routed
+      cyw43_arch_lwip_begin();
+      netif_set_gw(nif, &bogus);
+      cyw43_arch_lwip_end();
+      DPRINTF("devhooks: gateway pointed at 192.0.2.1\n");
+      return 1;
+    }
+    case DEVHOOKS_APP_WIFI_POWERSAVE: {
+      cyw43_wifi_pm(&cyw43_state, CYW43_PERFORMANCE_PM);
+      uint32_t pm = 0;
+      (void)cyw43_wifi_get_pm(&cyw43_state, &pm);
+      DPRINTF("devhooks: power save forced on, radio reports 0x%08lx\n",
+              (unsigned long)pm);
+      return 1;
+    }
+    case DEVHOOKS_APP_WIFI_BAD_STATIC: {
+      uint16_t which = (payloadSize >= 2u) ? payload[0] : 0u;
+      SettingsContext *ctx = gconfig_getContext();
+      settings_put_bool(ctx, PARAM_WIFI_DHCP, false);
+      settings_put_string(ctx, PARAM_WIFI_IP, "192.168.1.60");
+      settings_put_string(ctx, PARAM_WIFI_NETMASK, "255.255.255.0");
+      settings_put_string(ctx, PARAM_WIFI_GATEWAY, "192.168.1.1");
+      switch (which) {
+        case 1:
+          settings_put_string(ctx, PARAM_WIFI_IP, "");
+          break;
+        case 2:
+          settings_put_string(ctx, PARAM_WIFI_NETMASK, "255.0.255.0");
+          break;
+        case 3:
+          settings_put_string(ctx, PARAM_WIFI_GATEWAY, "10.9.9.9");
+          break;
+        case 4:
+          break;  // leave the valid values above alone
+        default:
+          settings_put_string(ctx, PARAM_WIFI_IP, "999.1.2.3");
+          break;
+      }
+      DPRINTF("devhooks: static config case %u staged in memory\n",
+              (unsigned)which);
+      (void)cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+      return 1;
+    }
+    case DEVHOOKS_APP_WIFI_SLOW_CONNECT: {
+      // Payload 0: an SSID that does not exist (times out). Payload 1: the
+      // real SSID with a wrong key, which the access point answers with
+      // BADAUTH. Both staged in memory only.
+      uint16_t mode = (payloadSize >= 2u) ? payload[0] : 0u;
+      if (mode == 1u) {
+        settings_put_string(gconfig_getContext(), PARAM_WIFI_PASSWORD,
+                            "wrongpassword");
+        DPRINTF("devhooks: connect with a wrong key staged in memory\n");
+      } else {
+        settings_put_string(gconfig_getContext(), PARAM_WIFI_SSID,
+                            "NO_SUCH_AP_XYZ");
+        DPRINTF("devhooks: slow connect starting (SSID staged in memory)\n");
+      }
+      network_setPollingCallback(emul_pollTick);
+      wifi_sta_conn_process_status_t rc = network_wifiStaConnect();
+      network_setPollingCallback(NULL);
+      DPRINTF("devhooks: slow connect returned %d\n", (int)rc);
+      return 1;
+    }
+    case DEVHOOKS_APP_GEMDRIVE_STALL: {
+      uint16_t chunks = (payloadSize >= 2u) ? payload[0] : 1u;
+      uint16_t ds = (payloadSize >= 4u) ? payload[1] : 0u;
+      gemdrive_setWriteStall(chunks, ds);
+      DPRINTF("devhooks: stalling the next %u write chunk(s) by %u ds\n",
+              (unsigned)chunks, (unsigned)ds);
+      return 1;
+    }
+    case DEVHOOKS_APP_COUNTDOWN_STOP:
+      haltCountdown = true;
+      return 1;
+    case DEVHOOKS_APP_COUNTDOWN_RESTART:
+      (void)term_consumeAnyKeyPressed();
+      countdown = BOOT_COUNTDOWN_SECONDS;
+      lastCountdownTick = get_absolute_time();
+      haltCountdown = false;
+      if (menuScreenActive) {
+        showCounter(countdown);
+        display_refresh();
+      }
+      return 1;
+    default:
+      return 0;
+  }
+}
+#endif
 
 // Thin horizontal dividers between the menu's config groups.
 // Drawn in the gap row above each section header so they don't
@@ -886,12 +1105,29 @@ typedef struct {
   char topDir[MAX_FILENAME_LENGTH + 1];
 } DirNavigation;
 
-static DirNavigation navStateStorage;
-static DirNavigation *navState = &navStateStorage;
+// 24.8 KB, so it exists only while the folder picker is open (upstream's
+// pattern): allocated when [o] opens the picker, freed when it closes.
+static DirNavigation *navState = NULL;
+
+static bool navStateOpen(void) {
+  if (navState != NULL) return true;
+  navState = calloc(1, sizeof(DirNavigation));
+  if (navState == NULL) {
+    DPRINTF("Folder picker: cannot allocate %u bytes\n",
+            (unsigned)sizeof(DirNavigation));
+    return false;
+  }
+  return true;
+}
+
+static void navStateClose(void) {
+  free(navState);
+  navState = NULL;
+}
 
 // Filter: directories only — we list folders, never files. Hidden dotfiles
 // are skipped. Mirrors the spirit of source's floppiesFilter for our case.
-static bool __not_in_flash_func(foldersOnlyFilter)(const char *name,
+static bool foldersOnlyFilter(const char *name,
                                                    BYTE attr) {
   if (name[0] == '.') {
     return false;
@@ -900,9 +1136,12 @@ static bool __not_in_flash_func(foldersOnlyFilter)(const char *name,
 }
 
 // Remove last path component (".." navigation).
-static void __not_in_flash_func(pathUp)(void) {
+static void pathUp(void) {
   char temp[MAX_FILENAME_LENGTH + 1];
-  char *segments[MAX_ENTRIES_DIR];
+  // One segment needs at least a separator and a character, so a path of
+  // MAX_FILENAME_LENGTH cannot have more than half that many. This array
+  // used to hold 256 pointers, 1 KB of stack for no reason.
+  char *segments[(MAX_FILENAME_LENGTH / 2) + 1];
   int sp = 0;
 
   strncpy(temp, navState->folderPath, sizeof(temp));
@@ -963,7 +1202,7 @@ static void drawPage(uint16_t top_offset) {
   term_printString("SPACE to confirm selection. ESC to exit");
 }
 
-static enum navStatus __not_in_flash_func(navigate_directory)(
+static enum navStatus navigate_directory(
     bool first_time, bool dirs_only, char key, EntryFilterFn filter_fn,
     char top_folder[MAX_FILENAME_LENGTH + 1]) {
   enum navStatus status = NAV_DIR_ERROR;
@@ -1073,15 +1312,28 @@ static enum navStatus __not_in_flash_func(navigate_directory)(
 // Builds the menu — single GEMDRIVE block + bottom navigation strip.
 // Layout follows the source's menu(): vt52Cursor positions, the F[o]lder/
 // [D]rive labels, and the bottom "[G]EMDRIVE / [X] Return to Booster" line.
-static void __not_in_flash_func(menu)(void) {
+static void menu(void) {
   term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
   menuScreenActive = true;
 
   showTitle();
 
+  // Why the RP rebooted, when it was a crash or a hang. Row 1 is free.
+  char bootLine[TERM_SCREEN_SIZE_X + 1];
+  if (health_getBootLine(bootLine, sizeof(bootLine))) {
+    vt52Cursor(1, 0);
+    term_printString(bootLine);
+  }
+
   // Folder + drive read straight from aconfig, like source/md-drives.
   vt52Cursor(2, 0);
-  term_printString("GEMDRIVE\n");
+  // The card's state goes on the header line, not a row of its own: the
+  // section dividers are at fixed pixel rows and the status icons are
+  // right-aligned per header row, so an extra line shifts every section below
+  // into them. Kept short to clear the drive icon on the
+  // right.
+  term_printString(sdcard_isMounted() ? "GEMDRIVE   SD: mounted\n"
+                                      : "GEMDRIVE   SD: NO CARD\n");
 
   SettingsConfigEntry *gemDriveFolder =
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER);
@@ -1209,9 +1461,18 @@ static void __not_in_flash_func(menu)(void) {
   char ipLine[80];
   snprintf(urlLine, sizeof(urlLine), "  URL         : http://%s.local/",
            hostname);
+  // A rejected static configuration has to be visible here: the menu is where
+  // the setting gets fixed, so silently running on DHCP would hide the reason
+  // the chosen address never appeared.
+  const char *staticReason = NULL;
+  bool staticRejected = network_getStaticConfigRejected(&staticReason);
   if (apiIp.addr != 0) {
-    snprintf(ipLine, sizeof(ipLine), "  IP address  : %s",
-             ipaddr_ntoa(&apiIp));
+    snprintf(ipLine, sizeof(ipLine), "  IP address  : %s%s%s",
+             ipaddr_ntoa(&apiIp), staticRejected ? " DHCP: " : "",
+             staticRejected ? staticReason : "");
+  } else if (staticRejected) {
+    snprintf(ipLine, sizeof(ipLine), "  IP address  : (no IP) DHCP: %s",
+             staticReason);
   } else {
     snprintf(ipLine, sizeof(ipLine), "  IP address  : (no IP)");
   }
@@ -1243,15 +1504,15 @@ static void __not_in_flash_func(menu)(void) {
   // writes are done so the term renderer doesn't clobber them.
   // Frames around config groups are NOT drawn here because
   // vertical borders would slice through character columns and
-  // corrupt the text — see Tier 2 backlog if framed sections
-  // become a requirement.
+  // corrupt the text. Framed sections would need the term renderer to
+  // know about them.
   drawMenuDividers();
   drawMenuStatusIcons();
 
   refreshSetupInfoLine();
 }
 
-static void __not_in_flash_func(showCounter)(int cdown) {
+static void showCounter(int cdown) {
   if (cdown > 0) {
     // animated progress bar on the bottom strip
     // instead of plain text. Visual + textual at once.
@@ -1266,8 +1527,39 @@ static void __not_in_flash_func(showCounter)(int cdown) {
 
 // [G]EMDRIVE — drops straight into GEMDRIVE-only on the Atari ST
 // without activating the Runner control surface.
+// [G] and [U] make the m68k install GEMDRIVE at the address the RP computed
+// from the ST's HELLO, which the ST sends only at cold boot. After the RP
+// reboots while the ST keeps running (a crash, SELECT, a flash) no HELLO
+// arrives, the address is not published, and launching would halt the ST
+// with "Reloc/stack overlap". Until then it only worked because the previous
+// run's shared variables survived in uncleared RAM.
+static bool emul_canLaunch(void) {
+  haltCountdown = true;
+  // Without a card there is nothing to emulate a drive from, and both modes
+  // would come up broken. Refuse and say so; sdcard_pollRemount keeps trying,
+  // so inserting one clears this within a couple of seconds.
+  if (!sdcard_isMounted()) {
+    DPRINTF("Launch refused: no SD card mounted\n");
+    launchNeedsSdCard = true;
+    restartCountdownOnHello = countdownLaunching;
+    menu();
+    display_refresh();
+    return false;
+  }
+  if (gemdrive_getPhystop(NULL, NULL)) return true;
+  DPRINTF("Launch refused: no HELLO from the ST since the RP booted\n");
+  launchNeedsStReset = true;
+  restartCountdownOnHello = countdownLaunching;
+  // Redraw the whole menu: the countdown path has already cleared the screen
+  // for "Booting...". menu() paints the refusal on the bottom strip.
+  menu();
+  display_refresh();
+  return false;
+}
+
 void cmdGemdrive(const char *arg) {
   (void)arg;
+  if (!emul_canLaunch()) return;
   haltCountdown = true;
   menuScreenActive = false;
   showTitle();
@@ -1286,6 +1578,7 @@ void cmdGemdrive(const char *arg) {
 // — the Runner runs alongside it, in foreground.
 void cmdRunner(const char *arg) {
   (void)arg;
+  if (!emul_canLaunch()) return;
   haltCountdown = true;
   menuScreenActive = false;
   showTitle();
@@ -1319,12 +1612,17 @@ void cmdBooster(const char *arg) {
 // the currently configured folder; subsequent keystrokes (arrows / RETURN
 // / SPACE) come back through TERM_COMMAND_LEVEL_COMMAND_SINGLE_KEY_REENTRY
 // and drive navigate_directory.
-void __not_in_flash_func(cmdGemdriveFolder)(const char *arg) {
+void cmdGemdriveFolder(const char *arg) {
   haltCountdown = true;
   enum navStatus status = NAV_DIR_ERROR;
   switch (term_getCommandLevel()) {
     case TERM_COMMAND_LEVEL_SINGLE_KEY: {
       DPRINTF("Folder picker entering reentry mode.\n");
+      if (!navStateOpen()) {
+        drawSetupInfoLine("Not enough memory to open the folder picker.");
+        display_refresh();
+        return;
+      }
       SettingsConfigEntry *gemDriveFolder = settings_find_entry(
           aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER);
       const char *seed =
@@ -1342,6 +1640,12 @@ void __not_in_flash_func(cmdGemdriveFolder)(const char *arg) {
       char key = arg[0];
       // ESC cancels the picker and returns to the menu.
       if (key == 27) {
+        navStateClose();
+        term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
+        menu();
+        return;
+      }
+      if (navState == NULL) {
         term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
         menu();
         return;
@@ -1364,9 +1668,18 @@ void __not_in_flash_func(cmdGemdriveFolder)(const char *arg) {
     case NAV_DIR_SELECTED: {
       settings_put_string(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_FOLDER,
                           navState->folderPath);
-      settings_save(aconfig_getContext(), true);
+      (void)saveAppSettings();
+      navStateClose();
       term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
       menu();
+      break;
+    }
+    case NAV_DIR_ERROR: {
+      navStateClose();
+      term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
+      menu();
+      drawSetupInfoLine("Could not read the folder from the SD card.");
+      display_refresh();
       break;
     }
     default:
@@ -1393,7 +1706,7 @@ void cmdGemdriveDrive(const char *arg) {
   char driveBuffer[2] = {(char)toupper((unsigned char)input[0]), '\0'};
   settings_put_string(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_DRIVE,
                       driveBuffer);
-  settings_save(aconfig_getContext(), true);
+  (void)saveAppSettings();
   menu();
 }
 
@@ -1428,7 +1741,7 @@ void cmdGemdriveRelocAddr(const char *arg) {
   }
   settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR,
                        (int)value);
-  settings_save(aconfig_getContext(), true);
+  (void)saveAppSettings();
   menu();
 }
 
@@ -1461,7 +1774,7 @@ void cmdGemdriveMemtop(const char *arg) {
   }
   settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_DEVOPS_MEMTOP,
                        (int)value);
-  settings_save(aconfig_getContext(), true);
+  (void)saveAppSettings();
   menu();
 }
 
@@ -1483,7 +1796,7 @@ void cmdAdvHookVector(const char *arg) {
       (strcmp(current, "etv_timer") == 0) ? "vbl" : "etv_timer";
   settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ADV_HOOK_VECTOR,
                       next);
-  settings_save(aconfig_getContext(), true);
+  (void)saveAppSettings();
   menu();
 }
 
@@ -1566,6 +1879,14 @@ static void init(void) {
 }
 
 void emul_start() {
+  // Decode why the RP started and paint the stack for the high-water
+  // mark, then arm the watchdog. From here a hang reboots the RP.
+  health_init();
+  health_watchdogStart();
+#if defined(_DEBUG) && (_DEBUG != 0)
+  devhooks_setAppHandler(emul_devhooksApp);
+#endif
+
   // Bring up the USB CDC sink for the debugcap ring.
   // Idempotent stdio_init_all + detaches stdio from CDC so DPRINTF
   // stays UART-only and the CDC interface is the dedicated raw-byte
@@ -1625,6 +1946,27 @@ void emul_start() {
   //
   // Copy the terminal firmware to RAM
   COPY_FIRMWARE_TO_RAM((uint16_t *)target_firmware, target_firmware_length);
+#if defined(_DEBUG) && (_DEBUG != 0)
+  // The ST must see exactly the generated image.
+  if (memcmp((const void *)&__rom_in_ram_start__, target_firmware,
+             (size_t)target_firmware_length * sizeof(uint16_t)) != 0) {
+    DPRINTF("ERROR: cartridge image in RAM does not match target_firmware\n");
+  } else {
+    DPRINTF("Cartridge image in RAM verified (%u words)\n",
+            (unsigned)target_firmware_length);
+  }
+  // Nothing from a previous run may survive past the end of the image.
+  {
+    const uint8_t *window = (const uint8_t *)&__rom_in_ram_start__;
+    size_t used = (size_t)target_firmware_length * sizeof(uint16_t);
+    size_t leftovers = 0;
+    for (size_t i = used; i < ROM_SIZE_BYTES * ROM_BANKS; i++) {
+      if (window[i] != 0) leftovers++;
+    }
+    DPRINTF("Cartridge window after the image: %u non-zero bytes\n",
+            (unsigned)leftovers);
+  }
+#endif
 
   // Initialize the cartridge ROM4 read engine. ROM4 reads are served entirely
   // by chained DMAs feeding the PIO TX FIFO — no CPU/IRQ involvement.
@@ -1682,12 +2024,20 @@ void emul_start() {
   // files are stored. The folder name is defined in the configuration.
   // If there is no folder in the micro SD card, the app will create it.
 
-  FATFS fsys;
+  // Static: it lives for the whole run and FATFS carries a sector buffer.
+  static FATFS fsys;
   SettingsConfigEntry *folder =
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_FOLDER);
-  char *folderName = "/test";  // MODIFY THIS TO YOUR FOLDER NAME
+  char *folderName = "/devops";
   if (folder == NULL) {
     DPRINTF("FOLDER not found in the configuration. Using default value\n");
+  } else if (strcmp(folder->value, "/test") == 0) {
+    // Up to v1.1.0 the default was the template's "/test", which md-devops
+    // never used. Move stored settings to "/devops"; the folder is created
+    // below if it does not exist.
+    DPRINTF("FOLDER was /test; changing it to /devops\n");
+    settings_put_string(aconfig_getContext(), ACONFIG_PARAM_FOLDER, "/devops");
+    (void)saveAppSettings();
   } else {
     DPRINTF("FOLDER: %s\n", folder->value);
     folderName = folder->value;
@@ -1716,6 +2066,9 @@ void emul_start() {
     }
   }
 
+  // A failing card can take a few seconds to give up.
+  health_feed();
+
   // Initialize the display again (in case the terminal emulator changed it)
   display_setupU8g2();
 
@@ -1725,7 +2078,25 @@ void emul_start() {
   // initialized
   preinit();
 
-  // 6. Init the network, if needed
+  // 6. Configure the SELECT button and register the reset callbacks.
+  //    Short press → reset_device. Long press (≥ SELECT_LONG_RESET ms)
+  //    → reset_deviceAndEraseFlash. Edge detection + debounce + long-
+  //    press timing run in the foreground via select_checkPushReset(),
+  //    polled from the main loop below and from emul_pollTick during a
+  //    connect — Core 1 stays idle here, since launching it interferes
+  //    with the cyw43_arch_wait_for_work_until poll the main loop relies
+  //    on for Wi-Fi service.
+  //
+  //    This has to come **before** the network, not after it: the boot
+  //    connect can take three attempts of 30 s, and until the button is
+  //    configured it does nothing at all. A device that cannot reach its
+  //    access point was exactly the case where a factory reset was needed
+  //    and could not be asked for.
+  select_configure();
+  select_setResetCallback(reset_device);
+  select_setLongResetCallback(reset_deviceAndEraseFlash);
+
+  // 7. Init the network, if needed
   // It's always a good idea to wait for the network to be ready
   // Get the WiFi mode from the settings
   // If you are developing code that does not use the network, you can
@@ -1744,6 +2115,8 @@ void emul_start() {
       DPRINTF("WiFi mode is STA\n");
       wifiModeValue = WIFI_MODE_STA;
       int err = network_wifiInit(wifiModeValue);
+      // Loading the radio firmware takes a while.
+      health_feed();
       if (err != 0) {
         DPRINTF("Error initializing the network: %i. No initializing.\n", err);
       } else {
@@ -1778,10 +2151,11 @@ void emul_start() {
         // Earlier builds deferred this to firmware launch because of
         // an ST-side crash; that turned out to be RAM pressure (the
         // per-conn pool was 47 KB of BSS, pushing the heap into the
-        // ROM-in-RAM region). After shrinking the pool to ~5 KB and
-        // moving every http_server function to RAM via
-        // __not_in_flash_func, running the server during the menu
-        // is safe. Idempotent — safe even if Wi-Fi connect timed out.
+        // ROM-in-RAM region). Shrinking the pool to ~5 KB fixed it;
+        // the handlers were also moved to RAM at the time, which only
+        // added pressure and has since been undone (the download data
+        // path stays in RAM for speed). Idempotent —
+        // safe even if Wi-Fi connect timed out.
         http_server_init();
       }
     } else {
@@ -1789,16 +2163,11 @@ void emul_start() {
     }
   }
 
-  // 7. Configure the SELECT button and register the reset callbacks.
-  //    Short press → reset_device. Long press (≥ SELECT_LONG_RESET ms)
-  //    → reset_deviceAndEraseFlash. Edge detection + debounce + long-
-  //    press timing run in the foreground via select_checkPushReset(),
-  //    polled from the main loop below — Core 1 stays idle here, since
-  //    launching it interferes with the cyw43_arch_wait_for_work_until
-  //    poll the main loop relies on for Wi-Fi service.
-  select_configure();
-  select_setResetCallback(reset_device);
-  select_setLongResetCallback(reset_deviceAndEraseFlash);
+  // Crash-loop guard: after repeated crash reboots, stay in the menu
+  // instead of autobooting into whatever keeps crashing.
+  if (health_isCrashLoop()) {
+    haltCountdown = true;
+  }
 
   // 8. Now complete the terminal emulator initialization
   // The terminal emulator is used to interact with the user to configure the
@@ -1818,13 +2187,23 @@ void emul_start() {
   DPRINTF("Start the app loop here\n");
   lastCountdownTick = get_absolute_time();
   while (getKeepActive()) {
+    health_feed();
+    health_setPhase(HEALTH_PHASE_MAIN_LOOP);
+    // Drain the ROM3 command ring → dispatch to registered callbacks. First,
+    // before the wait below: the ST blocks on its answer, and nothing here
+    // wakes the wait early for a cartridge command, so a command that arrived
+    // during the wait would otherwise sit for the whole SLEEP_LOOP_MS.
+    chandler_loop();
+
 #if PICO_CYW43_ARCH_POLL
     network_safePoll();
+    // Notice a link that has gone away and rejoin. Non-blocking, and the only
+    // thing that catches an association lost without a callback.
+    network_superviseLink();
     cyw43_arch_wait_for_work_until(make_timeout_time_ms(SLEEP_LOOP_MS));
 #else
     sleep_ms(SLEEP_LOOP_MS);
 #endif
-    // Drain the ROM3 command ring → dispatch to registered callbacks.
     chandler_loop();
 
     // Pump pending debug bytes out the USB CDC interface.
@@ -1837,6 +2216,35 @@ void emul_start() {
     // the main-loop cadence. Short press fires reset_device; long
     // press (≥ SELECT_LONG_RESET ms) fires reset_deviceAndEraseFlash.
     select_checkPushReset();
+
+    // Bring a reinserted SD card back without a reset.
+    // Cheap while the card is mounted.
+    sdcard_pollRemount();
+
+    // Follow the card's state on the menu, and lift the launch block as soon
+    // as a usable card appears.
+    bool sdMountedNow = sdcard_isMounted();
+    if (sdMountedNow != lastDrawnSdMounted) {
+      lastDrawnSdMounted = sdMountedNow;
+      if (sdMountedNow && launchNeedsSdCard) {
+        launchNeedsSdCard = false;
+        if (restartCountdownOnHello) {
+          restartCountdownOnHello = false;
+          (void)term_consumeAnyKeyPressed();
+          countdown = BOOT_COUNTDOWN_SECONDS;
+          lastCountdownTick = get_absolute_time();
+          haltCountdown = false;
+        }
+      }
+      if (menuScreenActive) {
+        menu();
+        display_refresh();
+      }
+    }
+
+    // Heap sampling, the debug summary and debug test hooks.
+    health_tick();
+    devhooks_poll();
 
     // Run the terminal foreground (consume the published command, render
     // output, etc.).
@@ -1878,7 +2286,7 @@ void emul_start() {
     // showCounter is only called inside the decrement branch below.
     static bool lastHaltState = false;
     if (haltCountdown && !lastHaltState) {
-      drawSetupInfoLine("Countdown stopped. Press [G], [U] or [X] to continue.");
+      drawHaltedInfoLine();
       display_refresh();
     }
     lastHaltState = haltCountdown;
@@ -1896,7 +2304,9 @@ void emul_start() {
           // path as pressing [U]. Runner is the more useful default:
           // it includes the [G] GEMDRIVE behaviour AND the
           // workstation-driven Runner control surface.
+          countdownLaunching = true;
           cmdRunner(NULL);
+          countdownLaunching = false;
         }
       }
     }
@@ -1926,7 +2336,7 @@ void emul_start() {
     // Set emulation mode to 255 (setup menu)
     settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_MODE,
                          APP_MODE_SETUP);
-    settings_save(aconfig_getContext(), true);
+    (void)saveAppSettings();
 
     // Jump to the booster app
     DPRINTF("Jumping to the booster app...\n");

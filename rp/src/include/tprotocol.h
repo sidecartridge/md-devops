@@ -20,7 +20,14 @@
   0  // Set to 1 to clear the memory before starting the protocol
 
 #define PROTOCOL_HEADER 0xABCD
-#define PROTOCOL_READ_RESTART_MICROSECONDS 10000
+// Resynchronise the parser after this much silence on the command space. The
+// timestamp is refreshed on every sample, so this is a gap between samples,
+// not a deadline for a whole frame: a 1 KB payload arrives over tens of
+// milliseconds and used to be thrown away mid-frame, which cost the ST a full
+// command timeout and a resend. Samples are timestamped
+// when they are parsed, in batches from the ring, so this must also cover the
+// main loop's own gap between two drains.
+#define PROTOCOL_READ_RESTART_MICROSECONDS 50000
 #define MAX_PROTOCOL_PAYLOAD_SIZE \
   2048 + 64  // 2048 bytes of payload plus 64 bytes of overhead for safety
 
@@ -185,6 +192,7 @@ static inline void __not_in_flash_func(tprotocol_parse)(
       PROTOCOL_READ_RESTART_MICROSECONDS) {
     tprotocol_nextTPstep = HEADER_DETECTION;
   }
+  tprotocol_last_header_found = tprotocol_new_header_found;
 
   switch (tprotocol_nextTPstep) {
     case HEADER_DETECTION:
@@ -192,7 +200,6 @@ static inline void __not_in_flash_func(tprotocol_parse)(
         // Move to command read
         tprotocol_nextTPstep = COMMAND_READ;
       }
-      tprotocol_last_header_found = tprotocol_new_header_found;
       break;
 
     case COMMAND_READ:
@@ -201,6 +208,12 @@ static inline void __not_in_flash_func(tprotocol_parse)(
       break;
 
     case PAYLOAD_SIZE_READ:
+      // A size from a corrupted frame (lost ROM3 samples) must not walk
+      // the payload writes past the end of the buffer.
+      if (data > MAX_PROTOCOL_PAYLOAD_SIZE) {
+        tprotocol_nextTPstep = HEADER_DETECTION;
+        break;
+      }
       tprotocol_transmission.payload_size = data;
     case PAYLOAD_READ_START:
       tprotocol_transmission.bytes_read = 0;

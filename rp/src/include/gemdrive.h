@@ -102,6 +102,19 @@
 #define GEMDRIVE_WRITE_BUFFER_OFFSET 0x10F4     // 1024 bytes
 #define GEMDRIVE_WRITE_BUFFER_SIZE 1024
 
+#if defined(_DEBUG) && (_DEBUG != 0)
+/**
+ * @brief Debug-only: stall the answer to the next `chunks` write chunks.
+ *
+ * The data is committed first, so this reproduces a lost answer rather than a
+ * lost write.
+ */
+void gemdrive_setWriteStall(uint16_t chunks, uint16_t deciseconds);
+#endif
+// Report a write that took longer than this (debug builds only): the ST waits
+// about 300 ms for its answer before retrying the chunk.
+#define GEMDRIVE_SLOW_WRITE_US 20000
+
 // Pexec / DTA state.
 #define GEMDRIVE_PEXEC_MODE_OFFSET 0x14F4       // 4 bytes (mode word at +2)
 #define GEMDRIVE_PEXEC_STACK_ADDR_OFFSET 0x14F8 // 4 bytes

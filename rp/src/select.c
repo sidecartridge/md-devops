@@ -2,7 +2,6 @@
 
 static reset_callback_t reset_cb = NULL;
 static reset_callback_t reset_long_cb = NULL;
-static volatile bool core1WaitActive = false;
 static bool selectPressedLatched = false;
 static absolute_time_t selectPressStartTime;
 static bool selectLongPressDetected = false;
@@ -35,47 +34,6 @@ static uint32_t select_getPressDurationMs(void) {
   return (uint32_t)(elapsedUs / 1000);
 }
 
-void __not_in_flash_func(select_waitPush)() {
-  DPRINTF("Waiting for SELECT button release\n");
-
-  if (!select_detectStableState(true)) {
-    DPRINTF("SELECT button was not stably pressed\n");
-    return;
-  }
-
-  uint32_t press_duration = 0;
-  bool longPressDetected = false;
-  while (select_detectPush()) {
-    tight_loop_contents();
-    sleep_ms(SELECT_LOOP_DELAY);
-    if (press_duration < SELECT_LONG_RESET) {
-      press_duration += SELECT_LOOP_DELAY;
-      if (press_duration >= SELECT_LONG_RESET) {
-        longPressDetected = true;
-      }
-    }
-  }
-
-  while (!select_detectStableState(false)) {
-    tight_loop_contents();
-    sleep_ms(SELECT_LOOP_DELAY);
-  }
-
-  DPRINTF("SELECT button released after %lu ms\n", (unsigned long)press_duration);
-  if (longPressDetected) {
-    if (reset_long_cb != NULL) {
-      DPRINTF("Long press detected. Executing long reset callback\n");
-      reset_long_cb();
-    }
-  } else {
-    if (reset_cb != NULL) {
-      DPRINTF("Short press detected. Executing reset callback\n");
-      reset_cb();
-    }
-  }
-  DPRINTF("SELECT button callback returned!\n");
-}
-
 void select_configure() {
   // Configure the input ping for SELECT button
   gpio_init(SELECT_GPIO);
@@ -86,47 +44,14 @@ void select_configure() {
 
 bool select_detectPush() { return (gpio_get(SELECT_GPIO) != 0); }
 
-void select_coreWaitPush(reset_callback_t reset, reset_callback_t resetLong) {
-  inline void core1_waitPush(void) {
-    DPRINTF("Waiting for SELECT button to be pushed\n");
-    while (core1WaitActive && !select_detectStableState(true)) {
-      tight_loop_contents();
-      sleep_ms(SELECT_LOOP_DELAY);
-    }
-
-    if (!core1WaitActive) {
-      return;
-    }
-
-    DPRINTF("SELECT button pushed!\n");
-    select_waitPush();
-    core1WaitActive = false;
-  }
-
-  reset_cb = reset;
-  reset_long_cb = resetLong;
-
-  if (core1WaitActive) {
-    DPRINTF("Core 1 wait for SELECT is already active\n");
-    return;
-  }
-
-  DPRINTF("Launching core 1 to wait for SELECT button push\n");
-  core1WaitActive = true;
-  multicore_launch_core1(core1_waitPush);
-}
-
-void select_coreWaitPushDisable() {
-  if (!core1WaitActive) {
-    DPRINTF("Core 1 wait for SELECT is already disabled\n");
-    return;
-  }
-
-  DPRINTF("Disabling core 1\n");
-  core1WaitActive = false;
-  multicore_reset_core1();
-}
-
+// The core-1 SELECT watcher lived here: select_waitPush(),
+// select_coreWaitPush() and select_coreWaitPushDisable(). Removed in v1.1.
+// Nothing called them, and core 1 had already been backed out earlier because running it froze the Wi-Fi poll loop the main loop depends on.
+// Using it again would also need Booster's flash lockout (its settings.c grew
+// select_flashLockoutBegin once core 1 executed from flash during an erase), so
+// a ready-made entry point into a known hazard was worth deleting rather than
+// leaving for someone to find. SELECT is polled in the foreground by
+// select_checkPushReset() below.
 void select_checkPushReset() {
   bool isPressed = select_detectPush();
   if (isPressed && !selectPressedLatched) {

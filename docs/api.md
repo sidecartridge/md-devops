@@ -60,6 +60,12 @@ python3 cli/sidecart.py gemdrive rm SWITCHER.TOS
 - **One body-streaming request at a time.** A second concurrent
   download or upload returns `503 busy` with `Retry-After: 1`.
   Listings, ping, volume, and metadata mutations are not gated.
+- **Two connections at once, and a 20 s idle timeout.** A connection
+  that neither sends nor accepts data for 20 s is closed, so a client
+  that disappears mid-transfer frees the transfer lock and its file
+  handles instead of holding them until the device is reset. A slow
+  transfer that is still making progress is never cut off: the timer
+  is reset by bytes moving in either direction, not by the clock.
 - **Response always carries** `Content-Type`, `Content-Length` (or
   chunked listing), `Connection: close`, `Server: md-devops/<v>`.
   No `Date:` header — the device has no real-time clock.
@@ -89,7 +95,7 @@ python3 cli/sidecart.py gemdrive rm SWITCHER.TOS
 | `416 Range Not Satisfiable` | Range outside file bounds. Carries `Content-Range: bytes */<size>`. |
 | `422 Unprocessable Entity` | Malformed JSON body, missing required field, listing-on-file, rename-into-own-descendant. |
 | `500 Internal Server Error` | FatFs disk error. |
-| `503 Service Unavailable` | Body-stream lock held, SD not mounted, or Runner busy with another command. Always carries `Retry-After: 1`. |
+| `503 Service Unavailable` | Body-stream lock held (`busy`), no usable SD card (`no_sd_card`), Runner busy with another command (`busy`), FatFs's lock table full (`too_many_open_files`), or `insufficient_memory`: FatFs could not allocate its working buffer, so the operation can be retried when memory frees up. Always carries `Retry-After: 1`. |
 | `504 Gateway Timeout` | Synchronous Runner endpoint exceeded its server-side spin-wait deadline (`gateway_timeout`). Per-endpoint deadlines: `runner load` 10 s; `runner unload` 5 s; `runner meminfo`, `runner adv/meminfo`, and each `runner adv/load` chunk 1 s. |
 
 ## Error code vocabulary
@@ -99,10 +105,24 @@ Clients can switch on `code` reliably. All defined symbols:
 `bad_request`, `bad_path`, `bad_query`, `name_too_long`, `not_found`,
 `is_directory`, `is_file`, `conflict`, `length_required`,
 `payload_too_large`, `range_invalid`, `bad_json`, `unprocessable`,
-`unsupported_media`, `method_not_allowed`, `busy`, `disk_error`,
-`internal_error`, `runner_inactive`, `gateway_timeout`, `no_snapshot`,
+`unsupported_media`, `method_not_allowed`, `busy`, `no_sd_card`,
+`too_many_open_files`, `disk_error`,
+`insufficient_memory`, `internal_error`, `runner_inactive`, `gateway_timeout`, `no_snapshot`,
 `wrong_hook`, `ram_overflow`, `pexec_failed`, `mfree_failed`,
 `program_already_loaded`, `no_program_loaded`.
+
+`too_many_open_files` — FatFs's lock table is full. It is shared with GEMDRIVE
+(`FF_FS_LOCK`, 28 entries: 8 GEMDRIVE files, 16 GEMDRIVE searches and 2 HTTP
+connections holding a file and a directory each), so this usually means the ST
+is holding its share right now and the operation is worth retrying rather than
+a fault.
+
+`no_sd_card` — there is no usable SD card mounted. **Every** endpoint that
+needs the card answers this the same way: `volume`, listings, downloads,
+uploads, folder operations, `runner load` and `runner run`. It is not a fault
+to recover from by hand: the firmware retries the mount every two seconds, so
+inserting a working card clears it within a few seconds with no reset, and the
+setup menu shows `SD: NO CARD` meanwhile and refuses `[G]` and `[U]`.
 
 Runner-specific codes (see *Runner mode* below):
 - `runner_inactive` — the user didn't pick `[U]` at boot.
@@ -132,7 +152,7 @@ Returns the firmware version and uptime in seconds.
 
 **Success** (`200`):
 ```json
-{ "ok": true, "version": "v0.0.1dev", "uptime_s": 123 }
+{ "ok": true, "version": "v1.1.0", "uptime_s": 123 }
 ```
 
 **`curl`**:
@@ -143,6 +163,86 @@ curl http://sidecart.local/api/v1/ping
 **`sidecart`**:
 ```sh
 python3 cli/sidecart.py ping
+```
+
+`HEAD` is also accepted and returns the same headers with no body.
+
+---
+
+### `GET /api/v1/system/health` — device health
+
+Reads the device's diagnostics, in both build types: heap and stack
+high-water marks, why the RP last rebooted, and lost ROM3 samples and
+debug bytes. Sampling is cheap and changes nothing; poll it at any
+cadence.
+
+**Success** (`200`):
+```json
+{
+  "ok": true,
+  "version": "v1.1.0",
+  "build": "b9b53cc",
+  "debug": false,
+  "uptime_s": 312,
+  "heap": { "total": 49852, "free": 40984, "min_free": 27000, "sbrk_high_water": 23808 },
+  "stack": { "reserved": 16384, "high_water": 3556, "painted": 16352, "overflow": false },
+  "code_in_ram": 33512,
+  "reset": { "reason": "panic", "phase": null, "pc": "0x10012abc", "lr": null,
+             "sp": "0x2002fe58", "crash_count": 1, "crash_loop": false },
+  "watchdog": true,
+  "rom3_overruns": 0,
+  "debugcap_dropped": 0,
+  "usbcdc_dropped": 0,
+  "wifi": { "link_up": true, "power_save": 16, "rejoins": 0, "unreachable": 0 }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `build` | Git commit the firmware was built from: `<sha7>`, or `<sha7>-dirty.<diff7>` with uncommitted changes (`<diff7>` hashes the diff, so the same changes always give the same ID). Also printed on the debug console at boot. |
+| `debug` | `true` for a `debug` build (`DPRINTF` traces on the console), `false` for `release`. |
+| `uptime_s` | Seconds since the RP booted. `ping` counts from when the HTTP server started instead. |
+| `heap.total` | Bytes between the end of BSS and the bottom of the core-0 stack, which is where the heap is capped. |
+| `heap.free` | Bytes `malloc` can still use: never-claimed heap plus free chunks inside the claimed part. |
+| `heap.min_free` | Lowest `heap.free` seen since boot, sampled every 100 ms in the main loop and on every health request. |
+| `heap.sbrk_high_water` | Most heap ever claimed from the system, in bytes. |
+| `wifi.link_up` | `true` when the station is associated and lwIP has an address. |
+| `wifi.power_save` | The power-management word **read back from the radio on every request**, not the value asked for. `16` is `CYW43_NONE_PM`, no power saving, which is what the firmware always applies. Anything else means the driver put its own default back. |
+| `wifi.rejoins` | Joins the link supervisor has armed since boot, after a link loss or an unreachable network. |
+| `wifi.unreachable` | Times the gateway probe concluded the network was gone while the link still claimed to be up. |
+| `stack.reserved` | Core-0 stack size the linker reserves. |
+| `stack.high_water` | Deepest core-0 stack use since boot. The stack is 16 KB at the top of RAM and the MPU guards its bottom, so growing past `reserved` faults and reboots the device rather than reaching the heap. |
+| `stack.painted` | Bytes below the stack top that are measured. |
+| `stack.overflow` | `true` when the stack reached the bottom of the measured area, so the real depth is unknown and memory below it was overwritten. |
+| `code_in_ram` | Bytes of code and initialised data copied to RAM at boot. |
+| `reset.reason` | Why the RP last started: `power_on` (power, RUN pin or debugger), `reset` (SELECT or a menu reset), `panic`, `hardfault`, `hang` (the watchdog fired after the firmware stopped feeding it), or `reboot` (any other reboot, such as from Booster, picotool or a debug probe). A hang with interrupts disabled cannot be told apart from a probe reset and is reported as `reboot`. |
+| `reset.phase` | For a `hang`, where the firmware was: `boot`, `main_loop`, `wifi_connect`, `http_request`, `http_wait`, `gemdrive` or `flash_write`. Otherwise `null`. |
+| `reset.pc`, `reset.sp` | For a `panic`, the address that called `panic()` and the stack pointer there. For a `hardfault`, the faulting instruction and stack pointer. Otherwise `null`. |
+| `reset.lr` | For a `hardfault`, the link register at the fault. Otherwise `null`. |
+| `reset.crash_count` | Crash reboots (panic, HardFault or hang) in a row within 60 s. |
+| `reset.crash_loop` | `true` after 3 of them: the boot countdown stays stopped until a SELECT reset or a power cycle. |
+| `watchdog` | `true` once the 8 s watchdog is armed. |
+| `rom3_overruns` | Times the ROM3 command ring overflowed because the main loop fell behind. Each one lost commands (the ST retries them) and debug bytes. |
+| `debugcap_dropped` | Same as `bytes_dropped` in `GET /api/v1/debug`. |
+| `usbcdc_dropped` | Same as `usbcdc_dropped` in `GET /api/v1/debug`. |
+
+A `debug` build compiled with `DEVOPS_LWIP_STATS=1` in the environment
+adds lwIP's allocation counters, each as `[used, max, err]`. A non-zero
+`err` means lwIP failed an allocation:
+
+```json
+"lwip": { "mem": [812, 5120, 0], "pbuf_pool": [0, 4, 0], "tcp_pcb": [1, 3, 0],
+          "tcp_seg": [0, 9, 0], "sys_timeout": [9, 11, 0] }
+```
+
+**`curl`**:
+```sh
+curl http://sidecart.local/api/v1/system/health
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py health
 ```
 
 `HEAD` is also accepted and returns the same headers with no body.
@@ -160,7 +260,7 @@ python3 cli/sidecart.py ping
 `UNKNOWN` (the SD card mounted but FatFs reported a filesystem
 type the firmware doesn't have a string for).
 
-**Errors:** `503 busy` if the SD card is not mounted.
+**Errors:** `503 no_sd_card` if no usable SD card is mounted.
 
 **`curl`**:
 ```sh
@@ -450,7 +550,7 @@ fall into three behavioural buckets:
   wrong_hook` otherwise); `reset` and `adv meminfo` work on
   either vector.
 
-In addition to the foreground surface, Epic 04 adds an **Advanced
+In addition to the foreground surface there is an **Advanced
 Runner** layer at `/api/v1/runner/adv/...` whose handlers run from
 inside the m68k's VBL ISR (or `etv_timer`, depending on the setup
 menu's `ADV_HOOK_VECTOR` choice). VBL-driven commands keep working
@@ -834,7 +934,7 @@ Common error codes: `409 runner_inactive`, `503 busy`,
 
 ## Advanced Runner
 
-VBL-ISR-driven command surface (Epic 04). Handlers run from inside
+VBL-ISR-driven command surface. Handlers run from inside
 the m68k's level-4 autovector at `$70` (or `$400` if you flipped
 `ADV_HOOK_VECTOR` to `etv_timer` in the setup menu), so they keep
 firing even when the foreground poll loop is wedged. Two of the
@@ -1099,6 +1199,28 @@ screen /dev/tty.usbmodem*  115200          # baud is informational
 The CDC port is dedicated to debug bytes — the firmware's own
 DPRINTF diagnostics go to the UART debug header, not the CDC
 port. (Toggle `_DEBUG=1` in the build to enable UART DPRINTF.)
+
+### `POST /api/v1/debug/test/<fault>` — fault injection (debug builds)
+
+Only `debug` builds have these routes. They exist to check on hardware
+that the firmware recovers from a crash or a hang and reports it.
+
+| Path | Effect |
+| --- | --- |
+| `/api/v1/debug/test/panic` | Calls `panic()` from the main loop. The RP reboots with reason `panic`. |
+| `/api/v1/debug/test/hardfault` | Reads an unmapped address from the main loop. The RP reboots with reason `hardfault`. |
+| `/api/v1/debug/test/hang` | Spins forever in the main loop. After 8 s the watchdog reboots the RP with reason `hang`, phase `main_loop`. |
+| `/api/v1/debug/test/stack-overflow` | Recurses until the stack reaches its guard. The MPU faults on the guarded 32 bytes at the stack bottom, so the RP reboots with reason `hardfault` and an `sp` just below `__StackBottom`, instead of writing down through the heap. |
+| `/api/v1/debug/test/http-hang` | Spins forever inside the request handler and never answers. Reason `hang`, phase `http_request`. |
+| `/api/v1/debug/test/stall` | Blocks the main loop for 500 ms without reading the ROM3 ring. With the ST streaming debug bytes, `rom3_overruns` goes up. |
+
+All but `http-hang` answer `202` and act about 250 ms later, so the
+response gets out first:
+
+```sh
+curl -X POST http://sidecart.local/api/v1/debug/test/panic
+{"ok":true,"test":"panic"}
+```
 
 ### Verifying the path end-to-end
 

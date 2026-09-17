@@ -7,7 +7,8 @@
  *              Management API. Built on lwIP's raw TCP API
  *              so it interleaves cleanly with the cartridge-bus poll
  *              loop on Core 0. The lwIP `httpd` app is intentionally
- *              not used — see docs/epics/02-http-api.md.
+ *              not used: it owns its own connection state and cannot
+ *              yield to that poll loop.
  */
 
 #ifndef HTTP_SERVER_H

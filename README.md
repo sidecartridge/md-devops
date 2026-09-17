@@ -51,6 +51,10 @@ HTTP-management surface stitched on top.
 - **Live setup menu** — graphical status icons (Wi-Fi / SD / USB
   CDC / Adv Vector), animated countdown bar, USB CDC attach state
   refreshed live as you plug / unplug.
+- **Looks after itself** — a pulled microSD card is picked up again
+  when it comes back, the Wi-Fi rejoins on its own after a router
+  reboot, and a firmware crash or hang reboots the Pico into the
+  setup menu with the reason on screen instead of freezing.
 
 # ⚠️ Read before installing
 
@@ -115,6 +119,64 @@ ST's keyboard:
 The button is the canonical recovery path for any banner the
 firmware shows on the ST screen (e.g. the `Reloc/stack
 overlap` warning described below).
+
+### When there is no SD card
+
+GEMDRIVE emulates a drive from a folder on the microSD card, so without a
+working card there is nothing to emulate. The setup menu says so on the
+GEMDRIVE line — `SD: NO CARD` instead of `SD: mounted` — and `[G]` and `[U]`
+refuse to start, with *"Insert a working microSD card: GEMDRIVE needs one."*
+on the status line, rather than launching a mode with no drive behind it.
+
+The auto-launch countdown is refused the same way, so a device powered on
+without a card waits in the menu instead of booting into a broken drive.
+
+Every API endpoint that needs the card answers `503 no_sd_card` while it is
+missing, including `volume` and directory listings.
+
+Insert a working card and the block clears by itself within a couple of
+seconds — no reset. The same applies to a card pulled while the device is
+running: it is noticed within about two seconds and remounted when it comes
+back.
+
+### When the network goes away
+
+The device rejoins by itself. A lost link is noticed either from lwIP or from
+a gateway probe the firmware sends every minute, and it then retries the join
+with a backoff from 5 seconds up to a minute, so the API and
+`<hostname>.local` come back without anyone touching the hardware.
+
+The radio runs at full power, with power saving off. Earlier versions always
+ran in power save regardless of the setting, which roughly quadrupled
+round-trip latency.
+
+### When the Pico crashes or hangs
+
+The Pico reboots itself instead of freezing. A crash (a `panic` or a
+HardFault) reboots it within about 100 ms. A hang reboots it after
+8 s, when the watchdog fires. Either way the Pico comes back in the
+setup menu, and row 2 of the menu says why:
+
+```
+Recovered: panic @10012ABC
+Recovered: fault @10003F10 x2
+Recovered: hang in http_request
+```
+
+The address is the program counter at the crash, which the firmware's
+symbol file (`rp.elf`) turns into a function name. `x2` counts crash
+reboots in a row. The same record is in `sidecart.py health` and, on
+a `debug` build, on the UART console.
+
+What the ST sees: for about a second the cartridge window stops
+answering while the Pico re-initialises the bus. The ST program keeps
+running, but GEMDRIVE's open files and the Runner's state are gone, so
+it usually needs an ST reset.
+
+**Crash-loop guard.** After 3 crash reboots within 60 s, the boot
+countdown stays stopped, so the device waits in the menu instead of
+autobooting into whatever keeps crashing. A SELECT short press or a
+power cycle clears the guard.
 
 ## ⚙️ Setup menu screen
 
@@ -408,6 +470,33 @@ unreachable too — fix Wi-Fi / mDNS first. Common causes:
 
 Once `ping` works, every other CLI command works too — they all
 talk to the same HTTP server.
+
+## 🩺 Device health: `health`
+
+`health` reads the device's own diagnostics, including on a `release`
+build that has no console: free heap and its low point, how deep the
+stack has gone, why the Pico last rebooted, and lost ROM3 samples or
+debug bytes.
+
+```sh
+$ python3 cli/sidecart.py health
+version         : v1.1.0
+build           : c783b55 (release)
+uptime          : 312 s
+heap free       : 40984 / 49852 bytes
+heap min free   : 27000 bytes
+sbrk high-water : 23808 bytes
+stack high-water: 3556 bytes, 16384 reserved, 16352 measured
+code in RAM     : 33512 bytes
+last reset      : power_on
+crash count     : 0
+watchdog        : on
+rom3 overruns   : 0
+debugcap dropped: 0
+usbcdc dropped  : 0
+```
+
+See [`docs/api.md`](docs/api.md) for every field.
 
 ## 💾 GEMDRIVE commands — manage files and folders remotely
 

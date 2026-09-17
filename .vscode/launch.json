@@ -2,8 +2,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            // Modify the name to your project name
-            "name": "MULTIDEVICE UFIRMWARE TEMPLATE Debug",
+            "name": "DevOps microfirmware (debug probe)",
             "cwd": "${workspaceFolder}",
             "executable": "${command:cmake.launchTargetPath}",
             "request": "launch",

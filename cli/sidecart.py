@@ -16,6 +16,7 @@ normal output; errors always go to stderr.
 
 Subcommands:
     ping                                          GET  /api/v1/ping
+    health                                        GET  /api/v1/system/health
     gemdrive volume                               GET  /api/v1/gemdrive/volume
     gemdrive ls [PATH]                            GET  /api/v1/gemdrive/files?path=...
     gemdrive get REMOTE [LOCAL] [-r/--resume]     GET  /api/v1/gemdrive/files/<rel>
@@ -37,10 +38,12 @@ Exit codes:
     5  server returned 400 / 422 / other 4xx
     6  server returned 503 (busy or SD unmounted)
     7  server returned 5xx other than 503
-    8  network / DNS error (couldn't reach the host)
+    8  network error: couldn't reach the host, or it dropped the
+       connection (a reboot, a panic or a SELECT press all look like this)
 
 Examples:
     python3 cli/sidecart.py ping
+    python3 cli/sidecart.py health
     SIDECART_HOST=192.168.1.42 python3 cli/sidecart.py gemdrive ls /games
     python3 cli/sidecart.py gemdrive get FILE.TOS -r
     python3 cli/sidecart.py gemdrive put LOCAL.PRG -f
@@ -55,6 +58,7 @@ import argparse
 import http.client
 import json
 import os
+import socket
 import sys
 import urllib.error
 import urllib.parse
@@ -65,8 +69,32 @@ DEFAULT_PORT = 80
 USER_AGENT = "sidecart-cli/0.1"
 REQUEST_TIMEOUT_S = 10
 
-# Granular exit-code map (see docs/epics/02-http-api.md "CLI / Exit code
-# map"). Lets shell scripts branch on category.
+# The device dropping a connection is a normal thing to survive -- it reboots
+# on a watchdog, a panic or a SELECT press, and the HTTP server closes idle
+# connections on purpose. urllib only wraps some of that in URLError; the rest
+# escapes as a bare OSError and used to reach the user as a traceback.
+# IncompleteRead is in here because a chunked body cut short raises it rather
+# than an OSError.
+CONNECTION_DROPPED = (
+    ConnectionResetError,
+    ConnectionAbortedError,
+    BrokenPipeError,
+    http.client.RemoteDisconnected,
+    http.client.IncompleteRead,
+    socket.timeout,
+    TimeoutError,
+)
+
+
+def _dropped(operation: str, exc: BaseException) -> int:
+    """Report a dropped connection as one line and the network exit code."""
+    detail = str(exc) or exc.__class__.__name__
+    print(f"error: {operation}: connection dropped by the device ({detail})",
+          file=sys.stderr)
+    return EXIT_NETWORK
+
+# Granular exit-code map, so shell scripts can branch on the category of a
+# failure rather than parsing the message.
 EXIT_OK = 0
 EXIT_GENERIC = 1
 EXIT_USAGE = 2
@@ -141,6 +169,12 @@ def request_json(method: str, url: str, *, body: bytes | None = None,
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
             status = resp.status
+    except CONNECTION_DROPPED as exc:
+        # Re-raised as URLError so the callers' existing handling applies;
+        # the reason carries what actually happened.
+        detail = str(exc) or exc.__class__.__name__
+        raise urllib.error.URLError(
+            f"connection dropped by the device ({detail})") from exc
     except urllib.error.HTTPError as exc:
         # Server returned >= 400 — read its body so we can render the
         # error envelope, then close the response handle to silence
@@ -198,6 +232,69 @@ def cmd_ping(args: argparse.Namespace) -> int:
         version = parsed.get("version", "?")
         uptime_s = parsed.get("uptime_s", 0)
         print(f"ok  version={version}  uptime={uptime_s}s")
+    return EXIT_OK
+
+
+def _describe_reset(reset: dict) -> str:
+    """One line for the `reset` object of the health report."""
+    reason = reset.get("reason", "?")
+    if reason == "hang":
+        return f"hang in {reset.get('phase') or '?'}"
+    if reason in ("panic", "hardfault"):
+        line = f"{reason} at {reset.get('pc') or '?'}"
+        if reset.get("lr"):
+            line += f"  lr={reset['lr']}"
+        return line + f"  sp={reset.get('sp') or '?'}"
+    return reason
+
+
+def cmd_health(args: argparse.Namespace) -> int:
+    """GET /api/v1/system/health — heap, stack, reset reason, drops."""
+    url = base_url(args.host) + "/api/v1/system/health"
+    try:
+        status, parsed, raw = request_json("GET", url)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200 or parsed is None or parsed.get("ok") is not True:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        json.dump(parsed, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return EXIT_OK
+    if args.quiet:
+        return EXIT_OK
+
+    heap = parsed.get("heap", {})
+    stack = parsed.get("stack", {})
+    reset = parsed.get("reset", {})
+    print(f"version         : {parsed.get('version', '?')}")
+    build_type = "debug" if parsed.get("debug") else "release"
+    print(f"build           : {parsed.get('build', '?')} ({build_type})")
+    print(f"uptime          : {parsed.get('uptime_s', 0)} s")
+    print(f"heap free       : {heap.get('free', 0)} / {heap.get('total', 0)} bytes")
+    print(f"heap min free   : {heap.get('min_free', 0)} bytes")
+    print(f"sbrk high-water : {heap.get('sbrk_high_water', 0)} bytes")
+    overflow = "  OVERFLOW" if stack.get("overflow") else ""
+    print(f"stack high-water: {stack.get('high_water', 0)} bytes, "
+          f"{stack.get('reserved', 0)} reserved, "
+          f"{stack.get('painted', 0)} measured{overflow}")
+    print(f"code in RAM     : {parsed.get('code_in_ram', 0)} bytes")
+    print(f"last reset      : {_describe_reset(reset)}")
+    loop = "  crash loop: countdown stopped" if reset.get("crash_loop") else ""
+    print(f"crash count     : {reset.get('crash_count', 0)}{loop}")
+    print(f"watchdog        : {'on' if parsed.get('watchdog') else 'off'}")
+    print(f"rom3 overruns   : {parsed.get('rom3_overruns', 0)}")
+    print(f"debugcap dropped: {parsed.get('debugcap_dropped', 0)}")
+    print(f"usbcdc dropped  : {parsed.get('usbcdc_dropped', 0)}")
+    lwip = parsed.get("lwip")
+    if isinstance(lwip, dict):
+        for name, counters in lwip.items():
+            used, peak, err = (list(counters) + [0, 0, 0])[:3]
+            print(f"lwip {name:<11}: used {used}  max {peak}  err {err}")
     return EXIT_OK
 
 
@@ -343,6 +440,8 @@ def cmd_get(args: argparse.Namespace) -> int:
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         resp = urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S)
+    except CONNECTION_DROPPED as exc:
+        return _dropped(f"downloading {url}", exc)
     except urllib.error.HTTPError as exc:
         try:
             raw = exc.read() if exc.fp is not None else b""
@@ -399,6 +498,13 @@ def cmd_get(args: argparse.Namespace) -> int:
             # Newline after the progress line.
             sys.stderr.write("\n")
             sys.stderr.flush()
+    except CONNECTION_DROPPED as exc:
+        # Mid-transfer: the partial file is left in place so --resume can pick
+        # it up, which is the whole reason that option exists.
+        if not args.quiet:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+        return _dropped(f"downloading {url}", exc)
     finally:
         resp.close()
 
@@ -778,6 +884,8 @@ def cmd_debug_tail(args: argparse.Namespace) -> int:
     try:
         # No timeout — we deliberately want to block forever.
         resp = urllib.request.urlopen(req, timeout=None)
+    except CONNECTION_DROPPED as exc:
+        return _dropped(f"tailing {url}", exc)
     except urllib.error.HTTPError as exc:
         # Non-200 from the server — render the error envelope if any.
         try:
@@ -810,13 +918,17 @@ def cmd_debug_tail(args: argparse.Namespace) -> int:
             out.flush()
     except KeyboardInterrupt:
         return EXIT_OK
+    except CONNECTION_DROPPED as exc:
+        # A tail is long-lived by design, so the device rebooting under it is
+        # the expected way for this to end, not an anomaly.
+        return _dropped(f"tailing {url}", exc)
     finally:
         resp.close()
     return EXIT_OK
 
 
 def cmd_debug_status(args: argparse.Namespace) -> int:
-    """GET /api/v1/debug — fast-debug-traces diagnostics (Epic 05 v2)."""
+    """GET /api/v1/debug — fast-debug-traces diagnostics."""
     url = base_url(args.host) + "/api/v1/debug"
     try:
         status, parsed, raw = request_json("GET", url)
@@ -965,7 +1077,7 @@ def cmd_runner_reset(args: argparse.Namespace) -> int:
 
 
 def cmd_runner_status(args: argparse.Namespace) -> int:
-    """GET /api/v1/runner — Epic 03 Runner state."""
+    """GET /api/v1/runner — Runner state."""
     url = base_url(args.host) + "/api/v1/runner"
     try:
         status, parsed, raw = request_json("GET", url)
@@ -1011,7 +1123,7 @@ def cmd_runner_status(args: argparse.Namespace) -> int:
     else:
         print(f"last     : {last_cmd} {last_path} (exit={last_exit})")
 
-    # Epic 06 / S5+S6 — Pexec load+exec split state. Print only
+    # Pexec load+exec split state. Print only
     # when there's a basepage pending or a load error to report,
     # so a fresh-boot status stays uncluttered.
     loaded_basepage = parsed.get("loaded_basepage")
@@ -1177,8 +1289,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("ping", help="Health check; show version and uptime.")
+    sub.add_parser(
+        "health",
+        help="Device health: heap, stack, last reset reason, drops.")
 
-    # Epic 06 / S10 — file/folder management verbs grouped under
+    # File/folder management verbs grouped under
     # `gemdrive` so they nest at the same depth as `runner` and
     # `debug` instead of polluting the top level. The HTTP API
     # (/api/v1/gemdrive/files/*, /api/v1/gemdrive/folders/*, /api/v1/gemdrive/volume) is
@@ -1217,7 +1332,7 @@ def build_parser() -> argparse.ArgumentParser:
     put.add_argument("-f", "--force", action="store_true",
                      help="Overwrite if the remote file exists.")
 
-    runner = sub.add_parser("runner", help="Runner mode (Epic 03).")
+    runner = sub.add_parser("runner", help="Runner mode.")
     runner_sub = runner.add_subparsers(dest="runner_cmd", required=True)
     runner_sub.add_parser("status", help="Show Runner state and last completion.")
     runner_sub.add_parser("reset", help="Cold-reset the Atari ST.")
@@ -1234,7 +1349,7 @@ def build_parser() -> argparse.ArgumentParser:
         "meminfo",
         help="System memory snapshot from the live ST (synchronous).")
     adv_p = runner_sub.add_parser(
-        "adv", help="Advanced Runner (Epic 04) — VBL hook diagnostics.")
+        "adv", help="Advanced Runner — VBL hook diagnostics.")
     adv_sub = adv_p.add_subparsers(dest="adv_cmd", required=True)
     adv_sub.add_parser(
         "status",
@@ -1307,7 +1422,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     debug = sub.add_parser(
         "debug",
-        help="Fast-debug-traces (Epic 05) diagnostics + transports.")
+        help="Fast-debug-traces diagnostics + transports.")
     debug_sub = debug.add_subparsers(dest="debug_cmd", required=True)
     debug_sub.add_parser(
         "status",
@@ -1328,9 +1443,10 @@ def main(argv: list[str] | None = None) -> int:
 
     handlers = {
         "ping": cmd_ping,
+        "health": cmd_health,
     }
     if args.cmd == "gemdrive":
-        # Epic 06 / S10 — file/folder verbs grouped under
+        # File/folder verbs grouped under
         # `gemdrive` so the CLI's nesting depth matches the
         # other subcommand families (runner, debug). HTTP API
         # endpoints are unchanged.

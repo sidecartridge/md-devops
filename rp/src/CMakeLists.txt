@@ -81,10 +81,32 @@ include(${PICO_EXTRAS_PATH}/external/pico_extras_import.cmake)
 # Set name of project (as PROJECT_NAME) and C/C   standards
 project(rp C CXX)
 set(CMAKE_C_STANDARD 11)
+# malloc must return NULL on failure instead of panicking.
+#
+# MUST be set before pico_sdk_init(): check_alloc() lives in the SDK's own
+# malloc.c, and pico_sdk_init() pulls the SDK in as a subdirectory, which
+# inherits compile definitions as they stand at that moment. Setting this
+# further down the file compiles OUR sources with it and leaves the SDK's
+# malloc.c untouched, which looks right and does nothing.
+#
+# The SDK default (PICO_MALLOC_PANIC 1) turns a failed allocation into
+# panic("Out of memory"), which defeats libraries written to handle NULL and
+# recover. FatFs's dir_clear() is the case that bit us: creating a directory
+# asks for up to 32KB and HALVES the request until it fits, falling back to
+# single-sector writes if nothing can be allocated. With the panic enabled the
+# first oversized request killed the device, so booting with an SD card that
+# has no app folder was fatal. mbedTLS is written the same way and fails a
+# handshake on a failed allocation rather than taking the device down.
+#
+# Every malloc in this firmware checks its result, and sbrk still refuses to
+# grow the heap past __StackLimit, so the guard this removes was redundant.
+if (NOT DEFINED ENV{PICO_MALLOC_PANIC})
+    set(ENV{PICO_MALLOC_PANIC} "0")
+endif()
+add_compile_definitions(PICO_MALLOC_PANIC=$ENV{PICO_MALLOC_PANIC})
+
 # Creates a pico-sdk subdirectory in our project for the libraries
 pico_sdk_init()
-
-add_subdirectory(settings)
 
 # Add u8g2 library
 add_subdirectory(u8g2)
@@ -111,12 +133,14 @@ target_sources(${PROJECT_NAME} PRIVATE
         emul.c
         gconfig.c
         gemdrive.c
+        health.c
         http_server.c
         hw_config.c
         network.c
         reset.c
         romemul.c
         runner.c
+        sd_timeouts.c
         sdcard.c
         select.c
         term.c
@@ -127,6 +151,11 @@ target_sources(${PROJECT_NAME} PRIVATE
 # Create map/bin/hex/uf2 files
 pico_add_extra_outputs(${PROJECT_NAME})
 
+# A panic() records the reason and reboots through the watchdog instead of
+# stopping at a breakpoint nobody sees (health.c).
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    PICO_PANIC_FUNCTION=health_panic)
+
 # Link libraries required for the project
 target_link_libraries(${PROJECT_NAME} PRIVATE
     ${LINK_LIBRARIES}        # External or additional libraries passed as variables
@@ -135,7 +164,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     pico_stdlib              # Core functionality
     pico_multicore          # Multicore support
     pico_lwip_mdns           # lwIP mDNS responder so <hostname>.local works
-    settings                 # Custom settings library
     u8g2                     # for display
 )
 
@@ -162,15 +190,14 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 target_include_directories(${PROJECT_NAME} BEFORE PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/ff)
 
-# Needed to include lwipopts.h properly
+# Needed to include lwipopts.h properly. settings/ holds settings.h;
+# settings.c is compiled directly into the target (see target_sources).
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/include
+    ${CMAKE_CURRENT_LIST_DIR}/settings
     ${CMAKE_CURRENT_LIST_DIR}/..)
 
-
-# Use reduced space for ROMs
-pico_set_binary_type(${PROJECT_NAME} rp)
 
 # Fetch the values from the environment variables
 set(RELEASE_TYPE $ENV{RELEASE_TYPE})
@@ -211,13 +238,21 @@ if (NOT _DEBUG)
         set(_DEBUG 0)
 endif()
 
-# Debug outputs
+# USB stdio stays compiled in because usbcdc.c runs the TinyUSB CDC
+# interface through it, detaching it from stdio at runtime. UART stdio is the
+# DPRINTF console, so only debug builds enable it.
 pico_enable_stdio_usb(${PROJECT_NAME} 1)
-# Workaround to disable USB output in release builds
 if(${_DEBUG} STREQUAL "0")
     pico_enable_stdio_uart(${PROJECT_NAME} 0)
 else()
     pico_enable_stdio_uart(${PROJECT_NAME} 1)
+    # 921,600 baud, not the SDK's 115,200: DPRINTF blocks on the UART, and at
+    # 115,200 the settings dumped before the cartridge copy delayed it enough
+    # that a power-cycled ST booted into GEM without the cartridge. The UART
+    # clock stays at 48 MHz after the 225 MHz overclock, so the divider error
+    # is 0.02 %. Set the serial terminal to 921600.
+    target_compile_definitions(${PROJECT_NAME} PRIVATE
+        PICO_DEFAULT_UART_BAUD_RATE=921600)
 endif()
 
 # Print the variables on screen
@@ -226,6 +261,22 @@ message("RELEASE_VERSION: " ${RELEASE_VERSION})
 message("RELEASE_DATE: " ${RELEASE_DATE})
 message("DEBUG_MODE: " ${_DEBUG})
 message("LATEST_RELEASE_URL: " ${LATEST_RELEASE_URL})
+
+# build_id.h and build_id.c (RELEASE_BUILD_ID and the release_build_id symbol,
+# the git commit) are regenerated on every build; see build_id.cmake. They are
+# rewritten only when the ID changes, so only their users recompile. The symbol
+# is kept through --gc-sections so tools can read it over SWD.
+set(BUILD_ID_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/build_id)
+add_custom_target(build_id
+    COMMAND ${CMAKE_COMMAND} -DSRC_DIR=${CMAKE_CURRENT_LIST_DIR}
+            -DOUT_DIR=${BUILD_ID_DIR} -P ${CMAKE_CURRENT_LIST_DIR}/build_id.cmake
+    BYPRODUCTS ${BUILD_ID_DIR}/build_id.h ${BUILD_ID_DIR}/build_id.c
+    COMMENT "Checking the build ID")
+add_dependencies(${PROJECT_NAME} build_id)
+target_sources(${PROJECT_NAME} PRIVATE ${BUILD_ID_DIR}/build_id.c)
+set_source_files_properties(${BUILD_ID_DIR}/build_id.c PROPERTIES GENERATED TRUE)
+target_include_directories(${PROJECT_NAME} PRIVATE ${BUILD_ID_DIR})
+target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--undefined=release_build_id")
 
 # Pass these values to the C compiler
 add_definitions(-DRELEASE_TYPE="${RELEASE_TYPE}")
@@ -245,6 +296,23 @@ endif()
 # Pass the _DEBUG flag to the C compiler
 add_definitions(-D_DEBUG=${_DEBUG})
 
+# Guard the bottom of core 0's stack with the MPU: an
+# overflow faults at the guard instead of writing down through the heap and,
+# past it, the cartridge window the ST reads. Both build types on purpose: in a
+# shipping build the alternative is silent corruption that surfaces later as a
+# mystery, while a fault reboots with a breadcrumb. Costs one of the
+# eight MPU regions (nothing else here uses the MPU), the lowest 32 bytes of
+# the stack, and a few instructions per core at boot.
+add_definitions(-DPICO_USE_STACK_GUARDS=1)
+
+# lwIP statistics are opt-in and debug-only (lwipopts.h). Set
+# DEVOPS_LWIP_STATS=1 in the environment of a debug build to report the
+# lwIP pool counters in GET /api/v1/system/health.
+if(DEFINED ENV{DEVOPS_LWIP_STATS} AND NOT "$ENV{DEVOPS_LWIP_STATS}" STREQUAL "")
+    message("DEVOPS_LWIP_STATS: $ENV{DEVOPS_LWIP_STATS}")
+    add_definitions(-DDEVOPS_LWIP_STATS=$ENV{DEVOPS_LWIP_STATS})
+endif()
+
 # Device/Computer type
 add_definitions(-DDISPLAY_ATARIST)
 
@@ -263,21 +331,26 @@ add_definitions(-DPICO_FLASH_ASSUME_CORE0_SAFE=1)
 # undefined behaviour.
 add_definitions(-DCFG_TUD_CDC_TX_BUFSIZE=1024)
 
+# Print the RAM and flash budget after every link, with the
+# same script that fills the CI job summary, so a local build and a CI build
+# report the same numbers. Skipped when no python3 is around.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_LIST_DIR}/../../.github/scripts/firmware_size_report.py
+                $<TARGET_FILE:${PROJECT_NAME}>
+                $<TARGET_FILE:${PROJECT_NAME}>.map
+                "$<IF:$<STREQUAL:${_DEBUG},0>,release,debug>"
+        VERBATIM)
+endif()
+
 # Remove unused data
+# Symbols stay in rp.elf: they are not part of the flashed image, and crash
+# addresses and debug probes need them.
 target_link_options(${PROJECT_NAME} PRIVATE
    "-Wl,--gc-sections"
-   "-Wl,--strip-all"
 )
-
-# Enable clang-tidy (you need to have clang-tidy installed on your system)
-find_program(CLANG_TIDY_EXE NAMES clang-tidy)
-
-if(CLANG_TIDY_EXE)
-    set(CMAKE_C_CLANG_TIDY "${CLANG_TIDY_EXE}")
-    message(STATUS "Found clang-tidy: ${CLANG_TIDY_EXE}")
-else()
-    message(WARNING "clang-tidy not found, skipping linting")
-endif()
 
 # Find clang-format executable
 find_program(CLANG_FORMAT_BIN NAMES clang-format)

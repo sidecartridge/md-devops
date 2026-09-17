@@ -20,8 +20,8 @@
 ;   3. Publish the RUNNER_HELLO magic + protocol version into the
 ;      Runner shared sub-region so the RP-side `GET /api/v1/runner`
 ;      handshake reports `active=true`.
-;   4. Loop forever (active foreground poll). Subsequent stories
-;      add the actual command dispatch (RESET / EXECUTE / CD).
+;   4. Loop forever (active foreground poll). Command dispatch
+;      (RESET / EXECUTE / CD) is layered on top of this loop.
 
 	section text
 
@@ -89,9 +89,10 @@ RANDOM_TOKEN_SEED_ADDR		equ (SHARED_BLOCK_ADDR + 8)	; $FA2808
 RANDOM_TOKEN_POST_WAIT		equ $1
 ROMCMD_START_ADDR		equ $FB0000
 CMD_MAGIC_NUMBER		equ $ABCD
-CMD_RETRIES_COUNT		equ 3
+CMD_RETRIES_COUNT		equ 5
 CMD_SET_SHARED_VAR		equ 1
-COMMAND_TIMEOUT			equ $0000FFFF
+; Same budget as gemdrive.s: the Runner's commands also wait on SD work.
+COMMAND_TIMEOUT			equ $0006FFFF
 COMMAND_WRITE_TIMEOUT		equ COMMAND_TIMEOUT
 _dskbufp			equ $4C6
 

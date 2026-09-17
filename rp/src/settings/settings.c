@@ -4,6 +4,9 @@
 
 #include "settings.h"
 
+#include "debug.h"  // the firmware's DPRINTF, not the library fallback
+#include "health.h"
+
 /*
  * -----------
  * STATIC HELPER FUNCTIONS
@@ -215,10 +218,20 @@ int settings_init(SettingsContext *ctx,
                   const SettingsConfigEntry *defaultEntries,
                   uint16_t defaultNumEntries, uint32_t flashOffset,
                   uint32_t flashSize, uint16_t magic, uint16_t version) {
-  // 1) Validate/Assign flash parameters
-  assert(flashSize % SETTINGS_FLASH_PAGE_SIZE == 0);
+  // 1) Validate/Assign flash parameters. These guard the erase and program
+  // ranges, so they are runtime checks: both build types define NDEBUG, which
+  // removes assert() from the shipping firmware.
+  if (flashSize % SETTINGS_FLASH_PAGE_SIZE != 0) {
+    DPRINTF("Error: flash size %lu is not a multiple of the %u-byte page.\n",
+            (unsigned long)flashSize, (unsigned)SETTINGS_FLASH_PAGE_SIZE);
+    return -1;
+  }
   ctx->flashSettingsSize = flashSize;
-  assert(flashOffset % SETTINGS_FLASH_PAGE_SIZE == 0);
+  if (flashOffset % SETTINGS_FLASH_PAGE_SIZE != 0) {
+    DPRINTF("Error: flash offset 0x%lx is not page-aligned.\n",
+            (unsigned long)flashOffset);
+    return -1;
+  }
   ctx->flashSettingsOffset = flashOffset;
 
   DPRINTF("Flash settings size: %lu\n", (unsigned long)ctx->flashSettingsSize);
@@ -229,7 +242,11 @@ int settings_init(SettingsContext *ctx,
   size_t maxEntries = ctx->flashSettingsSize / sizeof(SettingsConfigEntry);
   DPRINTF("Max entries count: %zu\n", maxEntries);
 
-  assert(defaultNumEntries <= maxEntries);
+  if (defaultNumEntries > maxEntries) {
+    DPRINTF("Error: %u default entries do not fit in %zu slots.\n",
+            (unsigned)defaultNumEntries, maxEntries);
+    return -1;
+  }
   DPRINTF("Default entries count: %d\n", defaultNumEntries);
 
   // 3) Prepare the configData structure
@@ -334,6 +351,7 @@ int __not_in_flash_func(settings_save)(SettingsContext *ctx,
            totalUsed < programSize ? totalUsed : programSize);
   }
 
+  health_setPhase(HEALTH_PHASE_FLASH_WRITE);
   uint32_t ints = 0;
   if (disable_interrupts) {
     ints = save_and_disable_interrupts();
@@ -365,6 +383,7 @@ int settings_erase(SettingsContext *ctx) {
   if (!ctx) return -1;
 
   // Erase the flash region
+  health_setPhase(HEALTH_PHASE_FLASH_WRITE);
   uint32_t ints = save_and_disable_interrupts();
   flash_range_erase(ctx->flashSettingsOffset, ctx->flashSettingsSize);
   restore_interrupts(ints);
@@ -494,10 +513,16 @@ void settings_print(SettingsContext *ctx, char *buffer) {
         break;
     }
 
-    // Print in the format: "KEY (TYPE): Value\n"
+    // Print in the format: "KEY (TYPE): Value\n", except for secrets. Every
+    // caller of this sends the result to the debug console, and those logs get
+    // pasted into issues and chats, so a key whose name says it holds a
+    // password prints only whether one is set.
+    const char *value = ctx->configData.entries[i].value;
+    if (strstr(ctx->configData.entries[i].key, "PASSWORD") != NULL) {
+      value = (value[0] != '\0') ? "<set>" : "<none>";
+    }
     len = snprintf(ptr, remaining, "%s (%s): %s\n",
-                   ctx->configData.entries[i].key, typeStr,
-                   ctx->configData.entries[i].value);
+                   ctx->configData.entries[i].key, typeStr, value);
 
     ptr += len;
     remaining = (len < remaining) ? (remaining - len) : 0;

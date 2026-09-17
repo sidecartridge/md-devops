@@ -14,7 +14,7 @@ Top-level build is driven by `build.sh` in the repo root:
 
 ```bash
 # <board_type> = pico | pico_w | sidecartos_16mb
-# <build_type> = debug | release   (note: always compiled as MinSizeRel — see below)
+# <build_type> = release | debug   (case-insensitive; both are CMake Release — see below)
 # <app_uuid_key> = UUID4 identifying this app, must match desc/app.json
 ./build.sh pico_w release 123e4567-e89b-12d3-a456-426614174000
 ```
@@ -24,10 +24,10 @@ Required host environment:
 - `atarist-toolkit-docker` (`stcmd`) — needed for the m68k target. `stcmd` requires a PTY (`pty=true`).
 - SDK paths (auto-set from the repo if unset): `PICO_SDK_PATH`, `PICO_EXTRAS_PATH`, `FATFS_SDK_PATH`.
 
-Build flow (orchestrated by `build.sh`):
+Build flow (orchestrated by `build.sh`; every script stops at the first failed step):
 1. Copies `version.txt` into `rp/` and `target/atarist/`.
 2. Builds the Atari ST target (`target/atarist/build.sh`) via `stcmd make`. Enforces a **10 KB hard limit** on `BOOT.BIN` (the cartridge code budget — `CHANDLER_CARTRIDGE_CODE_SIZE` in `rp/src/include/chandler.h`, mirrored as `CARTRIDGE_CODE_SIZE` in `target/atarist/src/main.s`); a build that exceeds it aborts with `ERROR: cartridge code is N bytes; limit is 10240`. A separate copy (`FIRMWARE.IMG`) is then padded to 64 KB to fill the entire shared region, and `firmware.py` converts it into `rp/src/include/target_firmware.h` (a C byte array embedded in the RP firmware).
-3. Builds the RP firmware (`rp/build.sh`): pins submodule versions (pico-sdk 2.2.0, pico-extras sdk-2.2.0, fatfs-sdk at a specific commit), runs CMake, produces `rp/dist/rp-<board>.uf2`. The FatFs configuration lives at `rp/src/ff/ffconf.h` and shadows the submodule's default via `target_include_directories(... BEFORE PRIVATE)` in `rp/src/CMakeLists.txt`, so the `fatfs-sdk` submodule stays pristine.
+3. Builds the RP firmware (`rp/build.sh`): pins submodule versions (pico-sdk 2.2.0, pico-extras sdk-2.2.0, fatfs-sdk at a specific commit), empties `rp/build` and `rp/dist`, runs CMake, produces `rp/dist/rp-<board>.uf2` (`rp-<board>-debug.uf2` for debug). The FatFs configuration lives at `rp/src/ff/ffconf.h` and shadows the submodule's default via `target_include_directories(... BEFORE PRIVATE)` in `rp/src/CMakeLists.txt`, so the `fatfs-sdk` submodule stays pristine.
 4. Computes MD5, renames to `dist/<APP_UUID>-<VERSION>.uf2`, and substitutes UUID/MD5/version into `dist/<APP_UUID>.json` from the `desc/app.json` template.
 
 ### Iterating on m68k-only changes
@@ -40,19 +40,22 @@ cd target/atarist && ./build.sh "$(pwd)" release
 The top-level `./build.sh` also re-pins SDK submodules and rebuilds the full RP firmware (CMake configure + lwIP/cyw43/mbedtls + UF2), which is minutes of work for a m68k syntax check. The atarist script alone enforces the 10 KB `BOOT.BIN` cap and prints `Cartridge code: N / 10240 bytes` — exactly what the iteration loop needs. Reserve the top-level build for RP-side changes or both-sides changes.
 
 ### Build gotchas
-- **CMake always builds with `-DCMAKE_BUILD_TYPE=MinSizeRel`** regardless of the `<build_type>` argument. A full `Release` previously caused breakage (memory/over-optimization). The legacy line is left commented in `rp/build.sh`. `<build_type>` only controls the `DEBUG_MODE` macro and the dist filename.
+- **Both build types are CMake `Release` (`-O3`, `NDEBUG`).** `release` sets `DEBUG_MODE=0`; `debug` sets `DEBUG_MODE=1`, which only adds `DPRINTF` traces on the UART console (GPIO 0/1, **921,600 baud**; at the SDK's 115,200 the boot traces delayed the cartridge enough that a power-cycled ST booted into GEM). `DEBUG_BUFFERED_CONSOLE` in `rp/src/include/debug.h` (default 1) queues `DPRINTF` text in a 4 KB RAM ring sent by the UART transmit interrupt, so traces no longer stall the firmware; set it to 0 for the blocking console when chasing a hang, since text still queued when the firmware hangs is lost. Up to v1.0.1beta every build was `MinSizeRel`, because `Release` broke at runtime. **v1.1.0 ships `Release`**: both types pass the hardware gate — smoke, 4 MB transfers, aborted clients, and forced panic / HardFault / watchdog recovery. `RP_CMAKE_BUILD_TYPE=MinSizeRel` overrides only the CMake type, to compare against that configuration; it warns loudly, no workflow sets it, and it is comparison-only. A fixed `RELEASE_DATE` in the environment makes two builds of one commit byte-identical.
+- `rp.elf` keeps its symbols (no `--strip-all`); the flashed image is the same either way. In VS Code, pick the `release` or `debug` variant from `.vscode/cmake-variants.yaml`, which sets `DEBUG_MODE` and the development UUID.
 - `CHARACTER_GAP_MS` must remain defined (700) in `rp/src/include/blink.h` — removing it breaks the RP build.
 - Harmless VASM warnings during the m68k build (`target data type overflow`, `trailing garbage after option -D`) can be ignored.
 - VASM/`stcmd` errors like `the input device is not a TTY` mean `stcmd` was invoked without a PTY. `target/atarist/build.sh` already exports `STCMD_NO_TTY=1` for every `stcmd` call it makes; you only need to export it yourself if invoking `stcmd` directly from a non-TTY context (CI, sub-shells, build wrappers). Without it the m68k build can fail silently and the previous `BOOT.BIN` survives — leading to a working RP firmware that displays garbage on the ST because `target_firmware.h` is stale.
 
 ### CI / release
-- `.github/workflows/build.yml` builds `pico_w` Release on PR.
-- `.github/workflows/release.yml` triggers on `v*` tags: builds, attaches UF2 + JSON to the GitHub Release, uploads to `s3://atarist.sidecartridge.com/`.
+- `.github/workflows/build.yml` builds `pico_w` `release` and `debug` on PR with ARM GNU Toolchain 14.2.rel1, writes a size report to the job summary (`.github/scripts/firmware_size_report.py`) and uploads the firmware with `rp.elf` and its map.
+- `.github/workflows/release.yml` triggers on `v*` tags: builds `release`, attaches UF2 + JSON (plus `rp.elf` and its map) to the GitHub Release, uploads UF2 + JSON to `s3://atarist.sidecartridge.com/`.
 - `make tag` tags HEAD with the contents of `version.txt` and pushes the tag (which triggers release).
 - `upload_s3.sh <file>` is a manual one-off uploader; needs `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
 
 ### Tests
 There is no test suite. "Verification" is: build succeeds, UF2 boots on hardware, manual interaction over the serial debug console.
+
+Host-side developer tools live in `tools/dev/` (see its README). `tools/dev/console.py watch` captures the debug console to `tools/dev/logs/console.log`; read it with `console.py since-boot`, `grep` or `wait` instead of asking for a pasted log. `tools/dev/flash.sh <release|debug>` builds out of tree, flashes, and checks over SWD that the RP booted it and carries the new build ID (`<sha7>` or `<sha7>-dirty.<diff7>`, generated on every build by `rp/src/build_id.cmake`). The tools reach the RP only through picotool, the Debug Probe (`tools/dev/swd.py`) and the console, never through firmware services such as the HTTP server, so they stay portable to other microfirmwares. `tools/dev/swd.py` also reads the menu (`screen`, `text`), the shared variables and a crash report over SWD, and drives SELECT, keys and app commands; `tools/dev/smoke.py` is the end-to-end hardware check.
 
 ## Architecture
 
@@ -85,10 +88,14 @@ See `programming.md` for the full table and budget rules.
 - `emul.c` / `emul.h` — the application's main loop and entry point. This is where to add new features.
 - `romemul.c` / `romemul.pio` — PIO programs and the runtime that emulates the cartridge ROM/RAM bus to the Atari (driven by `READ_*` / `WRITE_*` GPIOs defined in `include/constants.h`).
 - `gconfig.c` / `aconfig.c` — global vs per-app configuration stored in dedicated flash sectors, on top of `settings/` (a key-value store).
-- `network.c`, `httpc/`, `download.c` — Wi-Fi (CYW43, lwIP poll mode), HTTPS-capable HTTP client, firmware download support.
+- `network.c`, `httpc/`, `download.c` — Wi-Fi (CYW43, lwIP poll mode), HTTPS-capable HTTP client, firmware download support. The radio never sleeps: `PARAM_WIFI_POWER` is deliberately ignored and `CYW43_NONE_PM` is re-applied after every bring-up, because the driver puts its own default back on each STA re-enable. `network_superviseLink()` runs from the main loop and rejoins on its own after a link loss, backing off 5 s to 60 s; it also probes the default gateway by ARP every 60 s, because both `cyw43_tcpip_link_status()` and `cyw43_wifi_link_status()` can report a healthy link when the radio has left the network.
+- `lwipopts.h` — the pool sizes carry the measurement that justifies them. `TCP_MSL` is 10 s, not lwIP's 60, because the server closes every connection and a 2-minute TIME_WAIT kept the pcb pool permanently full.
 - `sdcard.c`, `hw_config.c` — FatFs over SPI/SDIO via the bundled `fatfs-sdk`.
 - `display.c`, `display_term.c`, `term.c`, `u8g2/` — terminal-style display rendered into the Atari framebuffer at `$FAE0C0` and/or a local OLED.
 - `blink.c`, `select.c`, `reset.c`, `tprotocol.c` — LED Morse status, SELECT-button handling, soft reset/jump-to-booster, transport protocol primitives.
+- `health.c` — watchdog (8 s), crash and hang reboots with the reason kept in watchdog scratch registers 0-3, crash-loop guard, stack and heap high-water marks. Reported by `GET /api/v1/system/health` and shown on the second row of the menu (`Recovered: hang in main_loop x2`). `sd_timeouts.c` overrides fatfs-sdk's weak SD timeout table so a failing card cannot outlast the watchdog.
+- **`FF_FS_LOCK` is 28** (`rp/src/ff/ffconf.h`), not the default 8: it counts open files *and* open non-root directories, shared between GEMDRIVE (8 files + 16 searches) and the HTTP server (2 connections × a `FIL` and a `DIR`). `FR_TOO_MANY_OPEN_FILES` maps to GEMDOS `ENHNDL` and HTTP `503 too_many_open_files`.
+- **The SD card is remounted automatically.** It is only mounted at boot, so a pulled card used to stay dead until a reset: with card-detect disabled nothing marks the drive uninitialised, and FatFs will not re-init a volume that is still registered. `sdcard_pollRemount()` reads sector 0 every 2 s to notice a pull (FatFs itself keeps serving from cache and reports no error), then `deinit()`s the card and re-mounts. While no card is mounted every SD endpoint answers `503 no_sd_card` and the menu refuses `[G]` and `[U]`.
 
 ### Memory layout (`rp/src/memmap_rp.ld`)
 The RP2040's 2 MB flash is sliced into named regions, and code is responsible for not stomping on them:
@@ -101,8 +108,13 @@ The RP2040's 2 MB flash is sliced into named regions, and code is responsible fo
 | `CONFIG_FLASH` | `0x101E0000` | 120 K | 30 sectors of per-app config |
 | `GLOBAL_LOOKUP_FLASH` | `0x101FE000` | 4 K | UUID → config-sector lookup |
 | `GLOBAL_CONFIG_FLASH` | `0x101FF000` | 4 K | Global config |
-| `RAM` | `0x20000000` | 128 K | Normal RAM |
-| `ROM_IN_RAM` | `0x20020000` | 128 K | ROM data mirrored to RAM for fast bus access |
+| `RAM` | `0x20000000` | 192 K | Normal RAM (the upper 64 K was reclaimed in v1.1) |
+| `ROM_IN_RAM` | `0x20030000` | 64 K | The cartridge window the ST sees at `$FA0000` |
+| `SCRATCH_X` / `SCRATCH_Y` | `0x20040000` / `0x20041000` | 4 K each | Core-local scratch |
+
+Core 0's stack is 16 KB at the top of `RAM` (`__StackTop = 0x20030000`), guarded by the MPU
+(`PICO_USE_STACK_GUARDS`), and the link fails if the heap floor and the stack would collide — three
+`ASSERT`s in `memmap_rp.ld`. Measured stack peak across the v1.1 work is about 3.3 KB.
 
 The build assumes Core 0 owns flash writes (`PICO_FLASH_ASSUME_CORE0_SAFE=1`). The PIO bus emulation runs hot — Core 0 also overclocks to 225 MHz at `VREG_VOLTAGE_1_10`.
 
@@ -113,7 +125,10 @@ The build assumes Core 0 owns flash writes (`PICO_FLASH_ASSUME_CORE0_SAFE=1`). T
 
 - **Never modify** `pico-sdk/`, `pico-extras/`, or `fatfs-sdk/` — they are git submodules pinned to specific upstream revisions, and the build re-pins them on every run. To change FatFs configuration, edit `rp/src/ff/ffconf.h` (project-owned override); the include path is set up so this file wins over the submodule's default.
 - Don't touch `main.c` for feature work — start in `emul.c`.
-- Match the existing C style (clang-format config in `.clang-format`, clang-tidy in `.clang-tidy` — both wired up via CMake when the binaries are on `PATH`).
+- **The watchdog fires after 8 s without `health_feed()`.** It is fed only in the main loop, `emul_pollTick`, the Wi-Fi connect loop, the HTTP spin-waits and two slow boot steps. Any new loop or blocking call that can run longer must feed it and set a `health_setPhase()`; don't feed it anywhere else, or a real hang there goes unnoticed.
+- `panic()` goes to `health_panic` (`PICO_PANIC_FUNCTION`), and the HardFault vector is replaced at boot. Both reboot the RP. Don't call `watchdog_reboot` or jump to Booster without going through `reset.c` / `reset.h`, which record the reason and stop the watchdog.
+- **Never name an epic, story, iteration or task in anything that is committed** — comments, documentation, changelog, commit messages, PR descriptions. The planning notes live in `docs/epics/`, which is gitignored, so `EPIC-14 STORY-02` tells a reader of this repository nothing and cannot be looked up. Write what the code does and why instead: *"the driver re-applies its own default on every STA re-enable"*, not *"see EPIC-14 STORY-02"*. Check with `git grep -IiE "EPIC-|STORY-|\bepics?\b|\bstor(y|ies)\b"` before tagging a release.
+- Match the existing C style (clang-format config in `.clang-format`, exposed as the `clang-format` CMake target when the binary is on `PATH`; clang-tidy config in `.clang-tidy`, used by editors, not by the build).
 - **m68k modules `gemdrive.s` and `runner.s` MUST be 100% relocatable and self-contained.** They cannot rely on any cross-module symbol from `main.o` or each other. Concretely:
   - **No `xref` / `xdef`.** Every macro and helper they call must be defined inside the same assembly unit. The protocol macros live in `inc/sidecart_macros.s` and `bsr.w` into functions defined in `inc/sidecart_functions.s`; both files are `include`'d verbatim at the top/bottom of each module so the bsr's resolve to a private local copy. vasm doesn't export plain labels so vlink doesn't see duplicates between main.o, gemdrive.o, and runner.o.
   - **No `jsr` / `jmp` to outside-module symbols.** Both instructions emit absolute addresses, which freezes the call site to a specific runtime address — incompatible with relocation. Use `bsr` / `bra` (PC-relative) for all intra-module control flow. The single allowed exception is the entry-point `jmp` from `main.s`'s `check_commands` dispatch into the relocated blob (e.g. `jmp RUNNER_BLOB`); any future `jsr`/`jmp` to a non-local symbol from inside `gemdrive.s` or `runner.s` requires explicit user approval.

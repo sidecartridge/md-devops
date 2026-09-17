@@ -1,10 +1,12 @@
 #include "include/network.h"
 
+#include "lwip/etharp.h"
+
+#include "include/health.h"
+
 static bool cyw43Initialized = false;
 static wifi_mode_t wifiCurrentMode = WIFI_MODE_STA;
 static wifi_network_info_t wifiNetworkInfo = {.rssi = INT16_MIN};
-static wifi_scan_data_t wifiScanData = {0};
-static bool wifiScanInProgress = false;
 static char wifiHostname[NETWORK_MAX_STRING_LENGTH];
 static ip_addr_t currentIp = {0};
 static uint8_t cyw43Mac[NETWORK_MAC_SIZE];
@@ -33,7 +35,6 @@ static void network_resetConnectionState(void) {
 }
 
 static void network_resetRuntimeState(void) {
-  wifiScanInProgress = false;
   network_resetConnectionState();
   memset(cyw43Mac, 0, sizeof(cyw43Mac));
   cyw43MacStr[0] = '\0';
@@ -42,6 +43,150 @@ static void network_resetRuntimeState(void) {
   mdnsInitialized = false;
   mdnsStaRegistered = false;
 #endif
+}
+
+// Power saving is off, always, and re-applied after every bring-up because the
+// driver puts it back (see the comment in network_wifiInit). The value is read
+// back rather than assumed, and reported by the health endpoint.
+static uint32_t wifiPmReadback = 0;
+static bool wifiPmReadbackValid = false;
+
+static void network_applyNoPowerSave(void) {
+  if (!cyw43Initialized) {
+    return;
+  }
+  cyw43_wifi_pm(&cyw43_state, CYW43_NONE_PM);
+  uint32_t pm = 0;
+  if (cyw43_wifi_get_pm(&cyw43_state, &pm) == 0) {
+    wifiPmReadback = pm;
+    wifiPmReadbackValid = true;
+    if (pm != CYW43_NONE_PM) {
+      DPRINTF("WiFi power save: asked for 0x%08lx, radio reports 0x%08lx\n",
+              (unsigned long)CYW43_NONE_PM, (unsigned long)pm);
+    } else {
+      DPRINTF("WiFi power save: off (0x%08lx)\n", (unsigned long)pm);
+    }
+  } else {
+    wifiPmReadbackValid = false;
+    DPRINTF("WiFi power save: could not read the mode back\n");
+  }
+}
+
+bool network_getPowerSaveMode(uint32_t *pm) {
+  // Read it from the radio every time. A value cached at bring-up would go on
+  // claiming power saving was off however the mode changed afterwards, which
+  // is the opposite of what this report is for.
+  if (!cyw43Initialized) {
+    return false;
+  }
+  uint32_t live = 0;
+  if (cyw43_wifi_get_pm(&cyw43_state, &live) != 0) {
+    return false;
+  }
+  wifiPmReadback = live;
+  wifiPmReadbackValid = true;
+  *pm = live;
+  return true;
+}
+
+static char *network_trim_ascii_spaces(char *text);
+
+// --- Static TCP/IP validation ---
+//
+// The static branch used to dereference settings_find_entry(...)->value for the
+// address, netmask and gateway with no NULL check, so a global config missing
+// any of the three faulted before the setup menu could come up -- with no way
+// to fix the setting, because the menu is where you fix it. Values also went
+// straight into ipaddr_addr(), which accepts "10" and "1.2" as addresses.
+//
+// Anything missing or malformed now falls back to DHCP and says so, which is
+// recoverable; a fault is not.
+static bool staticConfigRejected = false;
+static char staticConfigReason[40] = "";
+
+bool network_getStaticConfigRejected(const char **reason) {
+  if (reason != NULL) {
+    *reason = staticConfigReason;
+  }
+  return staticConfigRejected;
+}
+
+static void network_rejectStaticConfig(const char *reason) {
+  staticConfigRejected = true;
+  snprintf(staticConfigReason, sizeof(staticConfigReason), "%s", reason);
+  DPRINTF("Static IP rejected (%s); falling back to DHCP\n", reason);
+}
+
+// Four decimal octets and nothing else. Deliberately stricter than
+// ipaddr_addr(), which would take "10" or "1.2".
+static bool network_parseDottedQuad(const char *text, ip_addr_t *out) {
+  if (text == NULL) {
+    return false;
+  }
+  uint32_t octets[4] = {0};
+  int count = 0;
+  const char *p = text;
+  while (*p != '\0' && count < 4) {
+    if (*p < '0' || *p > '9') {
+      return false;
+    }
+    uint32_t value = 0;
+    int digits = 0;
+    while (*p >= '0' && *p <= '9') {
+      value = (value * 10u) + (uint32_t)(*p - '0');
+      digits++;
+      if (digits > 3 || value > 255u) {
+        return false;
+      }
+      p++;
+    }
+    octets[count++] = value;
+    if (*p == '.') {
+      p++;
+      if (*p == '\0') {
+        return false;  // trailing dot
+      }
+    } else if (*p != '\0') {
+      return false;
+    }
+  }
+  if (count != 4 || *p != '\0') {
+    return false;
+  }
+  IP4_ADDR(out, octets[0], octets[1], octets[2], octets[3]);
+  return true;
+}
+
+// Reads one setting as a dotted quad. Returns false with the reason already
+// reported when the key is missing, empty or malformed.
+static bool network_readDottedQuad(const char *key, const char *what,
+                                   ip_addr_t *out) {
+  SettingsConfigEntry *entry = settings_find_entry(gconfig_getContext(), key);
+  if (entry == NULL || entry->value[0] == '\0') {
+    char reason[40];
+    snprintf(reason, sizeof(reason), "no %s", what);
+    network_rejectStaticConfig(reason);
+    return false;
+  }
+  char buf[NETWORK_MAX_STRING_LENGTH];
+  snprintf(buf, sizeof(buf), "%s", entry->value);
+  if (!network_parseDottedQuad(network_trim_ascii_spaces(buf), out)) {
+    char reason[40];
+    snprintf(reason, sizeof(reason), "bad %s", what);
+    network_rejectStaticConfig(reason);
+    return false;
+  }
+  return true;
+}
+
+// A netmask has to be a run of ones followed by a run of zeros.
+static bool network_netmaskIsContiguous(const ip_addr_t *mask) {
+  uint32_t host = lwip_ntohl(ip4_addr_get_u32(ip_2_ip4(mask)));
+  if (host == 0u) {
+    return false;
+  }
+  uint32_t inverted = ~host;
+  return (inverted & (inverted + 1u)) == 0u;
 }
 
 static void network_resetStaInterface(struct netif *nif) {
@@ -423,7 +568,7 @@ int network_wifiInit(wifi_mode_t mode) {
     DPRINTF("SSID: %s\n", ssidStr);
 
     char passwordStr[WIFI_AP_PASS_MAX_LENGTH] = WIFI_AP_PASS;
-    DPRINTF("Password: %s\n", passwordStr);
+    DPRINTF("Password: %s\n", (passwordStr[0] != '\0') ? "<set>" : "<none>");
 
     int authInt = WIFI_AP_AUTH;  // WPA2_AES_PSK
 
@@ -454,34 +599,20 @@ int network_wifiInit(wifi_mode_t mode) {
     wifiCurrentMode = WIFI_MODE_AP;
   }
 
-  // Setting the power management
-  uint32_t pmValue = NETWORK_POWER_MGMT_DISABLED;  // 0: Disable PM
-  SettingsConfigEntry *pmEntry =
-      settings_find_entry(gconfig_getContext(), PARAM_WIFI_POWER);
-  if (pmEntry != NULL) {
-    pmValue = strtoul(pmEntry->value, NULL, HEX_BASE);
-  }
-  if (pmValue < NETWORK_POWER_MGMT_MAX_OPTIONS) {
-    switch (pmValue) {
-      case 0:
-        pmValue = NETWORK_POWER_MGMT_DISABLED;  // DISABLED_PM
-        break;
-      case 1:
-        pmValue = CYW43_PERFORMANCE_PM;  // PERFORMANCE_PM
-        break;
-      case 2:
-        pmValue = CYW43_AGGRESSIVE_PM;  // AGGRESSIVE_PM
-        break;
-      case 3:
-        pmValue = CYW43_DEFAULT_PM;  // DEFAULT_PM
-        break;
-      default:
-        pmValue = CYW43_NO_POWERSAVE_MODE;  // NO_POWERSAVE_MODE
-        break;
-    }
-  }
-  DPRINTF("Setting power management to: %08x\n", pmValue);
-  cyw43_wifi_pm(&cyw43_state, pmValue);
+  // PARAM_WIFI_POWER is deliberately ignored. Two
+  // reasons: it never reached the radio anyway, and no value of it is wanted.
+  //
+  // It never arrived because every connect calls network_resetStaInterface,
+  // which disables and re-enables STA mode. Disabling clears the only
+  // interface bit, so the re-enable runs cyw43_wifi_set_up with itf_state 0,
+  // and that path applies CYW43_DEFAULT_PM unconditionally
+  // (cyw43_ctrl.c:558-561) -- CYW43_PERFORMANCE_PM, a PM2 power-save mode.
+  // Whatever this function had set was overwritten before the first packet.
+  //
+  // And it is not wanted because this device answers an Atari that is waiting
+  // on the cartridge bus: a radio that sleeps between beacons adds latency to
+  // every reply for no benefit on a mains-powered board.
+  network_applyNoPowerSave();
   return 0;
 }
 #endif
@@ -500,107 +631,13 @@ void network_safePoll() {
   }
 }
 
-/**
- * @brief Scans for available Wi-Fi networks and stores the results.
- *
- * This function initiates a Wi-Fi network scan if the network is initialized
- * and the scan interval has elapsed. It processes the scan results and stores
- * unique networks in the global `wifi_scan_data` structure.
- *
- * @param wifi_scan_time Pointer to the absolute time of the last scan.
- * @param wifi_scan_interval Interval between scans in seconds.
- * @return int Returns 0 on success, -1 if the network is not initialized.
- */
-int network_scan(absolute_time_t *wifiScanTime, int wifiScanInterval) {
-  if (!cyw43Initialized) {
-    // If the network is not initialized, we cancel the scan
-    return -1;
-  }
-  int scan_result(void *env, const cyw43_ev_scan_result_t *result) {
-    // Check if the BSSID already exists in the found networks
-    bool bssid_exists(wifi_network_info_t * network) {
-      for (size_t i = 0; i < wifiScanData.count; i++) {
-        if (strcmp(wifiScanData.networks[i].bssid, network->bssid) == 0) {
-          return true;  // BSSID found
-        }
-      }
-      return false;  // BSSID not found
-    }
-    if (result && wifiScanData.count < MAX_NETWORKS) {
-      wifi_network_info_t network;
+// Wi-Fi scanning lived here: network_scan(), network_scanIsActive() and
+// network_getFoundNetworks(), with a 100-entry result table. Removed in v1.1.
+// Nothing ever called them -- scanning and Wi-Fi configuration belong
+// to Booster, which this app only reads settings from -- and the scan callbacks
+// were GCC nested functions, which clang-based tooling cannot parse, so the
+// dead code also cost every editor check in the file.
 
-      // Copy SSID
-      snprintf(network.ssid, sizeof(network.ssid), "%s", result->ssid);
-
-      // Format BSSID
-      snprintf(network.bssid, sizeof(network.bssid),
-               "%02x:%02x:%02x:%02x:%02x:%02x", result->bssid[0],
-               result->bssid[1], result->bssid[2], result->bssid[3],
-               result->bssid[4], result->bssid[5]);
-
-      // Store authentication mode
-      network.auth_mode = result->auth_mode;
-
-      // Store signal strength
-      network.rssi = result->rssi;
-
-      // Check if BSSID already exists
-      if (!bssid_exists(&network)) {
-        if (strlen(network.ssid) > 0) {
-          wifiScanData.networks[wifiScanData.count] = network;
-          wifiScanData.count++;
-          DPRINTF("FOUND NETWORK %s (%s) with auth %d and RSSI %d\n",
-                  network.ssid, network.bssid, network.auth_mode, network.rssi);
-        }
-      }
-    }
-    return 0;
-  }
-  // DPRINTF("Time diff: %lld\n", absolute_time_diff_us(get_absolute_time(),
-  // (absolute_time_t)*wifi_scan_time));
-  if (absolute_time_diff_us(get_absolute_time(), *wifiScanTime) < 0) {
-    if (!wifiScanInProgress) {
-      DPRINTF("Scanning networks...\n");
-      cyw43_wifi_scan_options_t scanOptions = {0};
-      int err = cyw43_wifi_scan(&cyw43_state, &scanOptions, NULL, scan_result);
-      if (err == 0) {
-        DPRINTF("Performing wifi scan\n");
-        wifiScanInProgress = true;
-      } else {
-        DPRINTF("Failed to start scan: %d\n", err);
-        *wifiScanTime = make_timeout_time_ms(wifiScanInterval * SEC_TO_MS);
-      }
-    } else {
-      if (!cyw43_wifi_scan_active(&cyw43_state)) {
-        DPRINTF("Continue scanning...\n");
-        wifiScanInProgress = false;
-      }
-      *wifiScanTime = make_timeout_time_ms(wifiScanInterval * SEC_TO_MS);
-    }
-  }
-  // else {
-  //     DPRINTF("Scan already in progress\n");
-  // }
-}
-
-int network_scanIsActive() {
-  if (!cyw43Initialized) {
-    // If the network is not initialized, we cancel the scan
-    DPRINTF("WiFi not initialized.\n");
-    return -1;
-  }
-  return (int)cyw43_wifi_scan_active(&cyw43_state);
-}
-
-/**
- * @brief Return the list of found networks.
- *
- * This function returns a pointer to the list of Wi-Fi networks that have been
- * found during a scan.
- *
- * @return wifi_scan_data_t* Pointer to the list of found Wi-Fi networks.
- */
-wifi_scan_data_t *network_getFoundNetworks() { return &wifiScanData; }
 
 static void wifiLinkCallback(struct netif *netif) {
   DPRINTF("WiFi Link: %s\n", (netif_is_link_up(netif) ? "UP" : "DOWN"));
@@ -657,7 +694,10 @@ static void srv_txt(struct mdns_service *service, void *txt_userdata) {
 }
 #endif
 
-wifi_sta_conn_process_status_t network_wifiStaConnect() {
+// Everything up to and including arming the asynchronous join. Split out of
+// network_wifiStaConnect so the link supervisor can start a rejoin without the
+// 30 s wait loop, which must never run inside the main loop.
+static wifi_sta_conn_process_status_t network_beginStaConnect(void) {
   if (!cyw43Initialized) {
     DPRINTF("WiFi not initialized. Cancelling connection\n");
     return NETWORK_WIFI_STA_CONN_ERR_NOT_INITIALIZED;
@@ -673,6 +713,9 @@ wifi_sta_conn_process_status_t network_wifiStaConnect() {
   // connect attempt (mDNS service, stale IP/status).
   struct netif *nif = &cyw43_state.netif[CYW43_ITF_STA];
   network_resetStaInterface(nif);
+  // The re-enable inside that reset just put CYW43_DEFAULT_PM back, so this
+  // has to run after it, on every boot attempt and every rejoin alike.
+  network_applyNoPowerSave();
 
   // Hostname is optional; PARAM_HOSTNAME may be missing entirely.
   SettingsConfigEntry *hostnameEntry =
@@ -730,16 +773,39 @@ wifi_sta_conn_process_status_t network_wifiStaConnect() {
     DPRINTF("DHCP enabled\n");
   } else {
     DPRINTF("Static IP enabled\n");
-    dhcp_stop(nif);
+    // Validate everything before touching the interface, so a bad setting
+    // leaves DHCP running instead of half-applying a broken configuration.
     ip_addr_t ipaddr;
     ip_addr_t netmask;
     ip_addr_t gwy;
-    ipaddr.addr = ipaddr_addr(
-        settings_find_entry(gconfig_getContext(), PARAM_WIFI_IP)->value);
-    netmask.addr = ipaddr_addr(
-        settings_find_entry(gconfig_getContext(), PARAM_WIFI_NETMASK)->value);
-    gwy.addr = ipaddr_addr(
-        settings_find_entry(gconfig_getContext(), PARAM_WIFI_GATEWAY)->value);
+    bool ok = network_readDottedQuad(PARAM_WIFI_IP, "IP", &ipaddr) &&
+              network_readDottedQuad(PARAM_WIFI_NETMASK, "netmask", &netmask) &&
+              network_readDottedQuad(PARAM_WIFI_GATEWAY, "gateway", &gwy);
+    if (ok && !network_netmaskIsContiguous(&netmask)) {
+      network_rejectStaticConfig("bad netmask");
+      ok = false;
+    }
+    if (ok) {
+      uint32_t host = lwip_ntohl(ip4_addr_get_u32(ip_2_ip4(&ipaddr)));
+      if (host == 0u || host == 0xFFFFFFFFu || (host >> 24) >= 224u) {
+        network_rejectStaticConfig("unusable IP");
+        ok = false;
+      }
+    }
+    if (ok && !ip4_addr_isany_val(*ip_2_ip4(&gwy))) {
+      uint32_t m = ip4_addr_get_u32(ip_2_ip4(&netmask));
+      if ((ip4_addr_get_u32(ip_2_ip4(&gwy)) & m) !=
+          (ip4_addr_get_u32(ip_2_ip4(&ipaddr)) & m)) {
+        network_rejectStaticConfig("gateway off subnet");
+        ok = false;
+      }
+    }
+    if (!ok) {
+      goto static_ip_done;  // DHCP stays on; the menu says why
+    }
+    staticConfigRejected = false;
+    staticConfigReason[0] = '\0';
+    dhcp_stop(nif);
     netif_set_addr(nif, &ipaddr, &netmask, &gwy);
     DPRINTF("IP: %s\n", ipaddr_ntoa(&ipaddr));
     DPRINTF("Netmask: %s\n", ipaddr_ntoa(&netmask));
@@ -786,6 +852,7 @@ wifi_sta_conn_process_status_t network_wifiStaConnect() {
         }
       }
     }
+  static_ip_done:;
   }
   netif_set_up(nif);
 
@@ -827,8 +894,11 @@ wifi_sta_conn_process_status_t network_wifiStaConnect() {
     DPRINTF(
         "No password found in config. Trying to connect without password\n");
   }
-  DPRINTF("The password is: %s\n",
-          passwordValue != NULL ? passwordValue : "<null>");
+  // Never the password itself: these logs get pasted into issues and chats.
+  // Whether one is set is all that helps when debugging.
+  DPRINTF("Password: %s\n",
+          (passwordValue != NULL && passwordValue[0] != '\0') ? "<set>"
+                                                              : "<none>");
 
   snprintf(wifiNetworkInfo.ssid, sizeof(wifiNetworkInfo.ssid), "%s", ssid->value);
   wifiNetworkInfo.auth_mode = (uint16_t)atoi(authMode->value);
@@ -838,12 +908,22 @@ wifi_sta_conn_process_status_t network_wifiStaConnect() {
   uint32_t authValue = getAuthPicoCode(atoi(authMode->value));
   int errorCode = 0;
   DPRINTF("Connecting to SSID=%s, password=%s, auth=%08x. ASYNC\n", ssid->value,
-          passwordValue != NULL ? passwordValue : "<null>", authValue);
+          (passwordValue != NULL && passwordValue[0] != '\0') ? "<set>"
+                                                              : "<none>",
+          authValue);
   errorCode =
       cyw43_arch_wifi_connect_async(ssid->value, passwordValue, authValue);
   if (errorCode != 0) {
     DPRINTF("Failed to connect to WiFi: %d\n", errorCode);
     return NETWORK_WIFI_STA_CONN_ERR_CONNECTION_FAILED;
+  }
+  return 0;
+}
+
+wifi_sta_conn_process_status_t network_wifiStaConnect() {
+  wifi_sta_conn_process_status_t armed = network_beginStaConnect();
+  if (armed != 0) {
+    return armed;
   }
 
   // Enter a loop until the device has a WiFi connection with an IP address. Or
@@ -854,6 +934,8 @@ wifi_sta_conn_process_status_t network_wifiStaConnect() {
   absolute_time_t wifiConnConnTimeout =
       make_timeout_time_ms(NETWORK_CONNECT_TIMEOUT * SEC_TO_MS);  // 30 seconds
   while (absolute_time_diff_us(get_absolute_time(), wifiConnConnTimeout) > 0) {
+    health_feed();
+    health_setPhase(HEALTH_PHASE_WIFI_CONNECT);
 #ifdef BLINK_H
     blink_morse('T');
 #endif
@@ -862,7 +944,10 @@ wifi_sta_conn_process_status_t network_wifiStaConnect() {
         network_wifiConnStatus(&wifiConnStatusTime, wifiConnPollingInterval);
 #if PICO_CYW43_ARCH_POLL
     network_safePoll();
-    cyw43_arch_wait_for_work_until(make_timeout_time_ms(2 * SEC_TO_MS));
+    // The polling callback below is the only thing servicing the ST, the
+    // terminal, USB and SELECT while this loop runs, so it has to turn at the
+    // main loop's rate rather than sleeping for seconds.
+    cyw43_arch_wait_for_work_until(make_timeout_time_ms(NETWORK_CONNECT_POLL_MS));
 #else
     sleep_ms(NETWORK_POLLING_INTERVAL);
 #endif
@@ -890,6 +975,208 @@ wifi_sta_conn_process_status_t network_wifiStaConnect() {
   DPRINTF("Connected. Check the connection status...\n");
   network_updateCurrentNetworkInfoRadio();
   return 0;
+}
+
+// --- Link supervisor ---
+//
+// Detection is deliberately based on the lwIP link status alone, after the
+// driver's join state was measured and ruled out.
+//
+// cyw43_ctrl.c collects AUTH, LINK and KEYED as a join progresses and then
+// **collapses the whole set back to ACTIVE** the moment it completes
+// (`if (wifi_join_state == WIFI_JOIN_STATE_ALL) wifi_join_state =
+// WIFI_JOIN_STATE_ACTIVE;`, cyw43_ctrl.c:434). Read on this hardware while the
+// API was serving requests normally, `wifi_join_state` is **0x0001** -- exactly
+// the value captured on a device that had silently dropped off the network. The
+// two states are indistinguishable in the driver, so the join bits cannot tell
+// a live link from a dead one, and watching them only produced a rejoin loop on
+// a perfectly healthy connection.
+//
+// What this supervisor does catch is an ordinary disconnect, where lwIP is told
+// the link is down. The silent case -- radio gone, driver and lwIP both still
+// reporting success -- needs a liveness probe and is not solved here.
+
+// The silent case: the radio leaves the network and both the driver and lwIP
+// keep reporting success, so nothing above notices. The only way to tell is to
+// ask something on the network to answer. An ARP request for the default
+// gateway is the cheapest question available -- no sockets, no DNS, no
+// internet, one small frame -- and the reply has to come over the air.
+//
+// The ARP cache is flushed first because a stale entry would answer for a dead
+// network. That costs one re-ARP for whoever we talk to next, which is why the
+// interval is minutes rather than seconds.
+static absolute_time_t nextProbeAt;
+static absolute_time_t probeDeadline;
+static bool probeInFlight = false;
+static bool probeStarted = false;
+static uint32_t probeFailures = 0;
+static uint32_t probeDeclaredDead = 0;
+
+uint32_t network_getProbeFailures(void) { return probeDeclaredDead; }
+
+static bool network_gatewayKnown(struct netif *nif) {
+  const ip4_addr_t *gw = netif_ip4_gw(nif);
+  struct eth_addr *eth = NULL;
+  const ip4_addr_t *ip = NULL;
+  return etharp_find_addr(nif, gw, &eth, &ip) >= 0;
+}
+
+// Returns true when the probe has concluded the network is gone.
+static bool network_pollGatewayProbe(struct netif *nif) {
+  const ip4_addr_t *gw = netif_ip4_gw(nif);
+  if (gw == NULL || ip4_addr_isany(gw)) {
+    return false;  // nothing to ask
+  }
+  absolute_time_t now = get_absolute_time();
+
+  if (!probeStarted) {
+    probeStarted = true;
+    nextProbeAt = delayed_by_ms(now, NETWORK_PROBE_INTERVAL_MS);
+    return false;
+  }
+
+  if (probeInFlight) {
+    if (network_gatewayKnown(nif)) {
+      probeInFlight = false;
+      probeFailures = 0;
+      nextProbeAt = delayed_by_ms(now, NETWORK_PROBE_INTERVAL_MS);
+      return false;
+    }
+    if (absolute_time_diff_us(now, probeDeadline) > 0) {
+      return false;  // still waiting for the reply
+    }
+    probeInFlight = false;
+    probeFailures++;
+    DPRINTF("WiFi probe: gateway did not answer (%lu/%u)\n",
+            (unsigned long)probeFailures, (unsigned)NETWORK_PROBE_FAILURES);
+    if (probeFailures >= NETWORK_PROBE_FAILURES) {
+      probeFailures = 0;
+      probeDeclaredDead++;
+      nextProbeAt = delayed_by_ms(now, NETWORK_PROBE_INTERVAL_MS);
+      DPRINTF(
+          "WiFi probe: network unreachable while the link claims to be up "
+          "-- forcing a rejoin\n");
+      return true;
+    }
+    // Ask again sooner than the full interval while it looks doubtful.
+    nextProbeAt = delayed_by_ms(now, NETWORK_PROBE_RETRY_MS);
+    return false;
+  }
+
+  if (absolute_time_diff_us(now, nextProbeAt) > 0) {
+    return false;  // not time yet
+  }
+
+  cyw43_arch_lwip_begin();
+  etharp_cleanup_netif(nif);
+  err_t err = etharp_request(nif, gw);
+  cyw43_arch_lwip_end();
+  if (err != ERR_OK) {
+    DPRINTF("WiFi probe: could not send the ARP request (%d)\n", (int)err);
+    nextProbeAt = delayed_by_ms(now, NETWORK_PROBE_RETRY_MS);
+    return false;
+  }
+  probeInFlight = true;
+  probeDeadline = delayed_by_ms(now, NETWORK_PROBE_TIMEOUT_MS);
+  return false;
+}
+
+static void network_resetGatewayProbe(void) {
+  probeInFlight = false;
+  probeStarted = false;
+  probeFailures = 0;
+}
+
+static absolute_time_t linkDownSince;
+static absolute_time_t nextRejoinAt;
+static bool linkSupervisorTripped = false;
+static uint32_t rejoinBackoffMs = NETWORK_REJOIN_BACKOFF_MIN_MS;
+static uint32_t rejoinAttempts = 0;
+
+uint32_t network_getRejoinAttempts(void) { return rejoinAttempts; }
+
+bool network_isLinkHealthy(void) {
+  if (!cyw43Initialized || wifiCurrentMode != WIFI_MODE_STA) {
+    return false;
+  }
+  return cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) ==
+         CYW43_LINK_UP;
+}
+
+void network_superviseLink(void) {
+  if (!cyw43Initialized || wifiCurrentMode != WIFI_MODE_STA) {
+    return;
+  }
+
+  struct netif *nif = &cyw43_state.netif[CYW43_ITF_STA];
+
+  if (network_isLinkHealthy()) {
+    if (linkSupervisorTripped) {
+      DPRINTF("WiFi supervisor: link healthy again after %lu attempt(s)\n",
+              (unsigned long)rejoinAttempts);
+      linkSupervisorTripped = false;
+      rejoinBackoffMs = NETWORK_REJOIN_BACKOFF_MIN_MS;
+      network_resetGatewayProbe();
+    }
+    // lwIP is satisfied, which is exactly what it was during the failure this
+    // supervisor exists for. Ask the network itself.
+    if (!network_pollGatewayProbe(nif)) {
+      return;
+    }
+    // An unreachable network is treated as a link that is down.
+    snprintf(connectionStatusStr, sizeof(connectionStatusStr), "UNREACHABLE");
+    linkSupervisorTripped = true;
+    linkDownSince = get_absolute_time();
+    nextRejoinAt = get_absolute_time();
+    rejoinBackoffMs = NETWORK_REJOIN_BACKOFF_MIN_MS;
+    network_resetGatewayProbe();
+  }
+
+  absolute_time_t now = get_absolute_time();
+  if (!linkSupervisorTripped) {
+    // Give an ordinary reconnect a moment to finish before interfering: a
+    // rejoin in progress looks exactly like a link that is down.
+    linkSupervisorTripped = true;
+    linkDownSince = now;
+    nextRejoinAt = delayed_by_ms(now, NETWORK_LINK_DOWN_GRACE_MS);
+    rejoinBackoffMs = NETWORK_REJOIN_BACKOFF_MIN_MS;
+    DPRINTF("WiFi supervisor: link down (tcpip status %d)\n",
+            cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA));
+    snprintf(connectionStatusStr, sizeof(connectionStatusStr), "REJOINING");
+    return;
+  }
+
+  if (absolute_time_diff_us(now, nextRejoinAt) > 0) {
+    return;  // waiting out the grace period or the backoff
+  }
+
+  // A wrong key is worth retrying -- a router can come back with the right one
+  // -- but not every few seconds.
+  if (cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA) ==
+      CYW43_LINK_BADAUTH) {
+    rejoinBackoffMs = NETWORK_REJOIN_BACKOFF_MAX_MS;
+    snprintf(connectionStatusStr, sizeof(connectionStatusStr), "BAD AUTH");
+  }
+
+  rejoinAttempts++;
+  DPRINTF("WiFi supervisor: rejoin attempt %lu, down for %lld ms\n",
+          (unsigned long)rejoinAttempts,
+          absolute_time_diff_us(linkDownSince, now) / 1000);
+  // Tearing the interface down and arming the join takes tens of milliseconds
+  // of SPI traffic to the radio, so keep the watchdog fed across it.
+  health_feed();
+  wifi_sta_conn_process_status_t armed = network_beginStaConnect();
+  health_feed();
+  network_resetGatewayProbe();
+  if (armed != 0) {
+    DPRINTF("WiFi supervisor: rejoin could not be armed (%d)\n", (int)armed);
+  }
+
+  nextRejoinAt = delayed_by_ms(get_absolute_time(), rejoinBackoffMs);
+  rejoinBackoffMs *= 2;
+  if (rejoinBackoffMs > NETWORK_REJOIN_BACKOFF_MAX_MS) {
+    rejoinBackoffMs = NETWORK_REJOIN_BACKOFF_MAX_MS;
+  }
 }
 
 char *network_wifiConnStatusStr() { return connectionStatusStr; }

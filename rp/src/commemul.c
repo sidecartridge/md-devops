@@ -24,10 +24,18 @@
 #define COMM_RING_WORDS (COMM_RING_SIZE_BYTES / sizeof(uint16_t))
 #define COMM_RING_MASK (COMM_RING_WORDS - 1u)
 #define COMM_DMA_TRANSFER_COUNT (0xFFFFFFFFu)
+// Re-arm the DMA channel once this many samples have been captured,
+// long before the transfer count runs out and capture stops.
+#define COMM_DMA_REARM_THRESHOLD (0x80000000u)
 
 static uint16_t commRing[COMM_RING_WORDS]
     __attribute__((aligned(COMM_RING_SIZE_BYTES)));
 static uint32_t commReadIdx = 0;
+// Samples captured since the channel was last armed, as of the last poll.
+static uint32_t commLastWritten = 0;
+// Ring index the channel was armed at.
+static uint32_t commArmIdx = 0;
+static uint32_t commOverruns = 0;
 static int commDmaChannel = -1;
 static int commSm = -1;
 static bool commInitialized = false;
@@ -95,10 +103,43 @@ void __not_in_flash_func(commemul_poll)(CommEmulSampleCallback callback) {
 
   uint32_t transfersWritten =
       COMM_DMA_TRANSFER_COUNT - dma_hw->ch[commDmaChannel].transfer_count;
-  uint32_t writeIdx = transfersWritten & COMM_RING_MASK;
+  uint32_t writeIdx = (commArmIdx + transfersWritten) & COMM_RING_MASK;
+
+  // The ring holds COMM_RING_WORDS samples. When that many or more
+  // arrived since the last poll (exactly that many reads as an empty
+  // ring), the DMA lapped the reader and the unread samples are a mix of
+  // old and new data. Count it and drop them.
+  uint32_t unread = transfersWritten - commLastWritten;
+  commLastWritten = transfersWritten;
+  if (unread >= COMM_RING_WORDS) {
+    commOverruns++;
+    commReadIdx = writeIdx;
+    return;
+  }
 
   while (commReadIdx != writeIdx) {
     callback(commRing[commReadIdx]);
     commReadIdx = (commReadIdx + 1u) & COMM_RING_MASK;
   }
+
+  if (transfersWritten >= COMM_DMA_REARM_THRESHOLD) {
+    // Restart the channel where it is writing now, so the ring carries
+    // on. The transfer count is only meaningful while the channel runs,
+    // so take the position from the live write address. Samples written
+    // since the drain above stay unread from commReadIdx, and samples
+    // arriving during the restart wait in the PIO FIFO.
+    dma_channel_abort(commDmaChannel);
+    uint32_t idx =
+        ((dma_hw->ch[commDmaChannel].write_addr - (uint32_t)commRing) /
+         sizeof(uint16_t)) &
+        COMM_RING_MASK;
+    commArmIdx = idx;
+    commLastWritten = 0;
+    dma_channel_set_write_addr(commDmaChannel, &commRing[idx], false);
+    dma_channel_set_trans_count(commDmaChannel, COMM_DMA_TRANSFER_COUNT, false);
+    dma_channel_start(commDmaChannel);
+    DPRINTF("commemul: DMA re-armed at ring index %lu\n", (unsigned long)idx);
+  }
 }
+
+uint32_t commemul_getOverruns(void) { return commOverruns; }

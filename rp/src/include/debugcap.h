@@ -110,8 +110,7 @@ void debugcap_cursor_skipToNow(debugcap_cursor_t *cur);
  *        producer (chandler ingest) and single-core consumers
  *        (HTTP poll context + main-loop USB drain). No memory
  *        barriers are issued on producer/consumer hand-off. If
- *        a future change moves any consumer to Core 1 (see the
- *        "full Core 1 worker" backlog entry on), the
+ *        a future change moves any consumer to Core 1, the
  *        store-then-increment in `debugcap_emit` and the
  *        `g_debugWritePos` reads in `debugcap_cursor_*` will
  *        need explicit barriers to preserve ordering.
