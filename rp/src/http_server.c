@@ -27,6 +27,7 @@
 #include "pico/cyw43_arch.h"
 #include "pico/time.h"
 #include "runner.h"
+#include "select.h"
 #include "settings.h"
 #include "usbcdc.h"
 
@@ -69,11 +70,21 @@ extern unsigned char __rom_in_ram_start__[];
 // Hard cap on a single upload (PUT) body. Per the locked spec.
 #define HTTP_MAX_UPLOAD_BYTES (4u * 1024u * 1024u)
 
-// Idle-connection sweeper: tcp_poll fires every (4 × tcp_poll_interval) /
-// 2 seconds. With interval 8, that's 16 seconds per tick; we close on
-// the first tick, so a connection that never sends a complete request
-// is closed in ~16 s.
+// Idle-connection sweeper. tcp_poll fires every HTTP_POLL_INTERVAL slow
+// ticks, and a slow tick is 500 ms, so interval 8 is one call every 4 s --
+// not the 16 s an earlier comment here claimed.
+//
+// A poll is not evidence of an idle connection. lwIP restarts a pcb's poll
+// timer only when the peer acknowledges data the server sent
+// (core/tcp_in.c), and during an upload or a Runner advanced-load body the
+// server sends nothing, so the timer keeps running however fast the data
+// arrives. Closing on the first tick therefore killed every transfer that
+// lasted more than about 4 s: a 4 MB upload, a slow client, or a fast one
+// whose burst outran a reply. The sweeper now closes a connection only
+// after HTTP_IDLE_TIMEOUT_MS with no traffic in either direction, which is
+// what "idle" was meant to mean.
 #define HTTP_POLL_INTERVAL 8
+#define HTTP_IDLE_TIMEOUT_MS 20000u
 
 typedef enum {
   HC_FREE = 0,
@@ -124,6 +135,7 @@ typedef struct http_conn {
   char resp[HTTP_RESPONSE_BUF_BYTES];
   size_t resp_len;
   size_t resp_sent;
+  bool resp_queued;  // resp is in lwIP's send queue; false means retry it
 
   // Streaming directory listing state. Active while state ==
   // HC_STREAM_LISTING; the dir handle outlives a single TCP recv/sent
@@ -143,6 +155,7 @@ typedef struct http_conn {
   uint32_t stream_end;       // one-past-last byte to send (file size or
                              // Range slice end)
   bool holds_body_lock;      // this conn holds the body-stream lock
+  uint32_t last_activity_ms;  // last traffic either way; the sweeper's clock
 
   // Streaming file upload state. Active while state == HC_STREAM_UPLOAD;
   // FIL handle released by conn_close (and the partial file unlinked
@@ -193,10 +206,13 @@ static bool g_body_stream_busy = false;
 static http_conn_t *conn_alloc(void);
 static void conn_free(http_conn_t *c);
 static void conn_close(http_conn_t *c);
+static bool conn_takeAborted(void);
 
-static void parse_and_dispatch(http_conn_t *c);
+static void parse_and_dispatch(http_conn_t *c, struct pbuf *seg,
+                               size_t body_off);
 static void route(http_conn_t *c);
 static void __not_in_flash_func(send_buffered)(http_conn_t *c);
+static void __not_in_flash_func(send_buffered_try)(http_conn_t *c);
 
 static void write_response(http_conn_t *c, int status, const char *reason,
                            const char *content_type, const char *body,
@@ -222,16 +238,20 @@ static void srv_err_cb(void *arg, err_t err);
 static void stream_listing_drive(http_conn_t *c);
 static void __not_in_flash_func(stream_download_drive)(http_conn_t *c);
 static void stream_debug_drive(http_conn_t *c);
+static void __not_in_flash_func(stream_download_drive)(http_conn_t *c);
+static void stream_listing_drive(http_conn_t *c);
 // Chunked-encoding helpers (definitions further down).
 static err_t __not_in_flash_func(stream_send_chunk)(http_conn_t *c, const char *body,
                                size_t body_len);
 static err_t stream_send_terminator(http_conn_t *c);
-static bool handle_file_upload_init(http_conn_t *c, const char *body_start,
-                                    size_t leftover);
+static bool upload_drain_pbuf(http_conn_t *c, struct pbuf *seg, size_t off,
+                              size_t n, FRESULT *fr_out);
+static bool handle_file_upload_init(http_conn_t *c, struct pbuf *seg,
+                                    size_t body_off, size_t leftover);
 static void upload_finish_ok(http_conn_t *c);
-static bool handle_runner_adv_load_init(http_conn_t *c, const char *body_start,
-                                        size_t leftover);
-static void adv_load_drain_pbuf(http_conn_t *c, struct pbuf *p, size_t off,
+static bool handle_runner_adv_load_init(http_conn_t *c, struct pbuf *seg,
+                                        size_t body_off, size_t leftover);
+static bool adv_load_drain_pbuf(http_conn_t *c, struct pbuf *p, size_t off,
                                 size_t n);
 static bool adv_load_dispatch_chunk(http_conn_t *c);
 static void adv_load_finish_ok(http_conn_t *c);
@@ -282,6 +302,9 @@ void http_server_deinit(void) {
       conn_close(&g_conns[i]);
     }
   }
+  // Not inside a callback, so there is nobody to return ERR_ABRT: drop the
+  // flag rather than leave it for the next one.
+  (void)conn_takeAborted();
 }
 
 // --- Connection lifecycle ---
@@ -302,7 +325,61 @@ static void conn_free(http_conn_t *c) {
   c->state = HC_FREE;
 }
 
-static void conn_close(http_conn_t *c) {
+// Copy n body bytes out of seg (starting at off) into the upload file,
+// in chunks of the response buffer. Returns false and the FatFs error on
+// a short or failed write.
+static bool upload_drain_pbuf(http_conn_t *c, struct pbuf *seg, size_t off,
+                              size_t n, FRESULT *fr_out) {
+  size_t done = 0;
+  while (done < n) {
+    size_t chunk = n - done;
+    if (chunk > sizeof(c->resp)) chunk = sizeof(c->resp);
+    pbuf_copy_partial(seg, c->resp, (u16_t)chunk, (u16_t)(off + done));
+    UINT written = 0;
+    // Extending a multi-megabyte file makes FatFs walk the cluster chain, so
+    // a single write can outlast the watchdog. Feed it either side, the way
+    // the GEMDRIVE write path does, and name the phase so a real hang here
+    // is still reported as one (CLAUDE.md).
+    health_setPhase(HEALTH_PHASE_HTTP_REQUEST);
+    health_feed();
+    FRESULT fr = f_write(&c->upload_file, c->resp, (UINT)chunk, &written);
+    health_feed();
+    if (fr != FR_OK || written != chunk) {
+      DPRINTF("http_server: upload f_write failed (%d, %u/%zu)\n", (int)fr,
+              (unsigned)written, chunk);
+      *fr_out = fr;
+      return false;
+    }
+    done += chunk;
+  }
+  return true;
+}
+
+// What a spin-wait owes the rest of the firmware. Six HTTP handlers block
+// inside srv_recv_cb while the ST answers -- up to 10 s for a Runner load --
+// and nothing else runs meanwhile, so each turn of those loops has to feed the
+// watchdog, drain the cartridge ring the ST is waiting on, poll SELECT so the
+// button still resets the device, and push queued console bytes out of USB.
+static void http_spinTick(void) {
+  health_feed();
+  health_setPhase(HEALTH_PHASE_HTTP_WAIT);
+  chandler_loop();
+  select_checkPushReset();
+  usbcdc_drain();
+}
+
+// Traffic in either direction keeps a connection alive for the sweeper.
+static void conn_touch(http_conn_t *c) {
+  c->last_activity_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
+}
+
+// Everything this connection holds that is not the pcb. Split out of
+// conn_close so the error path can release it too: lwIP frees the pcb itself
+// and calls srv_err_cb, which used to drop the slot and leak the rest -- the
+// body-stream lock (every later transfer answering 503 busy until a reset),
+// FatFs handles counted against FF_FS_LOCK and shared with GEMDRIVE, and a
+// half-written upload left on the card.
+static void conn_release_resources(http_conn_t *c) {
   if (c->stream_dir_open) {
     f_closedir(&c->stream_dir);
     c->stream_dir_open = false;
@@ -327,6 +404,23 @@ static void conn_close(http_conn_t *c) {
     g_body_stream_busy = false;
     c->holds_body_lock = false;
   }
+}
+
+// Set when conn_close had to abort a pcb. lwIP requires the callback that
+// caused the abort to return ERR_ABRT (core/tcp.c, tcp_abort docs), and
+// conn_close is called from deep inside the response writers, so it reports
+// through this flag rather than a return value threaded through every call
+// site. Each callback clears it with conn_takeAborted() on the way out.
+static bool g_conn_aborted;
+
+static bool conn_takeAborted(void) {
+  bool aborted = g_conn_aborted;
+  g_conn_aborted = false;
+  return aborted;
+}
+
+static void conn_close(http_conn_t *c) {
+  conn_release_resources(c);
   if (c->pcb != NULL) {
     struct tcp_pcb *pcb = c->pcb;
     tcp_arg(pcb, NULL);
@@ -334,9 +428,13 @@ static void conn_close(http_conn_t *c) {
     tcp_sent(pcb, NULL);
     tcp_poll(pcb, NULL, 0);
     tcp_err(pcb, NULL);
+    // tcp_close only fails on a NULL pcb in this lwIP (ERR_MEM is deferred
+    // through TF_CLOSEPEND), so the abort is unreachable today -- but if it
+    // ever runs, the callback we are inside has to return ERR_ABRT.
     err_t err = tcp_close(pcb);
     if (err != ERR_OK) {
       tcp_abort(pcb);
+      g_conn_aborted = true;
     }
   }
   conn_free(c);
@@ -356,6 +454,7 @@ static err_t srv_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
     return ERR_ABRT;
   }
   c->pcb = newpcb;
+  conn_touch(c);
   tcp_arg(newpcb, c);
   tcp_recv(newpcb, srv_recv_cb);
   tcp_sent(newpcb, srv_sent_cb);
@@ -368,10 +467,14 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
                          err_t err) {
   http_conn_t *c = (http_conn_t *)arg;
   if (c == NULL) {
+    // Nobody owns this pcb. Returning any other error would make lwIP keep
+    // the pbuf we just freed and deliver it again (core/tcp_in.c), so abort
+    // and report the abort, which is the one contract-legal way out.
     if (p != NULL) {
       pbuf_free(p);
     }
-    return ERR_VAL;
+    tcp_abort(pcb);
+    return ERR_ABRT;
   }
   if (err != ERR_OK || p == NULL) {
     // Peer closed or error; either way the connection is done.
@@ -379,10 +482,22 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
       pbuf_free(p);
     }
     conn_close(c);
-    return ERR_OK;
+    return conn_takeAborted() ? ERR_ABRT : ERR_OK;
   }
+  conn_touch(c);
+  // Account for the segment here, once. A response writer can close the
+  // connection (a failed write, a FatFs error, a Runner timeout), and
+  // tcp_recved() on a closed pcb touches one lwIP has already purged and
+  // queued to be freed.
+  tcp_recved(pcb, p->tot_len);
 
   if (c->state == HC_READ_HEADERS) {
+    // Only the headers go into c->hdr. Body bytes that shared this
+    // segment with them stay in the pbuf and are handed to the
+    // dispatcher by offset: copying them into c->hdr would drop
+    // everything past HTTP_HEADER_BUF_BYTES while the tcp_recved above
+    // still tells the peer they arrived.
+    size_t hdr_before = c->hdr_len;
     size_t to_copy = p->tot_len;
     size_t remaining =
         (c->hdr_len < HTTP_HEADER_BUF_BYTES - 1)
@@ -396,14 +511,18 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
       c->hdr_len += to_copy;
       c->hdr[c->hdr_len] = '\0';
     }
-    tcp_recved(pcb, p->tot_len);
-    pbuf_free(p);
 
-    if (strstr(c->hdr, "\r\n\r\n") != NULL) {
-      parse_and_dispatch(c);
+    char *eoh = strstr(c->hdr, "\r\n\r\n");
+    if (eoh != NULL) {
+      // The terminator completed in this segment, so the first body
+      // byte is that many bytes into it.
+      size_t header_bytes = (size_t)(eoh + 4 - c->hdr);
+      size_t body_off = header_bytes - hdr_before;
+      parse_and_dispatch(c, p, body_off);
     } else if (c->hdr_len >= HTTP_HEADER_BUF_BYTES - 1) {
       write_error(c, 400, "Bad Request", "bad_request", "Headers too large");
     }
+    pbuf_free(p);
   } else if (c->state == HC_READ_BODY) {
     size_t need = c->content_length - c->body_received;
     size_t take = (p->tot_len < need) ? p->tot_len : need;
@@ -411,7 +530,6 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
       pbuf_copy_partial(p, c->body + c->body_received, (u16_t)take, 0);
       c->body_received += take;
     }
-    tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
     if (c->body_received >= c->content_length) {
       route(c);
@@ -422,29 +540,16 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
     // success response and close.
     size_t want = c->content_length - c->upload_received;
     size_t take = (p->tot_len < want) ? p->tot_len : want;
-    size_t off = 0;
-    while (off < take) {
-      size_t chunk = take - off;
-      if (chunk > sizeof(c->resp)) chunk = sizeof(c->resp);
-      pbuf_copy_partial(p, c->resp, (u16_t)chunk, (u16_t)off);
-      UINT written = 0;
-      FRESULT fr =
-          f_write(&c->upload_file, c->resp, (UINT)chunk, &written);
-      if (fr != FR_OK || written != chunk) {
-        DPRINTF("http_server: upload f_write failed (%d, %u/%zu)\n",
-                (int)fr, (unsigned)written, chunk);
-        // Surface 500 to the client; conn_close closes the FIL and
-        // unlinks the partial file when the response has been drained.
-        write_fs_error(c, fr, "f_write failed mid-upload");
-        tcp_recved(pcb, p->tot_len);
-        pbuf_free(p);
-        return ERR_OK;
-      }
-      off += chunk;
+    FRESULT fr = FR_OK;
+    bool written = upload_drain_pbuf(c, p, 0, take, &fr);
+    pbuf_free(p);
+    if (!written) {
+      // Surface 500 to the client; conn_close closes the FIL and
+      // unlinks the partial file when the response has been drained.
+      write_fs_error(c, fr, "f_write failed mid-upload");
+      return conn_takeAborted() ? ERR_ABRT : ERR_OK;
     }
     c->upload_received += take;
-    tcp_recved(pcb, p->tot_len);
-    pbuf_free(p);
     if (c->upload_received >= c->content_length) {
       upload_finish_ok(c);
     }
@@ -455,21 +560,22 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
     // client may have sent more than we'll honour.
     size_t want = (size_t)(c->adv_load_total - c->adv_load_received);
     size_t take = (p->tot_len < want) ? p->tot_len : want;
-    if (take > 0) {
-      adv_load_drain_pbuf(c, p, 0, take);
-    }
-    tcp_recved(pcb, p->tot_len);
+    bool drained = (take == 0) || adv_load_drain_pbuf(c, p, 0, take);
     pbuf_free(p);
+    if (!drained) {
+      // A chunk dispatch timed out; the 504 is already written and the
+      // load is over. Finishing it here would re-fire the failed chunk.
+      return conn_takeAborted() ? ERR_ABRT : ERR_OK;
+    }
     if (c->adv_load_received >= c->adv_load_total) {
       adv_load_finish_ok(c);
     }
   } else {
     // Already writing the response (or draining); discard any extra
     // bytes the client sent.
-    tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
   }
-  return ERR_OK;
+  return conn_takeAborted() ? ERR_ABRT : ERR_OK;
 }
 
 static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u16_t len) {
@@ -478,6 +584,7 @@ static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u1
   if (c == NULL) {
     return ERR_OK;
   }
+  conn_touch(c);
   c->resp_sent += len;
   if (c->state == HC_WRITE_RESPONSE && c->resp_sent >= c->resp_len) {
     c->state = HC_DRAINING;
@@ -494,7 +601,7 @@ static err_t __not_in_flash_func(srv_sent_cb)(void *arg, struct tcp_pcb *pcb, u1
     // ack'd; safe to close.
     conn_close(c);
   }
-  return ERR_OK;
+  return conn_takeAborted() ? ERR_ABRT : ERR_OK;
 }
 
 static err_t srv_poll_cb(void *arg, struct tcp_pcb *pcb) {
@@ -508,19 +615,46 @@ static err_t srv_poll_cb(void *arg, struct tcp_pcb *pcb) {
   // Try to push any bytes that may have arrived since the last drive.
   if (c->state == HC_STREAM_DEBUG) {
     stream_debug_drive(c);
+    return conn_takeAborted() ? ERR_ABRT : ERR_OK;
+  }
+  // Anything lwIP had no room for is still owed to the client, and a writer
+  // that stopped on ERR_MEM with nothing unacknowledged never gets a sent
+  // callback to wake it -- poll is the only thing that can retry. Falls
+  // through to the idle check below, so a peer that has really gone away is
+  // still swept.
+  if (c->state == HC_WRITE_RESPONSE && !c->resp_queued) {
+    send_buffered_try(c);
+  } else if (c->state == HC_STREAM_DOWNLOAD) {
+    stream_download_drive(c);
+  } else if (c->state == HC_STREAM_LISTING) {
+    stream_listing_drive(c);
+  }
+  if (c->state == HC_FREE) {
+    return conn_takeAborted() ? ERR_ABRT : ERR_OK;  // the retry closed it
+  }
+  uint32_t idle_ms =
+      (uint32_t)to_ms_since_boot(get_absolute_time()) - c->last_activity_ms;
+  if (idle_ms < HTTP_IDLE_TIMEOUT_MS) {
     return ERR_OK;
   }
-  DPRINTF("http_server: idle timeout, closing connection\n");
+  DPRINTF(
+      "http_server: idle for %lu ms, closing connection (state %d, "
+      "upload %lu/%lu)\n",
+      (unsigned long)idle_ms, (int)c->state, (unsigned long)c->upload_received,
+      (unsigned long)c->content_length);
   conn_close(c);
-  return ERR_OK;
+  return conn_takeAborted() ? ERR_ABRT : ERR_OK;
 }
 
 static void srv_err_cb(void *arg, err_t err) {
-  (void)err;
   http_conn_t *c = (http_conn_t *)arg;
   if (c != NULL) {
-    // pcb is already gone per lwIP contract; just release the slot.
+    // The pcb is already gone per lwIP's contract, but everything else this
+    // connection holds is ours to release.
+    DPRINTF("http_server: connection killed by lwIP (err %d), releasing\n",
+            (int)err);
     c->pcb = NULL;
+    conn_release_resources(c);
     conn_free(c);
   }
 }
@@ -556,7 +690,8 @@ static hc_method_t parse_method(const char *s, size_t n) {
   return HM_UNKNOWN;
 }
 
-static void parse_and_dispatch(http_conn_t *c) {
+static void parse_and_dispatch(http_conn_t *c, struct pbuf *seg,
+                               size_t body_off) {
   // Request line
   char *eol = strstr(c->hdr, "\r\n");
   if (eol == NULL) {
@@ -689,15 +824,12 @@ static void parse_and_dispatch(http_conn_t *c) {
 
   c->is_head = (c->method == HM_HEAD);
 
-  // Compute the body-segment bytes that fell after the headers in the
-  // same TCP segment. Used both by the upload streaming path (which
-  // writes them straight to the file) and by the generic JSON-body
-  // path (which buffers them into c->body).
-  char *body_start = p + 2;
-  size_t header_consumed_total = (size_t)(body_start - c->hdr);
-  size_t body_leftover = (c->hdr_len > header_consumed_total)
-                             ? c->hdr_len - header_consumed_total
-                             : 0;
+  // Body bytes that fell after the headers in the same TCP segment are
+  // still in the pbuf at body_off. Used both by the streaming paths
+  // (which drain them straight to their destination) and by the
+  // generic JSON-body path (which buffers them into c->body).
+  size_t body_leftover =
+      (seg != NULL && seg->tot_len > body_off) ? seg->tot_len - body_off : 0;
 
   // Special-case PUT-on-/api/v1/gemdrive/files/ for streaming upload — it
   // bypasses the small JSON-body buffer (which has a 256-byte cap)
@@ -708,7 +840,7 @@ static void parse_and_dispatch(http_conn_t *c) {
       strncmp(c->path, files_prefix, files_prefix_len) == 0) {
     size_t leftover = body_leftover;
     if (leftover > c->content_length) leftover = c->content_length;
-    if (!handle_file_upload_init(c, body_start, leftover)) {
+    if (!handle_file_upload_init(c, seg, body_off, leftover)) {
       return;  // upload_init already wrote the error response
     }
     if (c->upload_received >= c->content_length) {
@@ -728,7 +860,7 @@ static void parse_and_dispatch(http_conn_t *c) {
       strcmp(c->path, "/api/v1/runner/adv/load") == 0) {
     size_t leftover = body_leftover;
     if (leftover > c->content_length) leftover = c->content_length;
-    if (!handle_runner_adv_load_init(c, body_start, leftover)) {
+    if (!handle_runner_adv_load_init(c, seg, body_off, leftover)) {
       return;  // init wrote the error response
     }
     if (c->adv_load_received >= c->adv_load_total) {
@@ -751,14 +883,10 @@ static void parse_and_dispatch(http_conn_t *c) {
                   "Body too large for this route");
       return;
     }
-    // body_start / body_leftover were computed above. The header
-    // parser nul-terminated each header it walked but c->hdr_len is
-    // the original byte count copied off the wire, so anything past
-    // body_start is body that arrived in the same segment.
     size_t leftover = body_leftover;
     if (leftover > c->content_length) leftover = c->content_length;
     if (leftover > 0) {
-      memcpy(c->body, body_start, leftover);
+      pbuf_copy_partial(seg, c->body, (u16_t)leftover, (u16_t)body_off);
       c->body_received = leftover;
     }
     if (c->body_received >= c->content_length) {
@@ -1698,9 +1826,7 @@ static void handle_runner_load(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_LOAD_TIMEOUT_US);
   while (emul_isRunnerBusy()) {
-    health_feed();
-    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
-    chandler_loop();
+    http_spinTick();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
       // Treat the timeout as a load failure with a synthetic
@@ -1829,9 +1955,7 @@ static void handle_runner_unload(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_UNLOAD_TIMEOUT_US);
   while (emul_isRunnerBusy()) {
-    health_feed();
-    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
-    chandler_loop();
+    http_spinTick();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
       // Synthetic timeout failure — keeps state consistent
@@ -2227,9 +2351,8 @@ static uint8_t *adv_load_buf_base(void) {
 // dispatch the chunk and reset the cursor for the next one. The
 // final partial chunk (chunk_pos > 0 at end-of-content) is flushed
 // by adv_load_finish_ok().
-static void adv_load_drain_pbuf(http_conn_t *c,
-                                                     struct pbuf *p,
-                                                     size_t off, size_t n) {
+static bool adv_load_drain_pbuf(http_conn_t *c, struct pbuf *p, size_t off,
+                                size_t n) {
   uint8_t *base = adv_load_buf_base();
   // Walk pbuf segments to avoid an O(n) intermediate copy through
   // pbuf_copy_partial. Same shape as pbuf_get_at, but we can't use
@@ -2252,10 +2375,11 @@ static void adv_load_drain_pbuf(http_conn_t *c,
       // will keep draining bytes into nowhere; the response is
       // already a 504 so the client sees the failure.
       if (!adv_load_dispatch_chunk(c)) {
-        return;
+        return false;
       }
     }
   }
+  return true;
 }
 
 // Publish (target, len) in shared-var slots 18/19, fire
@@ -2277,9 +2401,7 @@ static bool adv_load_dispatch_chunk(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), ADV_LOAD_TIMEOUT_US);
   while (!emul_isRunnerAdvLoadAcked()) {
-    health_feed();
-    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
-    chandler_loop();
+    http_spinTick();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       DPRINTF("adv_load: chunk dispatch timed out at target=0x%lX len=%lu\n",
               (unsigned long)c->adv_load_target, (unsigned long)len);
@@ -2318,8 +2440,8 @@ static void adv_load_finish_ok(http_conn_t *c) {
 // body bytes that arrived in the same TCP segment as the headers.
 // Returns false if any validation failed (an error response was
 // already written).
-static bool handle_runner_adv_load_init(
-    http_conn_t *c, const char *body_start, size_t leftover) {
+static bool handle_runner_adv_load_init(http_conn_t *c, struct pbuf *seg,
+                                        size_t body_off, size_t leftover) {
   if (!emul_isRunnerActive()) {
     write_error(c, 409, "Conflict", "runner_inactive",
                 "Runner mode is not active; boot via [U] first");
@@ -2399,9 +2521,7 @@ static bool handle_runner_adv_load_init(
     absolute_time_t deadline =
         delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
     while (!emul_isRunnerMeminfoReady()) {
-      health_feed();
-      health_setPhase(HEALTH_PHASE_HTTP_WAIT);
-      chandler_loop();
+      http_spinTick();
       if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
         runner_meminfo_t empty = {0};
         uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
@@ -2437,20 +2557,11 @@ static bool handle_runner_adv_load_init(
   c->adv_load_chunk_pos = 0;
 
   // Pump the leftover bytes that arrived in the same TCP segment as
-  // the headers directly into the chunk buffer. pbuf-free isn't
-  // available here (no pbuf to walk); instead loop byte-by-byte.
+  // the headers directly into the chunk buffer.
   size_t pump = leftover;
   if (pump > c->adv_load_total) pump = c->adv_load_total;
-  uint8_t *base = adv_load_buf_base();
-  for (size_t i = 0; i < pump; i++) {
-    base[c->adv_load_chunk_pos ^ 1u] = (uint8_t)body_start[i];
-    c->adv_load_chunk_pos++;
-    c->adv_load_received++;
-    if (c->adv_load_chunk_pos >= ADV_LOAD_CHUNK_SIZE) {
-      if (!adv_load_dispatch_chunk(c)) {
-        return false;
-      }
-    }
+  if (pump > 0 && !adv_load_drain_pbuf(c, seg, body_off, pump)) {
+    return false;  // dispatch timed out; the 504 is already written
   }
   return true;
 }
@@ -2481,9 +2592,7 @@ static void handle_runner_adv_meminfo(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
   while (!emul_isRunnerMeminfoReady()) {
-    health_feed();
-    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
-    chandler_loop();
+    http_spinTick();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
       runner_meminfo_t empty = {0};
@@ -2708,9 +2817,7 @@ static void handle_runner_meminfo(http_conn_t *c) {
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
   while (!emul_isRunnerMeminfoReady()) {
-    health_feed();
-    health_setPhase(HEALTH_PHASE_HTTP_WAIT);
-    chandler_loop();
+    http_spinTick();
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       // Timeout — clear busy and report.
       uint32_t fail_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
@@ -3052,6 +3159,11 @@ static err_t __not_in_flash_func(stream_send_chunk)(http_conn_t *c,
   char hdr[16];
   int hn = snprintf(hdr, sizeof(hdr), "%lX\r\n", (unsigned long)body_len);
   if (hn < 0 || hn >= (int)sizeof(hdr)) return ERR_VAL;
+  // A chunk is three writes, and a client cannot make sense of a size line
+  // with no body after it. Only start one the send buffer can hold whole.
+  if (tcp_sndbuf(c->pcb) < (u16_t)hn + body_len + 2) {
+    return ERR_MEM;
+  }
   err_t err = tcp_write(c->pcb, hdr, (u16_t)hn,
                         TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE);
   if (err != ERR_OK) return err;
@@ -3756,6 +3868,10 @@ static void handle_file_download(http_conn_t *c,
       g_body_stream_busy = false;
       c->holds_body_lock = false;
     }
+    // Nothing follows the headers, so the peer's ack of them is the end of
+    // the response. Without this srv_sent_cb's HC_DRAINING branch never
+    // fires and the connection sits on a slot until the idle sweep.
+    c->stream_body_done = true;
     c->state = HC_DRAINING;
     return;
   }
@@ -3825,8 +3941,8 @@ static void upload_finish_ok(http_conn_t *c) {
 // upload was already complete after the leftover write, calls
 // upload_finish_ok); false means upload_init wrote the error response
 // itself and the caller should just return.
-static bool handle_file_upload_init(
-    http_conn_t *c, const char *body_start, size_t leftover) {
+static bool handle_file_upload_init(http_conn_t *c, struct pbuf *seg,
+                                    size_t body_off, size_t leftover) {
   // Single-streamer lock.
   if (g_body_stream_busy) {
     char body[160];
@@ -3955,11 +4071,7 @@ static bool handle_file_upload_init(
   // Write any leftover bytes that arrived in the same TCP segment as
   // the headers.
   if (leftover > 0) {
-    UINT written = 0;
-    fr = f_write(&c->upload_file, body_start, (UINT)leftover, &written);
-    if (fr != FR_OK || written != leftover) {
-      DPRINTF("http_server: upload leftover f_write failed (%d, %u/%zu)\n",
-              (int)fr, (unsigned)written, leftover);
+    if (!upload_drain_pbuf(c, seg, body_off, leftover, &fr)) {
       // Close + unlink happens in conn_close. Surface the error to
       // the client first.
       write_fs_error(c, fr, "f_write failed");
@@ -4424,17 +4536,35 @@ static void route(http_conn_t *c) {
 
 // --- Response writers ---
 
+// Try to hand the buffered response to lwIP. ERR_MEM means it queued
+// nothing (core/tcp_out.c) and the application is expected to wait for the
+// peer to acknowledge what is already in flight and try again -- so leave
+// resp_queued false and let the poll callback come back to it. Dropping the
+// response and closing, as this used to do, loses a reply the client is
+// still waiting for.
+static void __not_in_flash_func(send_buffered_try)(http_conn_t *c) {
+  if (c->pcb == NULL || c->resp_queued) {
+    return;
+  }
+  err_t err =
+      tcp_write(c->pcb, c->resp, (u16_t)c->resp_len, TCP_WRITE_FLAG_COPY);
+  if (err == ERR_OK) {
+    c->resp_queued = true;
+    tcp_output(c->pcb);
+    return;
+  }
+  if (err == ERR_MEM) {
+    return;  // nothing queued; srv_poll_cb retries, the idle sweep gives up
+  }
+  DPRINTF("http_server: tcp_write failed: %d\n", err);
+  conn_close(c);
+}
+
 static void __not_in_flash_func(send_buffered)(http_conn_t *c) {
   c->state = HC_WRITE_RESPONSE;
   c->resp_sent = 0;
-  err_t err = tcp_write(c->pcb, c->resp, (u16_t)c->resp_len,
-                        TCP_WRITE_FLAG_COPY);
-  if (err == ERR_OK) {
-    tcp_output(c->pcb);
-  } else {
-    DPRINTF("http_server: tcp_write failed: %d\n", err);
-    conn_close(c);
-  }
+  c->resp_queued = false;
+  send_buffered_try(c);
 }
 
 // Write a response with optional extra header lines (each must end
@@ -4499,6 +4629,13 @@ static void write_error(http_conn_t *c, int status, const char *reason,
 static void write_fs_error(http_conn_t *c, FRESULT fr, const char *message) {
   if (fr == FR_NOT_ENOUGH_CORE) {
     write_error(c, 503, "Service Unavailable", "insufficient_memory", message);
+    return;
+  }
+  // FatFs's lock table is shared with GEMDRIVE (FF_FS_LOCK in ffconf.h). A
+  // full table means the ST is holding its share right now, so this is also
+  // worth retrying rather than a disk fault (EPIC-13 STORY-06).
+  if (fr == FR_TOO_MANY_OPEN_FILES) {
+    write_error(c, 503, "Service Unavailable", "too_many_open_files", message);
     return;
   }
   write_error(c, 500, "Internal Server Error", "disk_error", message);
