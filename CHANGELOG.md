@@ -72,6 +72,10 @@ AUTO folder instead.
   what the cartridge said. GEMDRIVE now turns the cache off for each call
   it answers and back on after; the CPU speed is left alone. The cartridge
   also turns it off when the Atari boots, which a reset does not.
+- **The 16 KB that GEMDRIVE and the Runner live in** was still free memory
+  as far as TOS knew, so a program that took nearly all of it could be
+  given that area and overwrite them, and every program's stack started
+  inside it. GEMDRIVE now takes the area from TOS when it installs.
 
 ### Feed data to a running program: the rom4 area
 

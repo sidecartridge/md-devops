@@ -607,11 +607,64 @@ gemdrive_install:
 	move.l (a0)+, (a1)+
 	dbf d2, .gd_install_copy_loop
 
-	; Lower _memtop so TOS won't allocate over the resident blob on
-	; subsequent Pexec calls. We're still inside CA_INIT bit 27
-	; (pre_auto hasn't returned to TOS yet for the GEMDRIVE-only path,
-	; or the Runner is about to take over and never return), so the
-	; patch lands before any TPA computations.
+	; Take the zone out of GEMDOS's free memory. GEMDOS built its pool
+	; from _memtop before CA_INIT bit 27, so lowering _memtop now is too
+	; late for that: a program could still be given the zone, and every
+	; program's stack started inside it. Allocate the free memory below
+	; the zone, then the zone itself, which then belongs to the initial
+	; process for good, and free what was below. GEMDOS hands out the
+	; lowest free memory that fits, so this finds the zone when it sits
+	; in the largest free block, ending at _memtop. Otherwise, as when
+	; [R] puts it outside GEMDOS's memory, everything is given back.
+	move.l d0, d5				; d5 = zone start
+	move.l d1, d6				; d6 = the _memtop to publish
+	moveq #0, d7				; d7 = the block below, once taken
+	move.l memtop.w, d3			; d3 = top of GEMDOS's pool
+	move.l #-1, -(sp)
+	move.w #Malloc, -(sp)
+	trap #1
+	addq.l #6, sp				; d0 = largest free block
+	move.l d3, d4
+	sub.l d0, d4				; d4 = its start, if it ends at the top
+	cmp.l d4, d5
+	bcs.s .gd_reserved			; zone below it: not GEMDOS's
+	move.l d5, d0
+	add.l #RELOC_DANGER_ZONE_SIZE, d0
+	cmp.l d3, d0
+	bhi.s .gd_reserved			; zone above the pool: not GEMDOS's
+	move.l d5, d0
+	sub.l d4, d0				; d0 = free memory below the zone
+	beq.s .gd_take_zone
+	move.l d0, -(sp)
+	move.w #Malloc, -(sp)
+	trap #1
+	addq.l #6, sp
+	move.l d0, d7
+.gd_take_zone:
+	move.l #RELOC_DANGER_ZONE_SIZE, -(sp)
+	move.w #Malloc, -(sp)
+	trap #1
+	addq.l #6, sp
+	tst.l d0
+	beq.s .gd_free_below
+	cmp.l d5, d0
+	beq.s .gd_free_below			; the zone is ours
+	move.l d0, -(sp)			; somewhere else: give it back
+	move.w #Mfree, -(sp)
+	trap #1
+	addq.l #6, sp
+.gd_free_below:
+	tst.l d7
+	beq.s .gd_reserved
+	move.l d7, -(sp)
+	move.w #Mfree, -(sp)
+	trap #1
+	addq.l #6, sp
+.gd_reserved:
+	move.l d5, d0
+	move.l d6, d1
+
+	; Lower _memtop too, for programs that size themselves by it.
 	move.l d1, memtop.w
 
 	; Call into the relocated install_entry (offset 0 of the blob:
