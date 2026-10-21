@@ -1082,34 +1082,41 @@ static void __not_in_flash_func(handleFcloseCall)(uint16_t *payload) {
 }
 
 static void __not_in_flash_func(handleFseekCall)(uint16_t *payload) {
-  uint32_t offset = TPROTO_GET_PAYLOAD_PARAM32(payload);
+  // The ST sends the handle in d3, the offset in d4 and the mode in d5.
+  uint16_t handle = TPROTO_GET_PAYLOAD_PARAM16(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
-  uint16_t handle = (uint16_t)TPROTO_GET_PAYLOAD_PARAM32(payload);
+  int32_t offset = (int32_t)TPROTO_GET_PAYLOAD_PARAM32(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
-  uint16_t mode = (uint16_t)TPROTO_GET_PAYLOAD_PARAM32(payload);
+  uint16_t mode = TPROTO_GET_PAYLOAD_PARAM16(payload);
 
   GemFileSlot *slot = fileSlotByHandle(handle);
   if (slot == NULL) {
     writeAppFreeLong(GEMDRIVE_FSEEK_STATUS_OFFSET, (uint32_t)-37);
     return;
   }
-  FSIZE_t newPos;
-  int32_t signedOffset = (int32_t)offset;
-  switch (mode & 0xFFFF) {
+  int64_t newPos;
+  switch (mode) {
     case 0:  // SEEK_SET
-      newPos = (FSIZE_t)signedOffset;
+      newPos = offset;
       break;
     case 1:  // SEEK_CUR
-      newPos = f_tell(&slot->fp) + (FSIZE_t)signedOffset;
+      newPos = (int64_t)f_tell(&slot->fp) + offset;
       break;
     case 2:  // SEEK_END
-      newPos = f_size(&slot->fp) + (FSIZE_t)signedOffset;
+      newPos = (int64_t)f_size(&slot->fp) + offset;
       break;
     default:
       writeAppFreeLong(GEMDRIVE_FSEEK_STATUS_OFFSET, (uint32_t)-64);  // ERANGE
       return;
   }
-  FRESULT res = f_lseek(&slot->fp, newPos);
+  // TOS refuses a seek outside the file with ERANGE and leaves the position
+  // where it was. FatFs would grow a file open for writing instead, and
+  // mintlib's isatty() probes every file it opens with a seek one byte ahead.
+  if (newPos < 0 || newPos > (int64_t)f_size(&slot->fp)) {
+    writeAppFreeLong(GEMDRIVE_FSEEK_STATUS_OFFSET, (uint32_t)-64);  // ERANGE
+    return;
+  }
+  FRESULT res = f_lseek(&slot->fp, (FSIZE_t)newPos);
   sdcard_noteResult(res);
   if (res != FR_OK) {
     writeAppFreeLong(GEMDRIVE_FSEEK_STATUS_OFFSET, (uint32_t)-64);

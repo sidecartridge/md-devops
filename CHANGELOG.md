@@ -54,6 +54,14 @@ AUTO folder instead.
 - **The current directory** reached the Atari with its bytes swapped:
   `Dgetpath` returned `\STDL` as `S\DT`.
 
+### Files that programs open through GEMDRIVE
+
+- **`Fseek` never worked**: the RP took the handle for the offset, so a seek
+  answered "invalid handle" or moved the wrong file. Programs built with
+  mintlib seek on every file they open, and `fopen(..., "a")` failed and left
+  the file locked. A seek past either end of a file is now refused with
+  `ERANGE`, as by TOS, instead of growing the file.
+
 ### Feed data to a running program: the rom4 area
 
 1 KB of the cartridge, at `$FA8B00`, that the workstation writes over HTTP
