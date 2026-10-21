@@ -103,6 +103,12 @@ this one.
 
 ### The Runner
 
+- **On a Mega STE with its cache on**, the Runner's commands could be
+  missed, or their answers lost. `runner reset`, `meminfo` and the other
+  commands a running program cannot refuse are now seen within about half
+  a second whatever the program does with the cache, and DEVOPS.ACC turns
+  the cache off while it talks to the cartridge, for a desktop set up to
+  run fast. A program the accessory starts still gets the desktop's cache.
 - **`runner meminfo`** gave the address of TOS's ROM header as the running
   program's basepage. It now reports the real one.
 - **A `load` or `unload` that timed out** was still carried out later, when

@@ -79,6 +79,7 @@ XB_GETREZ		equ 4
 XB_SETSCREEN		equ 5
 XB_SETPALETTE		equ 6
 XB_SETCOLOR		equ 7
+XB_SUPEXEC		equ 38
 
 ; --- AES ---
 APPL_INIT		equ 10
@@ -159,8 +160,10 @@ acc_start:
 	move.l	#text_menu_entry, addr_in
 	aes	MENU_REGISTER, 1, 1, 1, 0
 
+	bsr	cache_off
 	send_sync RUNNER_CMD_DONE_ACC_HELLO, 0
 	trace	text_ready
+	bsr	cache_back
 
 	; Wake on the timer to poll, and on a message: a registered
 	; accessory must read its messages, and AC_OPEN is the Desk menu
@@ -182,7 +185,9 @@ acc_start:
 	bne.s	.poll
 	bsr	show_status
 .poll:
+	bsr	cache_off
 	bsr	poll
+	bsr	cache_back
 	bra.s	.loop
 
 ; Read the sentinel and serve a foreground Runner command. $06xx commands
@@ -217,6 +222,7 @@ do_execute:
 
 	bsr	enter_cwd
 	bsr	take_screen
+	bsr	cache_back			; the program gets the desktop's cache
 	clr.l	-(sp)				; environment: inherit
 	pea	RUNNER_CMDLINE
 	pea	RUNNER_PATH
@@ -225,6 +231,7 @@ do_execute:
 	trap	#1
 	lea	16(sp), sp
 	move.l	d0, result
+	bsr	cache_off
 	bsr	give_screen_back
 
 	bsr	trace_exit
@@ -269,14 +276,17 @@ do_exec:
 	trace	text_crlf
 
 	bsr	take_screen
+	move.l	RUNNER_BASEPAGE, d3
+	bsr	cache_back			; the program gets the desktop's cache
 	clr.l	-(sp)
-	move.l	RUNNER_BASEPAGE, -(sp)
+	move.l	d3, -(sp)
 	clr.l	-(sp)
 	move.w	#PE_GO, -(sp)
 	move.w	#Pexec, -(sp)
 	trap	#1
 	lea	16(sp), sp
 	move.l	d0, result
+	bsr	cache_off
 	bsr	give_screen_back
 
 	bsr	trace_exit
@@ -333,6 +343,38 @@ do_cd:
 	clr.b	acc_cwd+1
 .reported:
 	report	RUNNER_CMD_DONE_CD, RUNNER_CMD_CD
+	rts
+
+; A Mega STE's cache answers the cartridge's reads from copies it made
+; before, and the command channel breaks with it on, as it is on a desktop
+; set up to run fast. cache_off turns it off while the accessory talks to
+; the cartridge, and cache_back turns it on again if it was; a program the
+; accessory starts runs between the two. The RP says which machine this
+; is, from the boot: no other has the register.
+cache_off:
+	pea	cache_off_super(pc)
+	bra.s	supexec
+cache_back:
+	pea	cache_back_super(pc)
+supexec:
+	move.w	#XB_SUPEXEC, -(sp)
+	trap	#14
+	addq.l	#6, sp
+	rts
+
+cache_off_super:
+	cmp.l	#COOKIE_JAR_MEGASTE, SHARED_VARIABLES_ADDR+(SHARED_VARIABLE_HARDWARE_TYPE*4)
+	bne.s	.no_register
+	move.b	MEGASTE_SPEED_CACHE_REG.w, cache_setting
+	bclr	#0, MEGASTE_SPEED_CACHE_REG.w
+.no_register:
+	rts
+
+cache_back_super:
+	btst	#0, cache_setting
+	beq.s	.was_off
+	bset	#0, MEGASTE_SPEED_CACHE_REG.w
+.was_off:
 	rts
 
 ; Current drive and directory back to the Runner's.
@@ -691,6 +733,8 @@ addr_out:	ds.l	4
 unacked_cmd:	ds.l	1
 last_cmd:	ds.l	1
 result:		ds.l	1
+cache_setting:	ds.b	1	; the cache register as cache_off found it
+		even
 msg_buf:	ds.w	8
 alert_buf:	ds.b	160
 desk_xywh:	ds.w	4
