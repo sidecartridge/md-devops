@@ -352,17 +352,6 @@ hello_msg:
 	even
 
 ; ====================================================================
-; old_handler cell — populated by install_entry via PC-relative write.
-; XBRA structure makes the trap chain visible to tools that walk it.
-; ====================================================================
-	cnop	0,4
-	dc.l	'XBRA'
-	dc.l	'SDGD'
-old_handler:
-	dc.l	0
-	even
-
-; ====================================================================
 ; write_seq — chunk sequence number for .Fwrite.
 ;
 ; Bumped once per chunk, never per retry, and never reset: every retry
@@ -394,7 +383,16 @@ write_seq:
 ;   d1-d7/a0-a5
 ; .exec_old_handler and .gd_rte give all of it back. A handler finds
 ; the call's arguments through a0, its opcode at 6(a0).
+;
+; The XBRA header sits right in front of the entry point, where tools
+; that walk the trap #1 chain look for it; install_entry fills in
+; old_handler.
 ; ====================================================================
+	cnop	0,4
+	dc.l	'XBRA'
+	dc.l	'SDGD'
+old_handler:
+	dc.l	0
 gemdrive_trap:
 	; Reentry shortcut: GEMDOS calls invoked from inside our own
 	; handlers (which may need Dgetdrv, Fgetdta, etc.) bypass the

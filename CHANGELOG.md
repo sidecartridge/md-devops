@@ -134,6 +134,9 @@ this one.
 
 ### For developers
 
+- GEMDRIVE's XBRA header (`SDGD`) now sits right in front of its trap #1
+  entry, so tools that walk the GEMDOS chain find it and the handlers
+  below it.
 - `QUESTION.TOS` is a known-answer test for the Runner: it writes
   `ANSWER.TXT` containing `42` and exits with 42. `ROM4CHK.TOS` prints the
   rom4 area to the debug stream.
