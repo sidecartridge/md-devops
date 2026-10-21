@@ -190,8 +190,7 @@ restore_regs	macro
 
 ; Restore registers and rte through the original trap exception frame.
 return_rte	macro
-		restore_regs
-		rte
+		bra.w	.gd_rte
 		endm
 
 ; Return a word/long status from the shared region as a sign-extended
@@ -413,6 +412,20 @@ gemdrive_trap:
 .not_long:
 	save_regs
 
+	; A Mega STE's cache answers the cartridge's reads from copies it
+	; made before, and the command channel breaks with it on; a program
+	; that wants speed turns it on. Turn it off, which empties it, for
+	; the call, and keep the caller's setting in a word on the stack for
+	; .exec_old_handler and .gd_rte to put back: -1 on other machines.
+	moveq	#-1, d1
+	cmp.l	#COOKIE_JAR_MEGASTE, SHARED_VARIABLES+(SHARED_VARIABLE_HARDWARE_TYPE*4)
+	bne.s	.cache_kept
+	moveq	#0, d1
+	move.b	MEGASTE_SPEED_CACHE_REG.w, d1
+	bclr	#0, MEGASTE_SPEED_CACHE_REG.w
+.cache_kept:
+	move.w	d1, -(sp)
+
 	; Look up the handler. Each table entry is a 4-byte bra.w to the
 	; handler; opcode * 4 = byte offset within the table.
 	move.w	6(a0), d3
@@ -425,9 +438,22 @@ gemdrive_trap:
 	jmp	0(a1, d3.w)
 
 .exec_old_handler:
+	move.w	(sp)+, d1
+	bmi.s	.old_cache_kept
+	move.b	d1, MEGASTE_SPEED_CACHE_REG.w
+.old_cache_kept:
 	restore_regs
 	move.l	old_handler(pc), -(sp)
 	rts
+
+; Every handler that answers the call itself leaves through here.
+.gd_rte:
+	move.w	(sp)+, d1
+	bmi.s	.rte_cache_kept
+	move.b	d1, MEGASTE_SPEED_CACHE_REG.w
+.rte_cache_kept:
+	restore_regs
+	rte
 
 	even
 .gemdos_dispatch_table:

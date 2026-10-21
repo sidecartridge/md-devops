@@ -1552,9 +1552,17 @@ void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
   //   [4..7]  phystop       — TOS-reported _phystop ($42E)
   //   [8..11] total_ram_kb  — decoded from MMU bank-config nibble at
   //                           $FFFF8001; 0 = unrecognised silicon
+  //   [12..15] _MCH         — the machine cookie; 0 without a cookie jar
   uint32_t screenBase   = TPROTO_GET_PAYLOAD_PARAM32(payload);
   uint32_t phystop      = TPROTO_GET_NEXT32_PAYLOAD_PARAM32(payload);
   uint32_t totalRamKb   = TPROTO_GET_NEXT32_PAYLOAD_PARAM32(payload);
+  uint32_t machine      = TPROTO_GET_NEXT32_PAYLOAD_PARAM32(payload);
+
+  // GEMDRIVE, the Runner's hook and DEVOPS.ACC switch a Mega STE's cache
+  // off while they talk to the cartridge, and must not touch the register
+  // on any other machine.
+  SET_SHARED_VAR(CHANDLER_HARDWARE_TYPE, machine, sharedBaseAddress(),
+                 CHANDLER_SHARED_VARIABLES_OFFSET);
 
   // HELLO comes once per ST boot. Nothing the previous session opened can
   // still be in use, and a program that crashed never closed its files:
@@ -1582,11 +1590,12 @@ void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
 
   DPRINTF(
       "GEMDRIVE HELLO: screen_base=0x%08lX phystop=0x%08lX "
-      "total_ram=%lu KB (%s)\n",
+      "total_ram=%lu KB (%s) _MCH=0x%08lX\n",
       (unsigned long)screenBase, (unsigned long)phystop,
       (unsigned long)totalRamKb,
       gemdrivePhystopMismatch ? "MISMATCH" :
-        (totalRamKb == 0 ? "unrecognised" : "ok"));
+        (totalRamKb == 0 ? "unrecognised" : "ok"),
+      (unsigned long)machine);
   gemdrive_publishSettings();
 
   // GEMDRIVE HELLO is the unambiguous "ST cold-booted" signal — the

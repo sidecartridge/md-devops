@@ -464,6 +464,28 @@ end_rom_code:
 gemdrive_handshake:
 	movem.l d0-d7/a0-a3, -(sp)
 
+	; A Mega STE's cache answers the cartridge's reads from copies it
+	; made before, and the command channel breaks with it on; a reset
+	; leaves it as it was. Turn it off before the first command (the
+	; speed is kept), and send the _MCH cookie with HELLO: the modules
+	; check it before they touch the register, which is not there on
+	; other machines.
+	moveq	#0, d6
+	move.l	_p_cookies.w, d0
+	beq.s	.hs_machine
+	move.l	d0, a0
+.hs_cookie:
+	move.l	(a0)+, d0
+	beq.s	.hs_machine
+	move.l	(a0)+, d1
+	cmp.l	#'_MCH', d0
+	bne.s	.hs_cookie
+	move.l	d1, d6
+	cmp.l	#COOKIE_JAR_MEGASTE, d6
+	bne.s	.hs_machine
+	bclr	#0, MEGASTE_SPEED_CACHE_REG.w
+.hs_machine:
+
 	; Logbase (XBIOS fn 2) → d0.l = screen base
 	move.w #2, -(sp)
 	trap #14
@@ -511,10 +533,10 @@ gemdrive_handshake:
 	move.l #4096, d5
 .ph_decoded:
 
-	; Publish (screen_base, phystop, total_ram_kb). RP applies
+	; Publish (screen_base, phystop, total_ram_kb, _MCH). RP applies
 	; aconfig overrides + flags phystop mismatch + writes effective
 	; reloc/memtop back into shared variables.
-	send_sync CMD_GEMDRIVE_HELLO, 12
+	send_sync CMD_GEMDRIVE_HELLO, 16
 
 	movem.l (sp)+, d0-d7/a0-a3
 	rts

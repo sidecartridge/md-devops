@@ -67,6 +67,11 @@ AUTO folder instead.
 - **A file a program left open** when it ended, or crashed, stayed open
   until the next boot, locked against every other open, including the
   API's. GEMDRIVE now closes a program's files when it ends, as TOS does.
+- **On a Mega STE with its cache on**, as programs that want speed run,
+  GEMDRIVE calls were lost or answered wrong: the cache kept old copies of
+  what the cartridge said. GEMDRIVE now turns the cache off for each call
+  it answers and back on after; the CPU speed is left alone. The cartridge
+  also turns it off when the Atari boots, which a reset does not.
 
 ### Feed data to a running program: the rom4 area
 

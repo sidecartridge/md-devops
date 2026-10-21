@@ -4,6 +4,7 @@
 _p_cookies                              equ $5a0    ; pointer to the system Cookie-Jar
 
 COOKIE_JAR_MEGASTE                      equ $00010010 ; Mega STE computer
+MEGASTE_SPEED_CACHE_REG                 equ $FFFF8E21 ; Mega STE: bit 0 the cache, bit 1 16 MHz
 SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE   equ 16      ; Size of the shared variables for the shared functions
 SHARED_VARIABLE_HARDWARE_TYPE           equ 0       ; Hardware type of the Atari ST computer
 SHARED_VARIABLE_SVERSION                equ 1       ; TOS version from Sversion
