@@ -76,6 +76,11 @@ AUTO folder instead.
   as far as TOS knew, so a program that took nearly all of it could be
   given that area and overwrite them, and every program's stack started
   inside it. GEMDRIVE now takes the area from TOS when it installs.
+- **Programs started with `[U]` hung or crashed as they ended** when they
+  had used GEMDRIVE. Their calls ran on TOS's small boot-time stack, and
+  GEMDRIVE's work there overwrote TOS's own variables. GEMDRIVE now does
+  its work on a stack of its own, and a call it passes on to TOS reaches
+  it with every register as the program left it.
 
 ### Feed data to a running program: the rom4 area
 

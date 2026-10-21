@@ -161,7 +161,8 @@ void gemdrive_setWriteStall(uint16_t chunks, uint16_t deciseconds);
 //   screen_base − 11 KB ($2C00)  end of GEMDRIVE_BLOB
 //   screen_base − 10 KB ($2800)  RUNNER_BLOB    (3 KB) — $400 slack above
 //   screen_base −  7 KB ($1C00)  end of RUNNER_BLOB
-//   screen_base −  7 KB .. screen_base — 7 KB safety buffer to framebuffer
+//   screen_base −  7 KB .. screen_base — GEMDRIVE's own stack, growing down
+//                                        from screen_base (gemdrive.s)
 //
 // User-facing label in the setup menu is "auto (screen-16KB)".
 #define GEMDRIVE_DEFAULT_OFFSET_BYTES 0x4000

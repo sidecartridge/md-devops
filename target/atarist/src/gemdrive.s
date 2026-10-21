@@ -56,6 +56,9 @@ GEMDOS_Dgetdrv		equ $19
 VEC_GEMDOS		equ $21			; trap #1 vector slot in exception table
 XBIOS_Setexc		equ 5
 _drvbits		equ $4C2
+GD_ZONE_SIZE		equ $4000		; the zone the blobs live in: RELOC_DANGER_ZONE_SIZE in main.s
+GD_CACHE		equ 52			; on GEMDRIVE's stack, above d1-d7/a0-a5
+GD_CALLER_SP		equ 54			; and above that, the caller's stack pointer
 _bootdev		equ $446
 _nflops			equ $4A6
 _longframe		equ $59E
@@ -169,15 +172,16 @@ GEMDRIVE_EXEC_PD		equ (APP_FREE_ADDR + $1534)
 ; MACROS
 ; ====================================================================
 
-; Save scratch registers used by GEMDOS handlers. a0/a1 are NOT saved:
-; a0 stays as the args-frame pointer set up by exec_trapped_handler, a1
-; is scratch for the dispatch table lookup. d0 is the return value.
-save_regs	macro
-		movem.l	d1-d7/a2-a6, -(sp)
-		endm
-
+; Give the caller back its Mega STE cache setting, its registers and its
+; stack, from GEMDRIVE's own (see gemdrive_trap).
 restore_regs	macro
-		movem.l	(sp)+, d1-d7/a2-a6
+		move.w	GD_CACHE(sp), d1
+		bmi.s	.\@cache_kept
+		move.b	d1, MEGASTE_SPEED_CACHE_REG.w
+.\@cache_kept:
+		movem.l	(sp)+, d1-d7/a0-a5
+		move.l	2(sp), sp			; past GD_CACHE: the caller's stack, at its a6
+		move.l	(sp)+, a6
 		endm
 
 ; send_sync / send_write_sync come from inc/sidecart_macros.s included
@@ -261,6 +265,7 @@ detect_emulated_file_handler	macro
 ; offset 0: install_entry  (called from main.s gemdrive_install after copy)
 ; offset 4: diagnostic_entry (called from rom_function on [G]EMDRIVE)
 ; ====================================================================
+gd_blob:
 	bra.w	install_entry			; offset 0
 	bra.w	diagnostic_entry		; offset 4
 
@@ -372,50 +377,163 @@ write_seq:
 	even
 
 ; ====================================================================
-; gemdrive_trap — full trap #1 dispatcher
+; gemdrive_trap — the trap #1 hook
 ;
-; The CPU has already pushed the trap exception frame ([SR, PC]) on
-; the supervisor stack. Flow:
-;   1. If reentry is locked (RP set the flag during a handler that
-;      calls back into GEMDOS), just chain to old_handler — same
-;      pass-through behaviour.
-;   2. Otherwise compute a0 = address of the args frame (different
-;      stack for user vs supervisor mode, +2 for long-frame CPUs).
-;   3. save_regs (d1-d7/a2-a6 — preserves a0/a1/d0).
-;   4. Read the GEMDOS opcode at offset 6(a0) and indexed-jmp into
-;      the dispatch table; the table entry is a bra.w that branches
-;      to the actual handler.
+; TOS's GEMDOS gives a caller in supervisor mode every register but d0
+; back as it got it, and one in user mode all but a0. So a call is
+; looked up with d0 alone, and a0 for a user-mode caller, and a call
+; that is not GEMDRIVE's goes on to TOS as it came, with nothing pushed.
+;
+; A call GEMDRIVE takes costs the caller's stack 4 bytes and runs on
+; GEMDRIVE's own stack, at the top of the zone the blobs live in. A
+; program the boot-time Runner starts calls GEMDOS on TOS's boot stack,
+; which has little room before TOS's own variables, and GEMDRIVE's work
+; there corrupted them. From the top of GEMDRIVE's stack down:
+;   the caller's stack pointer, at the a6 pushed on that stack
+;   GD_CACHE: the Mega STE cache setting, -1 on other machines
+;   d1-d7/a0-a5
+; .exec_old_handler and .gd_rte give all of it back. A handler finds
+; the call's arguments through a0, its opcode at 6(a0).
 ; ====================================================================
 gemdrive_trap:
 	; Reentry shortcut: GEMDOS calls invoked from inside our own
 	; handlers (which may need Dgetdrv, Fgetdta, etc.) bypass the
 	; full dispatch and chain straight to the original handler.
 	tst.l	(SHARED_VARIABLES+(SHARED_VAR_REENTRY_TRAP*4))
-	beq.s	.no_reentry
+	bne.s	.gd_pass
+	btst	#5, (sp)			; S-bit of saved SR
+	bne.s	.gd_super
+	move.l	usp, a0				; user: the call is on its stack
+	subq.l	#6, a0				; so that 6(a0) is the opcode
+	tst.w	_longframe.w
+	beq.s	.gd_user_call
+	addq.w	#2, a0				; long-frame trap pushes +2 bytes
+.gd_user_call:
+	move.w	6(a0), d0
+	bra.s	.gd_lookup
+.gd_super:
+	move.w	6(sp), d0			; the opcode, after SR and PC
+	tst.w	_longframe.w
+	beq.s	.gd_lookup
+	move.w	8(sp), d0			; after the format word too
+.gd_lookup:
+	cmp.w	#$57, d0
+	bhi.s	.gd_pass
+	add.w	d0, d0
+	move.w	.gemdos_dispatch_table(pc, d0.w), d0	; must reach it in 127 bytes
+	bne.w	.gd_take			; the handler, from the table
+.gd_pass:
 	move.l	old_handler(pc), -(sp)
 	rts
-.no_reentry:
-	; Determine which stack the caller's args are on.
-	btst	#5, (sp)			; S-bit of saved SR
-	beq.s	.from_user
-.from_super:
-	move.l	sp, a0				; supervisor: args follow [SR,PC] on SSP
-	bra.s	.check_cpu
-.from_user:
-	move.l	usp, a0				; user: args on USP
-	subq.l	#6, a0				; offset so 6(a0) = func code
-.check_cpu:
-	tst.w	_longframe.w
-	beq.s	.not_long
-	addq.w	#2, a0				; long-frame trap pushes +2 bytes
-.not_long:
-	save_regs
+
+	even
+; Each entry is its handler's offset from the table, 0 for a call that
+; goes on to TOS.
+.gemdos_dispatch_table:
+	dc.w	.Pterm-.gemdos_dispatch_table	; 0x00 Pterm0
+	dc.w	0				; 0x01
+	dc.w	0				; 0x02
+	dc.w	0				; 0x03
+	dc.w	0				; 0x04
+	dc.w	0				; 0x05
+	dc.w	0				; 0x06
+	dc.w	0				; 0x07
+	dc.w	0				; 0x08
+	dc.w	0				; 0x09
+	dc.w	0				; 0x0A
+	dc.w	0				; 0x0B
+	dc.w	0				; 0x0C
+	dc.w	0				; 0x0D
+	dc.w	0				; 0x0E
+	dc.w	0				; 0x0F
+	dc.w	0				; 0x10
+	dc.w	0				; 0x11
+	dc.w	0				; 0x12
+	dc.w	0				; 0x13
+	dc.w	0				; 0x14
+	dc.w	0				; 0x15
+	dc.w	0				; 0x16
+	dc.w	0				; 0x17
+	dc.w	0				; 0x18
+	dc.w	0				; 0x19 Dgetdrv (no intercept)
+	dc.w	.Fsetdta-.gemdos_dispatch_table	; 0x1A Fsetdta
+	dc.w	0				; 0x1B
+	dc.w	0				; 0x1C
+	dc.w	0				; 0x1D
+	dc.w	0				; 0x1E
+	dc.w	0				; 0x1F
+	dc.w	0				; 0x20
+	dc.w	0				; 0x21
+	dc.w	0				; 0x22
+	dc.w	0				; 0x23
+	dc.w	0				; 0x24
+	dc.w	0				; 0x25
+	dc.w	0				; 0x26
+	dc.w	0				; 0x27
+	dc.w	0				; 0x28
+	dc.w	0				; 0x29
+	dc.w	0				; 0x2A
+	dc.w	0				; 0x2B
+	dc.w	0				; 0x2C
+	dc.w	0				; 0x2D
+	dc.w	0				; 0x2E
+	dc.w	0				; 0x2F
+	dc.w	0				; 0x30
+	dc.w	.Pterm-.gemdos_dispatch_table	; 0x31 Ptermres
+	dc.w	0				; 0x32
+	dc.w	0				; 0x33
+	dc.w	0				; 0x34
+	dc.w	0				; 0x35
+	dc.w	.Dfree-.gemdos_dispatch_table	; 0x36 Dfree
+	dc.w	0				; 0x37
+	dc.w	0				; 0x38
+	dc.w	.Dcreate-.gemdos_dispatch_table	; 0x39 Dcreate
+	dc.w	.Ddelete-.gemdos_dispatch_table	; 0x3A Ddelete
+	dc.w	.Dsetpath-.gemdos_dispatch_table	; 0x3B Dsetpath
+	dc.w	.Fcreate-.gemdos_dispatch_table	; 0x3C Fcreate
+	dc.w	.Fopen-.gemdos_dispatch_table	; 0x3D Fopen
+	dc.w	.Fclose-.gemdos_dispatch_table	; 0x3E Fclose
+	dc.w	.Fread-.gemdos_dispatch_table	; 0x3F Fread
+	dc.w	.Fwrite-.gemdos_dispatch_table	; 0x40 Fwrite
+	dc.w	.Fdelete-.gemdos_dispatch_table	; 0x41 Fdelete
+	dc.w	.Fseek-.gemdos_dispatch_table	; 0x42 Fseek
+	dc.w	.Fattrib-.gemdos_dispatch_table	; 0x43 Fattrib
+	dc.w	0				; 0x44
+	dc.w	0				; 0x45
+	dc.w	0				; 0x46
+	dc.w	.Dgetpath-.gemdos_dispatch_table	; 0x47 Dgetpath
+	dc.w	0				; 0x48
+	dc.w	0				; 0x49
+	dc.w	0				; 0x4A
+	dc.w	.Pexec-.gemdos_dispatch_table	; 0x4B Pexec
+	dc.w	.Pterm-.gemdos_dispatch_table	; 0x4C Pterm
+	dc.w	0				; 0x4D
+	dc.w	.Fsfirst-.gemdos_dispatch_table	; 0x4E Fsfirst
+	dc.w	.Fsnext-.gemdos_dispatch_table	; 0x4F Fsnext
+	dc.w	0				; 0x50
+	dc.w	0				; 0x51
+	dc.w	0				; 0x52
+	dc.w	0				; 0x53
+	dc.w	0				; 0x54
+	dc.w	0				; 0x55
+	dc.w	.Frename-.gemdos_dispatch_table	; 0x56 Frename
+	dc.w	.Fdatime-.gemdos_dispatch_table	; 0x57 Fdatime
+
+.gd_take:
+	; Ours: onto GEMDRIVE's own stack, with the caller's registers.
+	move.l	a6, -(sp)
+	lea	gd_blob+GD_ZONE_SIZE(pc), a6	; the top of GEMDRIVE's stack
+	move.l	sp, -(a6)			; the caller's stack pointer, on ours
+	move.l	a6, sp
+	subq.l	#2, sp				; GD_CACHE
+	movem.l	d1-d7/a0-a5, -(sp)
+	lea	.gemdos_dispatch_table(pc), a1
+	add.w	d0, a1				; the handler
 
 	; A Mega STE's cache answers the cartridge's reads from copies it
 	; made before, and the command channel breaks with it on; a program
 	; that wants speed turns it on. Turn it off, which empties it, for
-	; the call, and keep the caller's setting in a word on the stack for
-	; .exec_old_handler and .gd_rte to put back: -1 on other machines.
+	; the call, and keep the caller's setting for restore_regs.
 	moveq	#-1, d1
 	cmp.l	#COOKIE_JAR_MEGASTE, SHARED_VARIABLES+(SHARED_VARIABLE_HARDWARE_TYPE*4)
 	bne.s	.cache_kept
@@ -423,127 +541,32 @@ gemdrive_trap:
 	move.b	MEGASTE_SPEED_CACHE_REG.w, d1
 	bclr	#0, MEGASTE_SPEED_CACHE_REG.w
 .cache_kept:
-	move.w	d1, -(sp)
+	move.w	d1, GD_CACHE(sp)
 
-	; Look up the handler. Each table entry is a 4-byte bra.w to the
-	; handler; opcode * 4 = byte offset within the table.
-	move.w	6(a0), d3
-	and.l	#$FFFF, d3
-	cmp.w	#$57, d3
-	bhi	.exec_old_handler
-	add.w	d3, d3
-	add.w	d3, d3
-	lea	.gemdos_dispatch_table(pc), a1
-	jmp	0(a1, d3.w)
+	; The call's arguments: on the caller's stack, after its exception
+	; frame's SR and PC (and format word), or on its user stack.
+	move.l	GD_CALLER_SP(sp), a0		; the caller's stack, at its a6
+	addq.l	#4, a0				; its exception frame
+	btst	#5, (a0)
+	bne.s	.gd_args
+	move.l	usp, a0
+	subq.l	#6, a0
+.gd_args:
+	tst.w	_longframe.w
+	beq.s	.gd_go
+	addq.w	#2, a0
+.gd_go:
+	jmp	(a1)
 
 .exec_old_handler:
-	move.w	(sp)+, d1
-	bmi.s	.old_cache_kept
-	move.b	d1, MEGASTE_SPEED_CACHE_REG.w
-.old_cache_kept:
 	restore_regs
 	move.l	old_handler(pc), -(sp)
 	rts
 
 ; Every handler that answers the call itself leaves through here.
 .gd_rte:
-	move.w	(sp)+, d1
-	bmi.s	.rte_cache_kept
-	move.b	d1, MEGASTE_SPEED_CACHE_REG.w
-.rte_cache_kept:
 	restore_regs
 	rte
-
-	even
-.gemdos_dispatch_table:
-	bra.w	.Pterm				; 0x00 Pterm0
-	bra.w	.exec_old_handler		; 0x01
-	bra.w	.exec_old_handler		; 0x02
-	bra.w	.exec_old_handler		; 0x03
-	bra.w	.exec_old_handler		; 0x04
-	bra.w	.exec_old_handler		; 0x05
-	bra.w	.exec_old_handler		; 0x06
-	bra.w	.exec_old_handler		; 0x07
-	bra.w	.exec_old_handler		; 0x08
-	bra.w	.exec_old_handler		; 0x09
-	bra.w	.exec_old_handler		; 0x0A
-	bra.w	.exec_old_handler		; 0x0B
-	bra.w	.exec_old_handler		; 0x0C
-	bra.w	.exec_old_handler		; 0x0D
-	bra.w	.exec_old_handler		; 0x0E
-	bra.w	.exec_old_handler		; 0x0F
-	bra.w	.exec_old_handler		; 0x10
-	bra.w	.exec_old_handler		; 0x11
-	bra.w	.exec_old_handler		; 0x12
-	bra.w	.exec_old_handler		; 0x13
-	bra.w	.exec_old_handler		; 0x14
-	bra.w	.exec_old_handler		; 0x15
-	bra.w	.exec_old_handler		; 0x16
-	bra.w	.exec_old_handler		; 0x17
-	bra.w	.exec_old_handler		; 0x18
-	bra.w	.exec_old_handler		; 0x19 Dgetdrv (no intercept)
-	bra.w	.Fsetdta			; 0x1A Fsetdta
-	bra.w	.exec_old_handler		; 0x1B
-	bra.w	.exec_old_handler		; 0x1C
-	bra.w	.exec_old_handler		; 0x1D
-	bra.w	.exec_old_handler		; 0x1E
-	bra.w	.exec_old_handler		; 0x1F
-	bra.w	.exec_old_handler		; 0x20
-	bra.w	.exec_old_handler		; 0x21
-	bra.w	.exec_old_handler		; 0x22
-	bra.w	.exec_old_handler		; 0x23
-	bra.w	.exec_old_handler		; 0x24
-	bra.w	.exec_old_handler		; 0x25
-	bra.w	.exec_old_handler		; 0x26
-	bra.w	.exec_old_handler		; 0x27
-	bra.w	.exec_old_handler		; 0x28
-	bra.w	.exec_old_handler		; 0x29
-	bra.w	.exec_old_handler		; 0x2A
-	bra.w	.exec_old_handler		; 0x2B
-	bra.w	.exec_old_handler		; 0x2C
-	bra.w	.exec_old_handler		; 0x2D
-	bra.w	.exec_old_handler		; 0x2E
-	bra.w	.exec_old_handler		; 0x2F
-	bra.w	.exec_old_handler		; 0x30
-	bra.w	.Pterm				; 0x31 Ptermres
-	bra.w	.exec_old_handler		; 0x32
-	bra.w	.exec_old_handler		; 0x33
-	bra.w	.exec_old_handler		; 0x34
-	bra.w	.exec_old_handler		; 0x35
-	bra.w	.Dfree				; 0x36 Dfree
-	bra.w	.exec_old_handler		; 0x37
-	bra.w	.exec_old_handler		; 0x38
-	bra.w	.Dcreate			; 0x39 Dcreate
-	bra.w	.Ddelete			; 0x3A Ddelete
-	bra.w	.Dsetpath			; 0x3B Dsetpath
-	bra.w	.Fcreate			; 0x3C Fcreate
-	bra.w	.Fopen				; 0x3D Fopen
-	bra.w	.Fclose				; 0x3E Fclose
-	bra.w	.Fread				; 0x3F Fread
-	bra.w	.Fwrite				; 0x40 Fwrite
-	bra.w	.Fdelete			; 0x41 Fdelete
-	bra.w	.Fseek				; 0x42 Fseek
-	bra.w	.Fattrib			; 0x43 Fattrib
-	bra.w	.exec_old_handler		; 0x44
-	bra.w	.exec_old_handler		; 0x45
-	bra.w	.exec_old_handler		; 0x46
-	bra.w	.Dgetpath			; 0x47 Dgetpath
-	bra.w	.exec_old_handler		; 0x48
-	bra.w	.exec_old_handler		; 0x49
-	bra.w	.exec_old_handler		; 0x4A
-	bra.w	.Pexec				; 0x4B Pexec
-	bra.w	.Pterm				; 0x4C Pterm
-	bra.w	.exec_old_handler		; 0x4D
-	bra.w	.Fsfirst			; 0x4E Fsfirst
-	bra.w	.Fsnext				; 0x4F Fsnext
-	bra.w	.exec_old_handler		; 0x50
-	bra.w	.exec_old_handler		; 0x51
-	bra.w	.exec_old_handler		; 0x52
-	bra.w	.exec_old_handler		; 0x53
-	bra.w	.exec_old_handler		; 0x54
-	bra.w	.exec_old_handler		; 0x55
-	bra.w	.Frename			; 0x56 Frename
-	bra.w	.Fdatime			; 0x57 Fdatime
 
 ; ====================================================================
 ; .Dfree — get free space on a drive
