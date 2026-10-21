@@ -133,7 +133,6 @@ SHARED_VARIABLES:         equ (RESERVED_SLOT_ADDR + 4)       ; $FA2810 (60 index
 ROMCMD_START_ADDR:        equ $FB0000					  ; We are going to use ROM3 address
 CMD_MAGIC_NUMBER    	  equ ($ABCD) 					  ; Magic number header to identify a command
 CMD_RETRIES_COUNT	  	  equ 3							  ; Number of retries for the command
-CMD_SET_SHARED_VAR		  equ 1							  ; This is a fake command to set the shared variables
 														  ; Used to store the system settings
 ; App commands for the terminal
 APP_TERMINAL 				equ $0 ; The terminal app

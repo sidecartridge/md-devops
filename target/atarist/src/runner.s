@@ -91,7 +91,6 @@ RANDOM_TOKEN_POST_WAIT		equ $1
 ROMCMD_START_ADDR		equ $FB0000
 CMD_MAGIC_NUMBER		equ $ABCD
 CMD_RETRIES_COUNT		equ 5
-CMD_SET_SHARED_VAR		equ 1
 ; Same budget as gemdrive.s: the Runner's commands also wait on SD work.
 COMMAND_TIMEOUT			equ $0006FFFF
 COMMAND_WRITE_TIMEOUT		equ COMMAND_TIMEOUT

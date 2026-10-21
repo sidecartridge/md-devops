@@ -38,7 +38,6 @@ RANDOM_TOKEN_POST_WAIT	equ $1
 ROMCMD_START_ADDR	equ $FB0000
 CMD_MAGIC_NUMBER	equ $ABCD
 CMD_RETRIES_COUNT	equ 5
-CMD_SET_SHARED_VAR	equ 1
 ; The RP answers a command after it has done the work, and an SD write that
 ; allocates a cluster and updates the FAT can block for tens of milliseconds
 ; (70 ms measured on a 29 GB FAT32 card). $FFFF gave up far too early and the
