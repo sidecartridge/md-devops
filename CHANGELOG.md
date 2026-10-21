@@ -64,6 +64,9 @@ AUTO folder instead.
 - **`Fdatime`** went by the current drive rather than the file handle, and
   its "get" returned whatever was in memory. It now acts on the handle's
   file: get returns the file's own date and time, and set changes them.
+- **A file a program left open** when it ended, or crashed, stayed open
+  until the next boot, locked against every other open, including the
+  API's. GEMDRIVE now closes a program's files when it ends, as TOS does.
 
 ### Feed data to a running program: the rom4 area
 

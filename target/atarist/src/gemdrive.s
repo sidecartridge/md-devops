@@ -80,6 +80,7 @@ CMD_FSEEK_CALL		equ ($42 + APP_GEMDRVEMUL)
 CMD_FATTRIB_CALL	equ ($43 + APP_GEMDRVEMUL)
 CMD_DGETPATH_CALL	equ ($47 + APP_GEMDRVEMUL)
 CMD_PEXEC_CALL		equ ($4B + APP_GEMDRVEMUL)
+CMD_PTERM_CALL		equ ($4C + APP_GEMDRVEMUL)
 CMD_FSFIRST_CALL	equ ($4E + APP_GEMDRVEMUL)
 CMD_FSNEXT_CALL		equ ($4F + APP_GEMDRVEMUL)
 CMD_GEMDRIVE_VERIFY_MEMTOP	equ ($52 + APP_GEMDRVEMUL)
@@ -430,7 +431,7 @@ gemdrive_trap:
 
 	even
 .gemdos_dispatch_table:
-	bra.w	.exec_old_handler		; 0x00
+	bra.w	.Pterm				; 0x00 Pterm0
 	bra.w	.exec_old_handler		; 0x01
 	bra.w	.exec_old_handler		; 0x02
 	bra.w	.exec_old_handler		; 0x03
@@ -479,7 +480,7 @@ gemdrive_trap:
 	bra.w	.exec_old_handler		; 0x2E
 	bra.w	.exec_old_handler		; 0x2F
 	bra.w	.exec_old_handler		; 0x30
-	bra.w	.exec_old_handler		; 0x31
+	bra.w	.Pterm				; 0x31 Ptermres
 	bra.w	.exec_old_handler		; 0x32
 	bra.w	.exec_old_handler		; 0x33
 	bra.w	.exec_old_handler		; 0x34
@@ -506,7 +507,7 @@ gemdrive_trap:
 	bra.w	.exec_old_handler		; 0x49
 	bra.w	.exec_old_handler		; 0x4A
 	bra.w	.Pexec				; 0x4B Pexec
-	bra.w	.exec_old_handler		; 0x4C
+	bra.w	.Pterm				; 0x4C Pterm
 	bra.w	.exec_old_handler		; 0x4D
 	bra.w	.Fsfirst			; 0x4E Fsfirst
 	bra.w	.Fsnext				; 0x4F Fsnext
@@ -618,6 +619,7 @@ gemdrive_trap:
 	move.l	8(a0), a4
 	move.w	12(a0), d3
 	detect_emulated_drive_letter
+	bsr	.run_basepage			; d4 = the new handle's owner
 	send_write_sync CMD_FCREATE_CALL, 256
 	return_interrupt_w GEMDRIVE_FCREATE_HANDLE
 
@@ -787,6 +789,7 @@ gemdrive_trap:
 
 	detect_emulated_drive_letter
 
+	bsr	.run_basepage			; d4 = the new handle's owner
 	send_write_sync CMD_FOPEN_CALL, 256
 
 	return_interrupt_l GEMDRIVE_FOPEN_HANDLE
@@ -897,6 +900,40 @@ gemdrive_trap:
 	rts
 
 ; ====================================================================
+; .Pterm — Pterm0, Ptermres and Pterm. TOS closes every file a process
+; opened when it ends, and a crash ends through Pterm too. Have the RP
+; close the GEMDRIVE files the ending process owns, then let TOS end it.
+; ====================================================================
+.Pterm:
+	bsr	.run_basepage
+	move.l	d4, d3
+	send_sync CMD_PTERM_CALL, 4
+	bra	.exec_old_handler
+
+; ====================================================================
+; .run_basepage — d4 = the running process's basepage (TOS's _run), the
+; process a file it opens belongs to. TOS 1.02 on says where _run is in
+; the OS header (p_run); TOS 1.00 keeps it at a fixed address, another
+; one on the Spanish ROM. Trashes a5.
+; ====================================================================
+.run_basepage:
+	move.l	$4F2.w, a5			; _sysbase: the OS header
+	cmp.w	#$0102, 2(a5)			; os_version
+	bcc.s	.rb_p_run
+	move.w	$1C(a5), d4			; os_conf
+	lea	$602C.w, a5			; _run, TOS 1.00
+	lsr.w	#1, d4
+	subq.w	#4, d4				; Spain?
+	bne.s	.rb_read
+	lea	$873C-$602C(a5), a5		; _run, Spanish TOS 1.00
+	bra.s	.rb_read
+.rb_p_run:
+	move.l	$28(a5), a5			; p_run: &_run
+.rb_read:
+	move.l	(a5), d4
+	rts
+
+; ====================================================================
 ; .Fsetdta — record the caller's DTA address with the RP so Fsfirst /
 ; Fsnext can look it up by address. The original handler still runs so
 ; TOS keeps its own _dta variable too (.exec_old_handler).
@@ -940,6 +977,7 @@ gemdrive_trap:
 	; Open the program file via Fopen (read).
 	move.l	GEMDRIVE_PEXEC_FNAME, a4
 	clr.w	d3
+	bsr	.run_basepage			; d4 = the new handle's owner
 	send_write_sync CMD_FOPEN_CALL, 256
 	move.l	GEMDRIVE_FOPEN_HANDLE, d0
 	bmi	.pexec_exit

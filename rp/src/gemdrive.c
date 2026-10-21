@@ -59,6 +59,8 @@ typedef struct {
   // The SD path it was opened with: FatFs keeps no date or time in a FIL,
   // so Fdatime reaches the file through its directory entry.
   char path[GEMDRIVE_DEFAULT_PATH_LEN + 64];
+  // Basepage of the process that opened it, closed by that process's Pterm.
+  uint32_t owner;
 } GemFileSlot;
 static GemFileSlot fileTable[GEMDRIVE_MAX_OPEN_FILES];
 
@@ -702,6 +704,7 @@ static void __not_in_flash_func(handleDdeleteCall)(uint16_t *payload) {
 static void __not_in_flash_func(handleFcreateCall)(uint16_t *payload) {
   uint16_t mode = TPROTO_GET_PAYLOAD_PARAM16(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
+  uint32_t owner = TPROTO_GET_PAYLOAD_PARAM32(payload);  // d4
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   char atari[GEMDRIVE_DEFAULT_PATH_LEN] = {0};
@@ -741,6 +744,7 @@ static void __not_in_flash_func(handleFcreateCall)(uint16_t *payload) {
   }
   snprintf(fileTable[slotIdx].path, sizeof(fileTable[slotIdx].path), "%s",
            sdPath);
+  fileTable[slotIdx].owner = owner;
   int handle = handleFromSlotIndex(slotIdx);
   DPRINTF("GEMDRIVE Fcreate: '%s' (mode=0x%X attribs=0x%X) -> handle %d\n",
           sdPath, (unsigned)mode, (unsigned)wantAttribs, handle);
@@ -1022,14 +1026,14 @@ static void __not_in_flash_func(readPayloadAtariPath)(uint16_t *payload, char *o
 
 static void __not_in_flash_func(handleFopenCall)(uint16_t *payload) {
   // The send_write_sync_far macro sent: d0=cmd, d1=size, d3=mode,
-  // d4 unused, d5 unused, d6=size. Then the buffer (256 bytes from a4 =
+  // d4=owner, d5 unused, d6=size. Then the buffer (256 bytes from a4 =
   // pattern address) follows. Chandler's ring captures both the args
   // and the bytes. payload pointer here is at the post-token args.
   //
   // First longword = mode (from d3); buffer follows from offset 16 (post
   // d3/d4/d5/d6).
   uint32_t mode = TPROTO_GET_PAYLOAD_PARAM32(payload);
-  TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d4
+  uint32_t owner = TPROTO_GET_NEXT32_PAYLOAD_PARAM32(payload);  // d4
   TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d5
   TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d6
 
@@ -1076,6 +1080,7 @@ static void __not_in_flash_func(handleFopenCall)(uint16_t *payload) {
   }
   snprintf(fileTable[slotIdx].path, sizeof(fileTable[slotIdx].path), "%s",
            sdPath);
+  fileTable[slotIdx].owner = owner;
   int handle = handleFromSlotIndex(slotIdx);
   DPRINTF("GEMDRIVE Fopen: '%s' (mode=%lu) -> handle %d\n", sdPath,
           (unsigned long)mode, handle);
@@ -1094,6 +1099,22 @@ static void __not_in_flash_func(handleFcloseCall)(uint16_t *payload) {
   releaseFileSlot(handle - GEMDRIVE_FIRST_FD);
   writeAppFreeLong(GEMDRIVE_FCLOSE_STATUS_OFFSET,
                    (res == FR_OK) ? 0 : (uint32_t)-37);
+}
+
+// Pterm0, Ptermres or Pterm, with the ending process's basepage in d3. TOS
+// closes the files a process leaves open when it ends; these are GEMDRIVE's,
+// and each would otherwise keep a FatFs file and lock entry until the next
+// boot, the file locked against every other open.
+static void __not_in_flash_func(handlePtermCall)(uint16_t *payload) {
+  uint32_t basepage = TPROTO_GET_PAYLOAD_PARAM32(payload);
+  for (int i = 0; i < GEMDRIVE_MAX_OPEN_FILES; i++) {
+    if (fileTable[i].inUse && fileTable[i].owner == basepage) {
+      DPRINTF("GEMDRIVE Pterm: closing handle %d left open by 0x%08lX\n",
+              handleFromSlotIndex(i), (unsigned long)basepage);
+      sdcard_noteResult(f_close(&fileTable[i].fp));
+      releaseFileSlot(i);
+    }
+  }
 }
 
 static void __not_in_flash_func(handleFseekCall)(uint16_t *payload) {
@@ -1493,6 +1514,9 @@ void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
       return;
     case GEMDRIVE_CMD_FCLOSE_CALL:
       handleFcloseCall(payload);
+      return;
+    case GEMDRIVE_CMD_PTERM_CALL:
+      handlePtermCall(payload);
       return;
     case GEMDRIVE_CMD_FSEEK_CALL:
       handleFseekCall(payload);
