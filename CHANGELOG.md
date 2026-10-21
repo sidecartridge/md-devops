@@ -104,11 +104,12 @@ this one.
 ### The Runner
 
 - **On a Mega STE with its cache on**, the Runner's commands could be
-  missed, or their answers lost. `runner reset`, `meminfo` and the other
-  commands a running program cannot refuse are now seen within about half
-  a second whatever the program does with the cache, and DEVOPS.ACC turns
-  the cache off while it talks to the cartridge, for a desktop set up to
-  run fast. A program the accessory starts still gets the desktop's cache.
+  missed, or their answers lost. The ones that reach a running program,
+  such as `runner reset` and `runner adv meminfo`, are now seen within
+  about half a second whatever the program does with the cache, and
+  DEVOPS.ACC turns the cache off while it talks to the cartridge, for a
+  desktop set up to run fast. A program the accessory starts still gets
+  the desktop's cache.
 - **`runner meminfo`** gave the address of TOS's ROM header as the running
   program's basepage. It now reports the real one.
 - **A `load` or `unload` that timed out** was still carried out later, when
@@ -127,7 +128,7 @@ this one.
 - `QUESTION.TOS` is a known-answer test for the Runner: it writes
   `ANSWER.TXT` containing `42` and exits with 42. `ROM4CHK.TOS` prints the
   rom4 area to the debug stream.
-- The cartridge code is at 10,190 of its 10,240 bytes.
+- The cartridge code is at 10,076 of its 10,240 bytes.
 
 ## v1.1.0 (2026-09-17) — robustness
 
