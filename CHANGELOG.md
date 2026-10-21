@@ -75,6 +75,13 @@ As in other SidecarTridge apps: hold SELECT while switching on and the
 cartridge goes straight to the Booster, to install another app or update
 this one.
 
+### The setup menu
+
+- **GEMDRIVE settings changed in the menu** — the drive letter, the
+  relocation address, `_memtop` and the Runner's hook vector — only took
+  effect from the next boot, so choosing `D:` and pressing `[G]` still
+  gave GEMDRIVE `C:`. `[G]` and `[U]` now use what the menu shows.
+
 ### The Runner
 
 - **`runner meminfo`** gave the address of TOS's ROM header as the running

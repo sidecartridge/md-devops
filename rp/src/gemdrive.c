@@ -1534,9 +1534,38 @@ void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
     return;
   }
 
+  DPRINTF(
+      "GEMDRIVE HELLO: screen_base=0x%08lX phystop=0x%08lX "
+      "total_ram=%lu KB (%s)\n",
+      (unsigned long)screenBase, (unsigned long)phystop,
+      (unsigned long)totalRamKb,
+      gemdrivePhystopMismatch ? "MISMATCH" :
+        (totalRamKb == 0 ? "unrecognised" : "ok"));
+  gemdrive_publishSettings();
+
+  // GEMDRIVE HELLO is the unambiguous "ST cold-booted" signal — the
+  // m68k only sends it from gemdrive_init at CA_INIT bit 27. Notify
+  // emul.c so it can re-fire DISPLAY_COMMAND_START_RUNNER when the
+  // user pressed the ST's physical reset button (which never goes
+  // through handle_runner_reset and would otherwise leave the m68k
+  // stuck in the print loop with no relaunch ticker scheduled).
+  emul_onGemdriveHello();
+}
+
+void __not_in_flash_func(gemdrive_init)(void) {
+  for (int i = 0; i < GEMDRIVE_MAX_OPEN_FILES; i++) fileTable[i].inUse = false;
+  for (int i = 0; i < GEMDRIVE_MAX_DTAS; i++) dtaTable[i].inUse = false;
+  chandler_addCB(gemdrive_command_cb);
+  DPRINTF("GEMDRIVE callback registered.\n");
+}
+
+void __not_in_flash_func(gemdrive_publishSettings)(void) {
+  if (!gemdriveHelloLanded) return;
+  if (!aconfigBool(ACONFIG_PARAM_GEMDRIVE_ENABLED, true)) return;
+
   uint32_t relocOverride = aconfigInt(ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR);
   uint32_t memtopOverride = aconfigInt(ACONFIG_PARAM_DEVOPS_MEMTOP);
-  uint32_t defaultReloc = screenBase - GEMDRIVE_DEFAULT_OFFSET_BYTES;
+  uint32_t defaultReloc = gemdriveScreenmem - GEMDRIVE_DEFAULT_OFFSET_BYTES;
   uint32_t effectiveReloc = (relocOverride != 0) ? relocOverride : defaultReloc;
   uint32_t effectiveMemtop =
       (memtopOverride != 0) ? memtopOverride : effectiveReloc;
@@ -1568,33 +1597,13 @@ void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
   publishDriveAndReentry(driveNumber, letter);
 
   DPRINTF(
-      "GEMDRIVE HELLO: screen_base=0x%08lX phystop=0x%08lX "
-      "total_ram=%lu KB (%s) -> reloc=0x%08lX (%s), memtop=0x%08lX (%s), "
+      "GEMDRIVE settings: reloc=0x%08lX (%s), memtop=0x%08lX (%s), "
       "drive=%c (#%u)\n",
-      (unsigned long)screenBase, (unsigned long)phystop,
-      (unsigned long)totalRamKb,
-      gemdrivePhystopMismatch ? "MISMATCH" :
-        (totalRamKb == 0 ? "unrecognised" : "ok"),
       (unsigned long)effectiveReloc,
       (relocOverride != 0) ? "override" : "auto",
       (unsigned long)effectiveMemtop,
       (memtopOverride != 0) ? "override" : "auto",
       letter, (unsigned)driveNumber);
-
-  // GEMDRIVE HELLO is the unambiguous "ST cold-booted" signal — the
-  // m68k only sends it from gemdrive_init at CA_INIT bit 27. Notify
-  // emul.c so it can re-fire DISPLAY_COMMAND_START_RUNNER when the
-  // user pressed the ST's physical reset button (which never goes
-  // through handle_runner_reset and would otherwise leave the m68k
-  // stuck in the print loop with no relaunch ticker scheduled).
-  emul_onGemdriveHello();
-}
-
-void __not_in_flash_func(gemdrive_init)(void) {
-  for (int i = 0; i < GEMDRIVE_MAX_OPEN_FILES; i++) fileTable[i].inUse = false;
-  for (int i = 0; i < GEMDRIVE_MAX_DTAS; i++) dtaTable[i].inUse = false;
-  chandler_addCB(gemdrive_command_cb);
-  DPRINTF("GEMDRIVE callback registered.\n");
 }
 
 bool __not_in_flash_func(gemdrive_getPhystop)(uint32_t *out_phystop, bool *out_mismatch) {

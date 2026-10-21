@@ -1765,6 +1765,7 @@ void cmdGemdriveDrive(const char *arg) {
   settings_put_string(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_DRIVE,
                       driveBuffer);
   (void)saveAppSettings();
+  gemdrive_publishSettings();
   menu();
 }
 
@@ -1800,6 +1801,7 @@ void cmdGemdriveRelocAddr(const char *arg) {
   settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR,
                        (int)value);
   (void)saveAppSettings();
+  gemdrive_publishSettings();
   menu();
 }
 
@@ -1833,15 +1835,14 @@ void cmdGemdriveMemtop(const char *arg) {
   settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_DEVOPS_MEMTOP,
                        (int)value);
   (void)saveAppSettings();
+  gemdrive_publishSettings();
   menu();
 }
 
 // Advanced Runner hook-vector toggle. Single keypress
 // cycles between "vbl" and "etv_timer" — no data-input flow because
-// only two values are valid. Effective on the next ST cold reset
-// (the m68k reads slot 16 once at runner_post_reloc); the menu
-// reflects the *new* setting immediately so the user knows the
-// toggle worked.
+// only two values are valid. The m68k reads slot 16 once at
+// runner_post_reloc, so the new value is published straight away.
 void cmdAdvHookVector(const char *arg) {
   (void)arg;
   haltCountdown = true;
@@ -1855,6 +1856,7 @@ void cmdAdvHookVector(const char *arg) {
   settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ADV_HOOK_VECTOR,
                       next);
   (void)saveAppSettings();
+  gemdrive_publishSettings();
   menu();
 }
 

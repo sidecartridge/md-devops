@@ -173,6 +173,14 @@ void gemdrive_init(void);
 // chandler callback. Public so emul.c can register it via chandler_addCB.
 void gemdrive_command_cb(TransmissionProtocol *protocol, uint16_t *payload);
 
+// Publish the settings the m68k reads when the user picks a mode: the
+// reloc and memtop it installs GEMDRIVE at, the Advanced Runner hook
+// vector and the drive. HELLO publishes them before the menu paints, so
+// a menu command that changes one must call this too, or [G] and [U]
+// use the value from boot. Does nothing until HELLO has landed, or
+// while GEMDRIVE is disabled.
+void gemdrive_publishSettings(void);
+
 // Read the cached phystop value from the most recent GEMDRIVE_CMD_HELLO.
 // Returns false if no HELLO has landed yet (handshake hasn't completed —
 // happens for a sub-millisecond window at boot). When true, *out_phystop
