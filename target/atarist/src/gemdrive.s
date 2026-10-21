@@ -643,32 +643,27 @@ gemdrive_trap:
 	return_interrupt_l GEMDRIVE_FATTRIB_STATUS
 
 ; ====================================================================
-; .Fdatime — get/set a file's date/time. Direct port of source.
-; Args: 8(a0)=struct ptr, 12(a0)=handle, 14(a0)=flag (0=get, 1=set).
+; .Fdatime — get/set a file's date/time.
+; Args: 8(a0)=DOSTIME ptr, 12(a0)=handle, 14(a0)=flag (0=get, 1=set).
+; Decided by the handle, as Fseek is. Like TOS, only a get that
+; succeeds writes the caller's DOSTIME (time word, then date word).
 ; ====================================================================
 .Fdatime:
+	move.w	12(a0), d3
+	detect_emulated_file_handler
+	move.w	d3, d4				; handle
+	move.w	14(a0), d3			; flag
 	move.l	8(a0), a4
-	move.w	12(a0), d4
-	move.w	14(a0), d3
-	move.l	0(a4), d5
-	move.l	4(a4), d6
-	and.l	#$FFFF, d3
-	and.l	#$FFFF, d4
-
-	detect_emulated_drive_letter
-
-	move.l	a4, -(sp)
-	send_sync CMD_FDATETIME_CALL, 16
-	move.l	(sp)+, a4
-
-	lea	GEMDRIVE_FDATETIME_TIME, a6
-	move.b	2(a6), 0(a4)
-	move.b	3(a6), 1(a4)
-	lea	GEMDRIVE_FDATETIME_DATE, a6
-	move.b	2(a6), 2(a4)
-	move.b	3(a6), 3(a4)
-
-	return_interrupt_l GEMDRIVE_FDATETIME_STATUS
+	move.l	(a4), d5			; the time and date, for a set
+	send_sync CMD_FDATETIME_CALL, 12
+	move.l	GEMDRIVE_FDATETIME_STATUS, d0
+	bne.s	.fdatime_done
+	tst.w	d3
+	bne.s	.fdatime_done
+	move.w	GEMDRIVE_FDATETIME_TIME+2, (a4)+
+	move.w	GEMDRIVE_FDATETIME_DATE+2, (a4)
+.fdatime_done:
+	return_rte
 
 ; ====================================================================
 ; .Frename — rename a file/dir. Args: 10(a0)=src, 14(a0)=dst.

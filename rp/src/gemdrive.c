@@ -56,6 +56,9 @@ typedef struct {
   // tail of the file.
   uint32_t lastWriteSeq;
   uint32_t lastWriteBytes;
+  // The SD path it was opened with: FatFs keeps no date or time in a FIL,
+  // so Fdatime reaches the file through its directory entry.
+  char path[GEMDRIVE_DEFAULT_PATH_LEN + 64];
 } GemFileSlot;
 static GemFileSlot fileTable[GEMDRIVE_MAX_OPEN_FILES];
 
@@ -736,6 +739,8 @@ static void __not_in_flash_func(handleFcreateCall)(uint16_t *payload) {
     writeAppFreeWord(GEMDRIVE_FCREATE_HANDLE_OFFSET, (uint16_t)-36);  // EACCDN
     return;
   }
+  snprintf(fileTable[slotIdx].path, sizeof(fileTable[slotIdx].path), "%s",
+           sdPath);
   int handle = handleFromSlotIndex(slotIdx);
   DPRINTF("GEMDRIVE Fcreate: '%s' (mode=0x%X attribs=0x%X) -> handle %d\n",
           sdPath, (unsigned)mode, (unsigned)wantAttribs, handle);
@@ -845,13 +850,13 @@ static void __not_in_flash_func(handleFrenameCall)(uint16_t *payload) {
 // On get: read fattrib's date/time from f_stat by looking up the open
 // file's path (we keep one in the slot for tracking — see below).
 static void __not_in_flash_func(handleFdatetimeCall)(uint16_t *payload) {
+  // d3 = flag (0 = get, 1 = set), d4 = handle, d5 = the caller's DOSTIME:
+  // the time word, then the date word.
   uint16_t flag = TPROTO_GET_PAYLOAD_PARAM16(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   uint16_t handle = TPROTO_GET_PAYLOAD_PARAM16(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   uint32_t dosTime = TPROTO_GET_PAYLOAD_PARAM32(payload);
-  TPROTO_NEXT32_PAYLOAD_PTR(payload);
-  uint32_t dosDate = TPROTO_GET_PAYLOAD_PARAM32(payload);
 
   GemFileSlot *slot = fileSlotByHandle(handle);
   if (slot == NULL) {
@@ -859,19 +864,27 @@ static void __not_in_flash_func(handleFdatetimeCall)(uint16_t *payload) {
     return;
   }
 
-  // FatFs doesn't expose date/time directly from FIL; the practical
-  // approach matches source: report the values that the m68k sent us
-  // back unchanged on get (the desktop typically only reads file dates
-  // via Fsfirst, not via Fdatime), and accept set silently. A more
-  // faithful "get" would require recording the path on Fopen and doing
-  // f_stat here; that's worth doing in S6/polish if any TOS app proves
-  // to depend on read-Fdatime.
-  (void)flag;
-  WRITE_WORD(appFreeAddress(), GEMDRIVE_FDATETIME_TIME_OFFSET,
-             (uint16_t)(dosTime & 0xFFFF));
-  WRITE_WORD(appFreeAddress(), GEMDRIVE_FDATETIME_DATE_OFFSET,
-             (uint16_t)(dosDate & 0xFFFF));
-  writeAppFreeLong(GEMDRIVE_FDATETIME_STATUS_OFFSET, 0);
+  FILINFO fno;
+  FRESULT res;
+  if (flag == 0) {
+    res = f_stat(slot->path, &fno);
+    if (res == FR_OK) {
+      writeAppFreeLong(GEMDRIVE_FDATETIME_TIME_OFFSET, fno.ftime);
+      writeAppFreeLong(GEMDRIVE_FDATETIME_DATE_OFFSET, fno.fdate);
+    }
+  } else {
+    // f_close stamps a file it wrote with the time it closes, so write out
+    // what is pending first: the time set here is then the one it keeps.
+    res = f_sync(&slot->fp);
+    if (res == FR_OK) {
+      fno.ftime = (WORD)(dosTime >> 16);
+      fno.fdate = (WORD)dosTime;
+      res = f_utime(slot->path, &fno);
+    }
+  }
+  sdcard_noteResult(res);
+  writeAppFreeLong(GEMDRIVE_FDATETIME_STATUS_OFFSET,
+                   (res == FR_OK) ? 0 : (uint32_t)-33);  // EFILNF
 }
 
 #if defined(_DEBUG) && (_DEBUG != 0)
@@ -1061,6 +1074,8 @@ static void __not_in_flash_func(handleFopenCall)(uint16_t *payload) {
     writeAppFreeLong(GEMDRIVE_FOPEN_HANDLE_OFFSET, err);
     return;
   }
+  snprintf(fileTable[slotIdx].path, sizeof(fileTable[slotIdx].path), "%s",
+           sdPath);
   int handle = handleFromSlotIndex(slotIdx);
   DPRINTF("GEMDRIVE Fopen: '%s' (mode=%lu) -> handle %d\n", sdPath,
           (unsigned long)mode, handle);

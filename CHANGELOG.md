@@ -61,6 +61,9 @@ AUTO folder instead.
   mintlib seek on every file they open, and `fopen(..., "a")` failed and left
   the file locked. A seek past either end of a file is now refused with
   `ERANGE`, as by TOS, instead of growing the file.
+- **`Fdatime`** went by the current drive rather than the file handle, and
+  its "get" returned whatever was in memory. It now acts on the handle's
+  file: get returns the file's own date and time, and set changes them.
 
 ### Feed data to a running program: the rom4 area
 
