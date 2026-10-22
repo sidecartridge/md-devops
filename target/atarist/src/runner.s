@@ -91,7 +91,6 @@ RANDOM_TOKEN_POST_WAIT		equ $1
 ROMCMD_START_ADDR		equ $FB0000
 CMD_MAGIC_NUMBER		equ $ABCD
 CMD_RETRIES_COUNT		equ 5
-CMD_SET_SHARED_VAR		equ 1
 ; Same budget as gemdrive.s: the Runner's commands also wait on SD work.
 COMMAND_TIMEOUT			equ $0006FFFF
 COMMAND_WRITE_TIMEOUT		equ COMMAND_TIMEOUT
@@ -112,6 +111,7 @@ XBIOS_Vsync			equ 37
 PE_LOAD_GO			equ 0	; Pexec mode 0: load + go, returns
 PE_LOAD				equ 3	; Pexec mode 3: load only, returns basepage ptr
 PE_GO				equ 4	; Pexec mode 4: just go, takes basepage ptr in fname slot
+_frclock			equ $466	; frames since boot, counted by TOS' VBL
 
 ; RUNNER_RES errno codes (i32 in RUNNER_CMD_DONE_RES payload).
 RUNNER_RES_OK			equ 0
@@ -922,6 +922,21 @@ runner_meminfo:
 ; ---------------------------------------------------------------
 adv_hook_handler:
 	movem.l	d0-d1/a0, -(sp)			; ISR prologue — minimal save
+	; A Mega STE's cache can answer the sentinel read from an old copy,
+	; and the commands below send through the cartridge. While a program
+	; has the cache on, look every 32nd frame only, so it keeps its
+	; cache, and then with the cache off: adv_chain_to_old puts it back.
+	cmp.l	#COOKIE_JAR_MEGASTE, SHARED_VARIABLES_ADDR+(SHARED_VARIABLE_HARDWARE_TYPE*4)
+	bne.s	.adv_read
+	btst	#0, MEGASTE_SPEED_CACHE_REG.w
+	beq.s	.adv_read
+	moveq	#31, d0
+	and.b	_frclock+3.w, d0
+	bne	adv_chain_to_old
+	bclr	#0, MEGASTE_SPEED_CACHE_REG.w
+	lea	adv_cache_off(pc), a0
+	st	(a0)
+.adv_read:
 	move.l	CMD_MAGIC_SENTINEL_ADDR, d0
 	move.l	d0, d1
 	andi.l	#$FFFFFF00, d1
@@ -940,6 +955,12 @@ adv_hook_handler:
 	; m68k from inside an ISR is a hazard; the RP-side handler
 	; already validated the command code before firing the sentinel.)
 adv_chain_to_old:
+	lea	adv_cache_off(pc), a0
+	tst.b	(a0)
+	beq.s	.adv_cache_kept
+	sf	(a0)
+	bset	#0, MEGASTE_SPEED_CACHE_REG.w
+.adv_cache_kept:
 	movem.l	(sp)+, d0-d1/a0
 	move.l	old_adv_hook(pc), -(sp)
 	rts					; chain → previous handler
@@ -1145,6 +1166,10 @@ old_adv_hook:
 	dc.l	0
 adv_active_vec:
 	dc.l	0
+; Set while the hook has turned a program's Mega STE cache off, for
+; adv_chain_to_old to turn it back on.
+adv_cache_off:
+	dc.b	0
 	even
 
 ; ---------------------------------------------------------------

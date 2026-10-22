@@ -56,6 +56,11 @@ typedef struct {
   // tail of the file.
   uint32_t lastWriteSeq;
   uint32_t lastWriteBytes;
+  // The SD path it was opened with: FatFs keeps no date or time in a FIL,
+  // so Fdatime reaches the file through its directory entry.
+  char path[GEMDRIVE_DEFAULT_PATH_LEN + 64];
+  // Basepage of the process that opened it, closed by that process's Pterm.
+  uint32_t owner;
 } GemFileSlot;
 static GemFileSlot fileTable[GEMDRIVE_MAX_OPEN_FILES];
 
@@ -699,6 +704,7 @@ static void __not_in_flash_func(handleDdeleteCall)(uint16_t *payload) {
 static void __not_in_flash_func(handleFcreateCall)(uint16_t *payload) {
   uint16_t mode = TPROTO_GET_PAYLOAD_PARAM16(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
+  uint32_t owner = TPROTO_GET_PAYLOAD_PARAM32(payload);  // d4
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   char atari[GEMDRIVE_DEFAULT_PATH_LEN] = {0};
@@ -736,6 +742,9 @@ static void __not_in_flash_func(handleFcreateCall)(uint16_t *payload) {
     writeAppFreeWord(GEMDRIVE_FCREATE_HANDLE_OFFSET, (uint16_t)-36);  // EACCDN
     return;
   }
+  snprintf(fileTable[slotIdx].path, sizeof(fileTable[slotIdx].path), "%s",
+           sdPath);
+  fileTable[slotIdx].owner = owner;
   int handle = handleFromSlotIndex(slotIdx);
   DPRINTF("GEMDRIVE Fcreate: '%s' (mode=0x%X attribs=0x%X) -> handle %d\n",
           sdPath, (unsigned)mode, (unsigned)wantAttribs, handle);
@@ -845,13 +854,13 @@ static void __not_in_flash_func(handleFrenameCall)(uint16_t *payload) {
 // On get: read fattrib's date/time from f_stat by looking up the open
 // file's path (we keep one in the slot for tracking — see below).
 static void __not_in_flash_func(handleFdatetimeCall)(uint16_t *payload) {
+  // d3 = flag (0 = get, 1 = set), d4 = handle, d5 = the caller's DOSTIME:
+  // the time word, then the date word.
   uint16_t flag = TPROTO_GET_PAYLOAD_PARAM16(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   uint16_t handle = TPROTO_GET_PAYLOAD_PARAM16(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
   uint32_t dosTime = TPROTO_GET_PAYLOAD_PARAM32(payload);
-  TPROTO_NEXT32_PAYLOAD_PTR(payload);
-  uint32_t dosDate = TPROTO_GET_PAYLOAD_PARAM32(payload);
 
   GemFileSlot *slot = fileSlotByHandle(handle);
   if (slot == NULL) {
@@ -859,19 +868,27 @@ static void __not_in_flash_func(handleFdatetimeCall)(uint16_t *payload) {
     return;
   }
 
-  // FatFs doesn't expose date/time directly from FIL; the practical
-  // approach matches source: report the values that the m68k sent us
-  // back unchanged on get (the desktop typically only reads file dates
-  // via Fsfirst, not via Fdatime), and accept set silently. A more
-  // faithful "get" would require recording the path on Fopen and doing
-  // f_stat here; that's worth doing in S6/polish if any TOS app proves
-  // to depend on read-Fdatime.
-  (void)flag;
-  WRITE_WORD(appFreeAddress(), GEMDRIVE_FDATETIME_TIME_OFFSET,
-             (uint16_t)(dosTime & 0xFFFF));
-  WRITE_WORD(appFreeAddress(), GEMDRIVE_FDATETIME_DATE_OFFSET,
-             (uint16_t)(dosDate & 0xFFFF));
-  writeAppFreeLong(GEMDRIVE_FDATETIME_STATUS_OFFSET, 0);
+  FILINFO fno;
+  FRESULT res;
+  if (flag == 0) {
+    res = f_stat(slot->path, &fno);
+    if (res == FR_OK) {
+      writeAppFreeLong(GEMDRIVE_FDATETIME_TIME_OFFSET, fno.ftime);
+      writeAppFreeLong(GEMDRIVE_FDATETIME_DATE_OFFSET, fno.fdate);
+    }
+  } else {
+    // f_close stamps a file it wrote with the time it closes, so write out
+    // what is pending first: the time set here is then the one it keeps.
+    res = f_sync(&slot->fp);
+    if (res == FR_OK) {
+      fno.ftime = (WORD)(dosTime >> 16);
+      fno.fdate = (WORD)dosTime;
+      res = f_utime(slot->path, &fno);
+    }
+  }
+  sdcard_noteResult(res);
+  writeAppFreeLong(GEMDRIVE_FDATETIME_STATUS_OFFSET,
+                   (res == FR_OK) ? 0 : (uint32_t)-33);  // EFILNF
 }
 
 #if defined(_DEBUG) && (_DEBUG != 0)
@@ -1009,14 +1026,14 @@ static void __not_in_flash_func(readPayloadAtariPath)(uint16_t *payload, char *o
 
 static void __not_in_flash_func(handleFopenCall)(uint16_t *payload) {
   // The send_write_sync_far macro sent: d0=cmd, d1=size, d3=mode,
-  // d4 unused, d5 unused, d6=size. Then the buffer (256 bytes from a4 =
+  // d4=owner, d5 unused, d6=size. Then the buffer (256 bytes from a4 =
   // pattern address) follows. Chandler's ring captures both the args
   // and the bytes. payload pointer here is at the post-token args.
   //
   // First longword = mode (from d3); buffer follows from offset 16 (post
   // d3/d4/d5/d6).
   uint32_t mode = TPROTO_GET_PAYLOAD_PARAM32(payload);
-  TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d4
+  uint32_t owner = TPROTO_GET_NEXT32_PAYLOAD_PARAM32(payload);  // d4
   TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d5
   TPROTO_NEXT32_PAYLOAD_PTR(payload);  // skip d6
 
@@ -1061,6 +1078,9 @@ static void __not_in_flash_func(handleFopenCall)(uint16_t *payload) {
     writeAppFreeLong(GEMDRIVE_FOPEN_HANDLE_OFFSET, err);
     return;
   }
+  snprintf(fileTable[slotIdx].path, sizeof(fileTable[slotIdx].path), "%s",
+           sdPath);
+  fileTable[slotIdx].owner = owner;
   int handle = handleFromSlotIndex(slotIdx);
   DPRINTF("GEMDRIVE Fopen: '%s' (mode=%lu) -> handle %d\n", sdPath,
           (unsigned long)mode, handle);
@@ -1081,35 +1101,58 @@ static void __not_in_flash_func(handleFcloseCall)(uint16_t *payload) {
                    (res == FR_OK) ? 0 : (uint32_t)-37);
 }
 
+// Pterm0, Ptermres or Pterm, with the ending process's basepage in d3. TOS
+// closes the files a process leaves open when it ends; these are GEMDRIVE's,
+// and each would otherwise keep a FatFs file and lock entry until the next
+// boot, the file locked against every other open.
+static void __not_in_flash_func(handlePtermCall)(uint16_t *payload) {
+  uint32_t basepage = TPROTO_GET_PAYLOAD_PARAM32(payload);
+  for (int i = 0; i < GEMDRIVE_MAX_OPEN_FILES; i++) {
+    if (fileTable[i].inUse && fileTable[i].owner == basepage) {
+      DPRINTF("GEMDRIVE Pterm: closing handle %d left open by 0x%08lX\n",
+              handleFromSlotIndex(i), (unsigned long)basepage);
+      sdcard_noteResult(f_close(&fileTable[i].fp));
+      releaseFileSlot(i);
+    }
+  }
+}
+
 static void __not_in_flash_func(handleFseekCall)(uint16_t *payload) {
-  uint32_t offset = TPROTO_GET_PAYLOAD_PARAM32(payload);
+  // The ST sends the handle in d3, the offset in d4 and the mode in d5.
+  uint16_t handle = TPROTO_GET_PAYLOAD_PARAM16(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
-  uint16_t handle = (uint16_t)TPROTO_GET_PAYLOAD_PARAM32(payload);
+  int32_t offset = (int32_t)TPROTO_GET_PAYLOAD_PARAM32(payload);
   TPROTO_NEXT32_PAYLOAD_PTR(payload);
-  uint16_t mode = (uint16_t)TPROTO_GET_PAYLOAD_PARAM32(payload);
+  uint16_t mode = TPROTO_GET_PAYLOAD_PARAM16(payload);
 
   GemFileSlot *slot = fileSlotByHandle(handle);
   if (slot == NULL) {
     writeAppFreeLong(GEMDRIVE_FSEEK_STATUS_OFFSET, (uint32_t)-37);
     return;
   }
-  FSIZE_t newPos;
-  int32_t signedOffset = (int32_t)offset;
-  switch (mode & 0xFFFF) {
+  int64_t newPos;
+  switch (mode) {
     case 0:  // SEEK_SET
-      newPos = (FSIZE_t)signedOffset;
+      newPos = offset;
       break;
     case 1:  // SEEK_CUR
-      newPos = f_tell(&slot->fp) + (FSIZE_t)signedOffset;
+      newPos = (int64_t)f_tell(&slot->fp) + offset;
       break;
     case 2:  // SEEK_END
-      newPos = f_size(&slot->fp) + (FSIZE_t)signedOffset;
+      newPos = (int64_t)f_size(&slot->fp) + offset;
       break;
     default:
       writeAppFreeLong(GEMDRIVE_FSEEK_STATUS_OFFSET, (uint32_t)-64);  // ERANGE
       return;
   }
-  FRESULT res = f_lseek(&slot->fp, newPos);
+  // TOS refuses a seek outside the file with ERANGE and leaves the position
+  // where it was. FatFs would grow a file open for writing instead, and
+  // mintlib's isatty() probes every file it opens with a seek one byte ahead.
+  if (newPos < 0 || newPos > (int64_t)f_size(&slot->fp)) {
+    writeAppFreeLong(GEMDRIVE_FSEEK_STATUS_OFFSET, (uint32_t)-64);  // ERANGE
+    return;
+  }
+  FRESULT res = f_lseek(&slot->fp, (FSIZE_t)newPos);
   sdcard_noteResult(res);
   if (res != FR_OK) {
     writeAppFreeLong(GEMDRIVE_FSEEK_STATUS_OFFSET, (uint32_t)-64);
@@ -1472,6 +1515,9 @@ void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
     case GEMDRIVE_CMD_FCLOSE_CALL:
       handleFcloseCall(payload);
       return;
+    case GEMDRIVE_CMD_PTERM_CALL:
+      handlePtermCall(payload);
+      return;
     case GEMDRIVE_CMD_FSEEK_CALL:
       handleFseekCall(payload);
       return;
@@ -1506,9 +1552,17 @@ void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
   //   [4..7]  phystop       — TOS-reported _phystop ($42E)
   //   [8..11] total_ram_kb  — decoded from MMU bank-config nibble at
   //                           $FFFF8001; 0 = unrecognised silicon
+  //   [12..15] _MCH         — the machine cookie; 0 without a cookie jar
   uint32_t screenBase   = TPROTO_GET_PAYLOAD_PARAM32(payload);
   uint32_t phystop      = TPROTO_GET_NEXT32_PAYLOAD_PARAM32(payload);
   uint32_t totalRamKb   = TPROTO_GET_NEXT32_PAYLOAD_PARAM32(payload);
+  uint32_t machine      = TPROTO_GET_NEXT32_PAYLOAD_PARAM32(payload);
+
+  // GEMDRIVE, the Runner's hook and DEVOPS.ACC switch a Mega STE's cache
+  // off while they talk to the cartridge, and must not touch the register
+  // on any other machine.
+  SET_SHARED_VAR(CHANDLER_HARDWARE_TYPE, machine, sharedBaseAddress(),
+                 CHANDLER_SHARED_VARIABLES_OFFSET);
 
   // HELLO comes once per ST boot. Nothing the previous session opened can
   // still be in use, and a program that crashed never closed its files:
@@ -1534,9 +1588,39 @@ void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
     return;
   }
 
+  DPRINTF(
+      "GEMDRIVE HELLO: screen_base=0x%08lX phystop=0x%08lX "
+      "total_ram=%lu KB (%s) _MCH=0x%08lX\n",
+      (unsigned long)screenBase, (unsigned long)phystop,
+      (unsigned long)totalRamKb,
+      gemdrivePhystopMismatch ? "MISMATCH" :
+        (totalRamKb == 0 ? "unrecognised" : "ok"),
+      (unsigned long)machine);
+  gemdrive_publishSettings();
+
+  // GEMDRIVE HELLO is the unambiguous "ST cold-booted" signal — the
+  // m68k only sends it from gemdrive_init at CA_INIT bit 27. Notify
+  // emul.c so it can re-fire DISPLAY_COMMAND_START_RUNNER when the
+  // user pressed the ST's physical reset button (which never goes
+  // through handle_runner_reset and would otherwise leave the m68k
+  // stuck in the print loop with no relaunch ticker scheduled).
+  emul_onGemdriveHello();
+}
+
+void __not_in_flash_func(gemdrive_init)(void) {
+  for (int i = 0; i < GEMDRIVE_MAX_OPEN_FILES; i++) fileTable[i].inUse = false;
+  for (int i = 0; i < GEMDRIVE_MAX_DTAS; i++) dtaTable[i].inUse = false;
+  chandler_addCB(gemdrive_command_cb);
+  DPRINTF("GEMDRIVE callback registered.\n");
+}
+
+void __not_in_flash_func(gemdrive_publishSettings)(void) {
+  if (!gemdriveHelloLanded) return;
+  if (!aconfigBool(ACONFIG_PARAM_GEMDRIVE_ENABLED, true)) return;
+
   uint32_t relocOverride = aconfigInt(ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR);
   uint32_t memtopOverride = aconfigInt(ACONFIG_PARAM_DEVOPS_MEMTOP);
-  uint32_t defaultReloc = screenBase - GEMDRIVE_DEFAULT_OFFSET_BYTES;
+  uint32_t defaultReloc = gemdriveScreenmem - GEMDRIVE_DEFAULT_OFFSET_BYTES;
   uint32_t effectiveReloc = (relocOverride != 0) ? relocOverride : defaultReloc;
   uint32_t effectiveMemtop =
       (memtopOverride != 0) ? memtopOverride : effectiveReloc;
@@ -1568,33 +1652,13 @@ void __not_in_flash_func(gemdrive_command_cb)(TransmissionProtocol *protocol,
   publishDriveAndReentry(driveNumber, letter);
 
   DPRINTF(
-      "GEMDRIVE HELLO: screen_base=0x%08lX phystop=0x%08lX "
-      "total_ram=%lu KB (%s) -> reloc=0x%08lX (%s), memtop=0x%08lX (%s), "
+      "GEMDRIVE settings: reloc=0x%08lX (%s), memtop=0x%08lX (%s), "
       "drive=%c (#%u)\n",
-      (unsigned long)screenBase, (unsigned long)phystop,
-      (unsigned long)totalRamKb,
-      gemdrivePhystopMismatch ? "MISMATCH" :
-        (totalRamKb == 0 ? "unrecognised" : "ok"),
       (unsigned long)effectiveReloc,
       (relocOverride != 0) ? "override" : "auto",
       (unsigned long)effectiveMemtop,
       (memtopOverride != 0) ? "override" : "auto",
       letter, (unsigned)driveNumber);
-
-  // GEMDRIVE HELLO is the unambiguous "ST cold-booted" signal — the
-  // m68k only sends it from gemdrive_init at CA_INIT bit 27. Notify
-  // emul.c so it can re-fire DISPLAY_COMMAND_START_RUNNER when the
-  // user pressed the ST's physical reset button (which never goes
-  // through handle_runner_reset and would otherwise leave the m68k
-  // stuck in the print loop with no relaunch ticker scheduled).
-  emul_onGemdriveHello();
-}
-
-void __not_in_flash_func(gemdrive_init)(void) {
-  for (int i = 0; i < GEMDRIVE_MAX_OPEN_FILES; i++) fileTable[i].inUse = false;
-  for (int i = 0; i < GEMDRIVE_MAX_DTAS; i++) dtaTable[i].inUse = false;
-  chandler_addCB(gemdrive_command_cb);
-  DPRINTF("GEMDRIVE callback registered.\n");
 }
 
 bool __not_in_flash_func(gemdrive_getPhystop)(uint32_t *out_phystop, bool *out_mismatch) {

@@ -54,6 +54,34 @@ AUTO folder instead.
 - **The current directory** reached the Atari with its bytes swapped:
   `Dgetpath` returned `\STDL` as `S\DT`.
 
+### Files that programs open through GEMDRIVE
+
+- **`Fseek` never worked**: the RP took the handle for the offset, so a seek
+  answered "invalid handle" or moved the wrong file. Programs built with
+  mintlib seek on every file they open, and `fopen(..., "a")` failed and left
+  the file locked. A seek past either end of a file is now refused with
+  `ERANGE`, as by TOS, instead of growing the file.
+- **`Fdatime`** went by the current drive rather than the file handle, and
+  its "get" returned whatever was in memory. It now acts on the handle's
+  file: get returns the file's own date and time, and set changes them.
+- **A file a program left open** when it ended, or crashed, stayed open
+  until the next boot, locked against every other open, including the
+  API's. GEMDRIVE now closes a program's files when it ends, as TOS does.
+- **On a Mega STE with its cache on**, as programs that want speed run,
+  GEMDRIVE calls were lost or answered wrong: the cache kept old copies of
+  what the cartridge said. GEMDRIVE now turns the cache off for each call
+  it answers and back on after; the CPU speed is left alone. The cartridge
+  also turns it off when the Atari boots, which a reset does not.
+- **The 16 KB that GEMDRIVE and the Runner live in** was still free memory
+  as far as TOS knew, so a program that took nearly all of it could be
+  given that area and overwrite them, and every program's stack started
+  inside it. GEMDRIVE now takes the area from TOS when it installs.
+- **Programs started with `[U]` hung or crashed as they ended** when they
+  had used GEMDRIVE. Their calls ran on TOS's small boot-time stack, and
+  GEMDRIVE's work there overwrote TOS's own variables. GEMDRIVE now does
+  its work on a stack of its own, and a call it passes on to TOS reaches
+  it with every register as the program left it.
+
 ### Feed data to a running program: the rom4 area
 
 1 KB of the cartridge, at `$FA8B00`, that the workstation writes over HTTP
@@ -75,8 +103,22 @@ As in other SidecarTridge apps: hold SELECT while switching on and the
 cartridge goes straight to the Booster, to install another app or update
 this one.
 
+### The setup menu
+
+- **GEMDRIVE settings changed in the menu** — the drive letter, the
+  relocation address, `_memtop` and the Runner's hook vector — only took
+  effect from the next boot, so choosing `D:` and pressing `[G]` still
+  gave GEMDRIVE `C:`. `[G]` and `[U]` now use what the menu shows.
+
 ### The Runner
 
+- **On a Mega STE with its cache on**, the Runner's commands could be
+  missed, or their answers lost. The ones that reach a running program,
+  such as `runner reset` and `runner adv meminfo`, are now seen within
+  about half a second whatever the program does with the cache, and
+  DEVOPS.ACC turns the cache off while it talks to the cartridge, for a
+  desktop set up to run fast. A program the accessory starts still gets
+  the desktop's cache.
 - **`runner meminfo`** gave the address of TOS's ROM header as the running
   program's basepage. It now reports the real one.
 - **A `load` or `unload` that timed out** was still carried out later, when
@@ -92,10 +134,13 @@ this one.
 
 ### For developers
 
+- GEMDRIVE's XBRA header (`SDGD`) now sits right in front of its trap #1
+  entry, so tools that walk the GEMDOS chain find it and the handlers
+  below it.
 - `QUESTION.TOS` is a known-answer test for the Runner: it writes
   `ANSWER.TXT` containing `42` and exits with 42. `ROM4CHK.TOS` prints the
   rom4 area to the debug stream.
-- The cartridge code is at 10,190 of its 10,240 bytes.
+- The cartridge code is at 10,076 of its 10,240 bytes.
 
 ## v1.1.0 (2026-09-17) — robustness
 
