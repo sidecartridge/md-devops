@@ -62,6 +62,7 @@ RUNNER_PROTO_VERSION		equ $00010001	; min=1, max=1
 ; CMD_START_RUNNER=5) live in the [0..15] range; Runner-namespace
 ; commands live at $0500 + N to avoid collisions.
 CMD_NOP				equ 0
+CMD_START_TSR			equ 6	; main.s' TSR dispatch; arrives in d6
 APP_RUNNER			equ $0500
 RUNNER_CMD_EXECUTE		equ ($02 + APP_RUNNER)	; Pexec mode 0
 RUNNER_CMD_CD			equ ($03 + APP_RUNNER)	; Dsetpath
@@ -90,7 +91,6 @@ RANDOM_TOKEN_POST_WAIT		equ $1
 ROMCMD_START_ADDR		equ $FB0000
 CMD_MAGIC_NUMBER		equ $ABCD
 CMD_RETRIES_COUNT		equ 5
-CMD_SET_SHARED_VAR		equ 1
 ; Same budget as gemdrive.s: the Runner's commands also wait on SD work.
 COMMAND_TIMEOUT			equ $0006FFFF
 COMMAND_WRITE_TIMEOUT		equ COMMAND_TIMEOUT
@@ -111,6 +111,7 @@ XBIOS_Vsync			equ 37
 PE_LOAD_GO			equ 0	; Pexec mode 0: load + go, returns
 PE_LOAD				equ 3	; Pexec mode 3: load only, returns basepage ptr
 PE_GO				equ 4	; Pexec mode 4: just go, takes basepage ptr in fname slot
+_frclock			equ $466	; frames since boot, counted by TOS' VBL
 
 ; RUNNER_RES errno codes (i32 in RUNNER_CMD_DONE_RES payload).
 RUNNER_RES_OK			equ 0
@@ -216,7 +217,10 @@ ADV_HOOK_VECTOR			equ ADV_HOOK_VECTOR_ETV_TIMER
 
 ; ---------------------------------------------------------------
 ; Entry point — offset 0 of the runner blob. Reached via
-; `jmp RUNNER_BLOB` from main.s's check_commands dispatch.
+; `jmp RUNNER_BLOB` from main.s's check_commands dispatch, or via
+; `jsr RUNNER_BLOB` from tsr_function. d6 holds the dispatching
+; sentinel value; with CMD_START_TSR the Runner installs its hook,
+; sends HELLO and returns instead of entering the poll loop.
 ; ---------------------------------------------------------------
 
 runner_entry:
@@ -268,23 +272,6 @@ runner_post_reloc:
 	; APP_FREE (RP writes), shared variables (RP writes via
 	; chandler), or the RP's in-memory mirror (set by cmdRunner /
 	; the chandler callbacks).
-
-	; --- Step 0: known cwd baseline. Whether we landed here from a
-	; cold boot, a runner reset, or the [U] menu pick, force the
-	; current drive onto the GEMDRIVE-emulated drive and Dsetpath the
-	; cwd back to root. The RP-side mirror clears its cwd on HELLO
-	; below, so relative `runner cd` / `runner run` always resolve
-	; from the same baseline on both sides. ---
-	move.l	DRIVE_NUMBER_ADDR, d3
-	move.w	d3, -(sp)
-	move.w	#GEMDOS_Dsetdrv, -(sp)
-	trap	#1
-	addq.l	#4, sp
-
-	pea	root_path(pc)
-	move.w	#GEMDOS_Dsetpath, -(sp)
-	trap	#1
-	addq.l	#6, sp
 
 	; --- Step 0.5: install the Advanced Runner
 	; hook at the vector chosen by the RP-side aconfig setting. The
@@ -340,6 +327,31 @@ runner_post_reloc:
 	ori.l	#$FF00, d3			; bits 8..15 = 0xFF (unknown)
 .adv_hello_send:
 	send_sync RUNNER_CMD_DONE_HELLO, 4
+
+	; TSR mode ends here: back to main.s' tsr_function, which lets TOS
+	; boot on, and DEVOPS.ACC keeps its own cwd. send_sync restores d6,
+	; so it still holds the dispatch.
+	cmp.w	#CMD_START_TSR, d6
+	bne.s	.foreground
+	rts
+.foreground:
+
+	; --- Known cwd baseline. Whether we landed here from a cold boot,
+	; a runner reset, or the [U] menu pick, force the current drive
+	; onto the GEMDRIVE-emulated drive and Dsetpath the cwd back to
+	; root. The RP-side mirror cleared its cwd on the HELLO above, so
+	; relative `runner cd` / `runner run` always resolve from the same
+	; baseline on both sides. ---
+	move.l	DRIVE_NUMBER_ADDR, d3
+	move.w	d3, -(sp)
+	move.w	#GEMDOS_Dsetdrv, -(sp)
+	trap	#1
+	addq.l	#4, sp
+
+	pea	root_path(pc)
+	move.w	#GEMDOS_Dsetpath, -(sp)
+	trap	#1
+	addq.l	#6, sp
 
 	; --- Step 1: clear screen + paint banner (single Cconws — the
 	; banner_text string leads with VT52 ESC E). ---
@@ -789,7 +801,7 @@ runner_res:
 ;     4     u32   _memtop   ($436)
 ;     8     u32   _phystop  ($42E)
 ;    12     u32   screenmem ($44E)
-;    16     u32   basepage  ($4F2 — TOS >= 1.04; 0 on older TOS)
+;    16     u32   basepage  (_run, see runner_store_basepage)
 ;    20     u16   bank0_kb  (decoded from $FFFF8001 lower nibble)
 ;    22     u16   bank1_kb
 ;
@@ -832,13 +844,13 @@ runner_meminfo:
 	clr.l	20(a4)
 
 	; Stage 4: full struct. _membot ($432), _memtop ($436),
-	; _phystop ($42E), screenmem ($44E), basepage ($4F2), and the
+	; _phystop ($42E), screenmem ($44E), basepage (_run), and the
 	; MMU bank-config byte at $FFFF8001.
 	move.l	$432.w, 0(a4)			; _membot
 	move.l	$436.w, 4(a4)			; _memtop
 	move.l	$42E.w, 8(a4)			; _phystop
 	move.l	$44E.w, 12(a4)			; screenmem (logical screen base)
-	move.l	$4F2.w, 16(a4)			; _run (basepage; 0 on TOS < 1.04)
+	bsr	runner_store_basepage		; 16(a4) = _run (basepage)
 
 	; Read the MMU configuration register at $FFFF8001. The byte's
 	; lower nibble encodes the (bank0, bank1) sizes. We're already
@@ -910,6 +922,21 @@ runner_meminfo:
 ; ---------------------------------------------------------------
 adv_hook_handler:
 	movem.l	d0-d1/a0, -(sp)			; ISR prologue — minimal save
+	; A Mega STE's cache can answer the sentinel read from an old copy,
+	; and the commands below send through the cartridge. While a program
+	; has the cache on, look every 32nd frame only, so it keeps its
+	; cache, and then with the cache off: adv_chain_to_old puts it back.
+	cmp.l	#COOKIE_JAR_MEGASTE, SHARED_VARIABLES_ADDR+(SHARED_VARIABLE_HARDWARE_TYPE*4)
+	bne.s	.adv_read
+	btst	#0, MEGASTE_SPEED_CACHE_REG.w
+	beq.s	.adv_read
+	moveq	#31, d0
+	and.b	_frclock+3.w, d0
+	bne	adv_chain_to_old
+	bclr	#0, MEGASTE_SPEED_CACHE_REG.w
+	lea	adv_cache_off(pc), a0
+	st	(a0)
+.adv_read:
 	move.l	CMD_MAGIC_SENTINEL_ADDR, d0
 	move.l	d0, d1
 	andi.l	#$FFFFFF00, d1
@@ -928,6 +955,12 @@ adv_hook_handler:
 	; m68k from inside an ISR is a hazard; the RP-side handler
 	; already validated the command code before firing the sentinel.)
 adv_chain_to_old:
+	lea	adv_cache_off(pc), a0
+	tst.b	(a0)
+	beq.s	.adv_cache_kept
+	sf	(a0)
+	bset	#0, MEGASTE_SPEED_CACHE_REG.w
+.adv_cache_kept:
 	movem.l	(sp)+, d0-d1/a0
 	move.l	old_adv_hook(pc), -(sp)
 	rts					; chain → previous handler
@@ -954,7 +987,7 @@ adv_force_reset:
 ; VBL ISR so it works even when the foreground poll loop is wedged.
 ;
 ; We're already in supervisor mode (autovector $70 entry preserves
-; the SR with S=1) so $432/$436/$42E/$44E/$4F2/$FFFF8001 are all
+; the SR with S=1) so $432/$436/$42E/$44E/_run/$FFFF8001 are all
 ; readable directly — no Super() toggle needed. No Cconws trace
 ; either: GEMDOS calls from inside an ISR are a hazard.
 ;
@@ -977,7 +1010,7 @@ adv_meminfo_isr:
 	move.l	$436.w, 4(a4)			; _memtop
 	move.l	$42E.w, 8(a4)			; _phystop
 	move.l	$44E.w, 12(a4)			; _v_bas_ad
-	move.l	$4F2.w, 16(a4)			; _run (basepage; 0 on TOS < 1.04)
+	bsr	runner_store_basepage		; 16(a4) = _run (basepage)
 	clr.l	20(a4)				; pre-zero bank0/bank1 slots
 
 	; --- Read MMU config byte at $FFFF8001 and decode bank sizes. ---
@@ -1133,7 +1166,36 @@ old_adv_hook:
 	dc.l	0
 adv_active_vec:
 	dc.l	0
+; Set while the hook has turned a program's Mega STE cache off, for
+; adv_chain_to_old to turn it back on.
+adv_cache_off:
+	dc.b	0
 	even
+
+; ---------------------------------------------------------------
+; runner_store_basepage — store the running process's basepage, from
+; TOS' _run, at 16(a4) in the meminfo struct. $4F2 is _sysbase, a
+; pointer to the OS header, not _run itself. From TOS 1.02 the header's
+; p_run field (offset $28) holds _run's address; TOS 1.00 has no such
+; field and keeps _run at $602C, or at $873C in the Spanish version
+; (country code 4 in bits 1..15 of os_conf). Trashes d0/a0.
+; ---------------------------------------------------------------
+runner_store_basepage:
+	move.l	$4F2.w, a0			; _sysbase: the OS header
+	cmp.w	#$0102, 2(a0)			; os_version
+	bcc.s	.sb_p_run
+	move.w	$1C(a0), d0			; os_conf
+	lea	$602C.w, a0			; _run, TOS 1.00
+	lsr.w	#1, d0
+	subq.w	#4, d0				; Spain?
+	bne.s	.sb_read
+	lea	$873C-$602C(a0), a0		; _run, Spanish TOS 1.00
+	bra.s	.sb_read
+.sb_p_run:
+	move.l	$28(a0), a0			; p_run: &_run
+.sb_read:
+	move.l	(a0), 16(a4)
+	rts
 
 ; ---------------------------------------------------------------
 ; runner_print_dec_d3 — print signed 32-bit value in d3 as ASCII

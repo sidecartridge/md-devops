@@ -34,6 +34,7 @@
 #include "network.h"
 #include "pico/stdlib.h"
 #include "reset.h"
+#include "rom4.h"
 #include "romemul.h"
 #include "sdcard.h"
 #include "select.h"
@@ -67,6 +68,7 @@ static void cmdGemdriveRelocAddr(const char *arg);
 static void cmdGemdriveMemtop(const char *arg);
 static void cmdAdvHookVector(const char *arg);
 static void cmdRunner(const char *arg);
+static void cmdGemdriveRunner(const char *arg);
 static void clearLaunchBlock(void);
 
 // Command table. Every key here corresponds to a label on the on-screen
@@ -82,6 +84,7 @@ static const Command commands[] = {
     {"t", cmdGemdriveMemtop},
     {"v", cmdAdvHookVector},
     {"u", cmdRunner},
+    {"n", cmdGemdriveRunner},
 };
 
 // Number of commands in the table
@@ -98,14 +101,19 @@ static bool menuScreenActive = false;
 // menu() (initial paint) and the main loop (live refresh) touch
 // it. Fixed cursor row so the overdraw doesn't have to walk the
 // terminal state.
-#define MENU_USBCDC_ROW 17
+#define MENU_USBCDC_ROW 18
+// The other section headers. The dividers and status icons are placed from
+// these rows, so a new menu row only moves the numbers below it, here.
+#define MENU_GEMDRIVE_ROW 2
+#define MENU_ADV_ROW 11
+#define MENU_API_ROW 14
 // Phystop and Screenmem value rows (inside the GEMDRIVE block,
-// under Mem[t]op). menu() always paints placeholders at these rows
-// so the layout below stays fixed even before the m68k HELLO has
-// landed; refreshPhystopLine() / refreshScreenmemLine() overdraw
+// under Mem[t]op and Ru[n]ner). menu() always paints placeholders at
+// these rows so the layout below stays fixed even before the m68k HELLO
+// has landed; refreshPhystopLine() / refreshScreenmemLine() overdraw
 // once HELLO arrives.
-#define MENU_PHYSTOP_ROW   7
-#define MENU_SCREENMEM_ROW 8
+#define MENU_PHYSTOP_ROW   8
+#define MENU_SCREENMEM_ROW 9
 
 // Forward decls — both refresh helpers are defined further down
 // (next to refreshUsbCdcLine), but emul_onGemdriveHello (above the
@@ -129,6 +137,11 @@ static int g_menuLastUsbCdcAttached = -1;
 // what makes edit-build-run iteration bearable. The scheduled
 // relaunch is driven from the main loop via runnerRelaunchAtMs.
 static bool runnerActive = false;
+// The GEMDRIVE Runner ([G] with Ru[n]ner on): Runner active, foreground
+// commands served by DEVOPS.ACC once GEM has started it. Called TSR mode in
+// the code and the API.
+static bool runnerTsrMode = false;
+static bool runnerAccessoryAttached = false;
 static bool runnerBusy = false;
 static runner_last_command_t runnerLastCommand = RUNNER_LAST_NONE;
 static char runnerLastPath[RUNNER_PATH_LEN] = {0};
@@ -175,6 +188,21 @@ static uint8_t runnerAdvHookVector = RUNNER_HOOK_VECTOR_UNKNOWN;
 static bool runnerAdvLoadAcked = false;
 
 bool emul_isRunnerActive(void) { return runnerActive; }
+
+// Defaults to on (aconfig.c); settings_init loads the defaults before what is
+// stored, so a sector saved before the setting existed still has it.
+static bool gemdriveRunnerEnabled(void) {
+  SettingsConfigEntry *entry =
+      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_RUNNER);
+  return entry != NULL && strcmp(entry->value, "true") == 0;
+}
+bool emul_isRunnerTsrMode(void) { return runnerTsrMode; }
+bool emul_isRunnerAccessoryAttached(void) { return runnerAccessoryAttached; }
+void emul_recordRunnerAccessoryAttached(void) {
+  // GEM starts the accessory with the GEMDRIVE Runner off too, where
+  // nothing resets this on the next boot; it only means something on.
+  if (runnerTsrMode) runnerAccessoryAttached = true;
+}
 bool emul_isRunnerBusy(void) { return runnerBusy; }
 
 runner_last_command_t emul_getRunnerLastCommand(void) {
@@ -193,6 +221,19 @@ bool emul_getRunnerLastExitCode(int32_t *out) {
 uint32_t emul_getRunnerLastStartedMs(void) { return runnerLastStartedMs; }
 uint32_t emul_getRunnerLastFinishedMs(void) { return runnerLastFinishedMs; }
 
+// What the RP knows about the ST's session, forgotten whenever the ST goes
+// down: the program that was running never sends DONE, so the busy lock
+// would never clear; the cold reset puts TOS' cwd back at the root; and the
+// accessory goes down with GEM.
+static void forgetStSession(void) {
+  runnerBusy = false;
+  runnerCwd[0] = '\0';
+  runnerCwdPrev[0] = '\0';
+  runnerLastHasCdErrno = false;
+  runnerLastCdErrno = 0;
+  runnerAccessoryAttached = false;
+}
+
 void emul_recordRunnerCommand(runner_last_command_t cmd, uint32_t now_ms) {
   runnerLastCommand = cmd;
   runnerLastStartedMs = now_ms;
@@ -201,17 +242,10 @@ void emul_recordRunnerCommand(runner_last_command_t cmd, uint32_t now_ms) {
   runnerLastExitCode = 0;
   runnerLastPath[0] = '\0';
   if (cmd == RUNNER_LAST_RESET) {
-    // The cold reset wipes the m68k TOS process cwd back to root —
-    // clear our mirror so subsequent relative commands resolve from
-    // the same baseline. Also forcibly clear the busy lock: the
-    // program that was running owned the cartridge bus and never got
-    // to send DONE; without this, status keeps reporting busy=true
-    // forever and POST /run / /cd return 503.
-    runnerBusy = false;
-    runnerCwd[0] = '\0';
-    runnerCwdPrev[0] = '\0';
-    runnerLastHasCdErrno = false;
-    runnerLastCdErrno = 0;
+    // Now, not at the Runner's HELLO several seconds into the boot: until
+    // then a foreground command got through to an ST that was still
+    // rebooting, and was lost.
+    forgetStSession();
   }
 }
 
@@ -438,11 +472,7 @@ bool emul_getRunnerMeminfo(runner_meminfo_t *out) {
 }
 
 void emul_resetRunnerSession(void) {
-  runnerBusy = false;
-  runnerCwd[0] = '\0';
-  runnerCwdPrev[0] = '\0';
-  runnerLastHasCdErrno = false;
-  runnerLastCdErrno = 0;
+  forgetStSession();
   runnerLastHasResErrno = false;
   runnerLastResErrno = 0;
   // The session resets on the Runner's HELLO, which means the ST has cold
@@ -498,15 +528,9 @@ void emul_onGemdriveHello(void) {
   // 200 ms slack lets the m68k finish gemdrive_init + relocate +
   // reach the print loop before the first sentinel write lands.
   runnerRelaunchAtMs = now_ms + 200;
-  // Also clear stuck busy/cwd here — physical reset never went
-  // through handle_runner_reset, so emul_recordRunnerCommand never
-  // ran and runnerBusy may still be true from the program that was
-  // running when the user hit reset.
-  runnerBusy = false;
-  runnerCwd[0] = '\0';
-  runnerCwdPrev[0] = '\0';
-  runnerLastHasCdErrno = false;
-  runnerLastCdErrno = 0;
+  // A physical reset never went through handle_runner_reset, so this is
+  // the first the RP hears of it.
+  forgetStSession();
   DPRINTF("emul: GEMDRIVE HELLO observed with runnerActive=true → "
           "scheduling relaunch\n");
 }
@@ -537,9 +561,9 @@ bool emul_isFirmwareMode(void) {
   return firmwareModeActive;
 }
 
-// Boot countdown — auto-launches Runner mode on the Atari ST when it hits 0
-// (the GEMDRIVE blob is still installed because Runner runs on top of it).
-// Mirrors md-drives-emulator's behavior. Any key press halts it.
+// Boot countdown — when it hits 0, launches whichever of [G] and [U] was
+// launched last (BOOT_MODE; [U] until [G] is first used). Mirrors
+// md-drives-emulator's behavior. Any key press halts it.
 #define BOOT_COUNTDOWN_SECONDS 20
 static int countdown = BOOT_COUNTDOWN_SECONDS;
 static bool haltCountdown = false;
@@ -669,6 +693,22 @@ static bool saveAppSettings(void) {
     haltCountdown = true;
   }
   return saved;
+}
+
+static bool bootModeIsGemdrive(void) {
+  SettingsConfigEntry *entry =
+      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_BOOT_MODE);
+  return entry != NULL && strcmp(entry->value, "G") == 0;
+}
+
+// Saved only when it changes, so launching the same mode every time costs no
+// flash write.
+static void rememberBootMode(const char *mode) {
+  SettingsConfigEntry *entry =
+      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_BOOT_MODE);
+  if (entry != NULL && strcmp(entry->value, mode) == 0) return;
+  settings_put_string(aconfig_getContext(), ACONFIG_PARAM_BOOT_MODE, mode);
+  (void)saveAppSettings();
 }
 
 static void refreshSetupInfoLine(void);
@@ -840,19 +880,14 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
 // Thin horizontal dividers between the menu's config groups.
 // Drawn in the gap row above each section header so they don't
 // overlap any character cell. One pixel tall, full-width edge-
-// to-edge. Positions shifted +16 px from the original layout
-// because two new GEMDRIVE rows (Phystop + Screenmem) bump every
-// section below them down by two rows (16 px).
+// to-edge.
+#define MENU_DIVIDER_Y(row) ((row) * DISPLAY_TERM_CHAR_HEIGHT - 4)
 static void drawMenuDividers(void) {
   u8g2_t *ref = display_getU8g2Ref();
   u8g2_SetDrawColor(ref, 1);
-  // Above Adv [V]ector (between row 8 GEMDRIVE last and row 10
-  // Adv header).
-  u8g2_DrawHLine(ref, 0, 76, DISPLAY_WIDTH);
-  // Above API Endpoint (between row 11 and row 13).
-  u8g2_DrawHLine(ref, 0, 100, DISPLAY_WIDTH);
-  // Above USB CDC (between row 15 and row 17).
-  u8g2_DrawHLine(ref, 0, 132, DISPLAY_WIDTH);
+  u8g2_DrawHLine(ref, 0, MENU_DIVIDER_Y(MENU_ADV_ROW), DISPLAY_WIDTH);
+  u8g2_DrawHLine(ref, 0, MENU_DIVIDER_Y(MENU_API_ROW), DISPLAY_WIDTH);
+  u8g2_DrawHLine(ref, 0, MENU_DIVIDER_Y(MENU_USBCDC_ROW), DISPLAY_WIDTH);
 }
 
 // status icons via u8g2_font_open_iconic_embedded_1x_t.
@@ -873,10 +908,10 @@ static void drawMenuDividers(void) {
 // drawIconCell helper takes y_top (the row's pixel-top); the
 // glyph baseline is at y_top + 7 (font is 8 px tall).
 #define MENU_ICON_X              (DISPLAY_WIDTH - 12)
-#define MENU_ICON_GEMDRIVE_YTOP  16   // term row 2
-#define MENU_ICON_ADV_YTOP       80   // term row 10 (Phystop + Screenmem add 2 rows)
-#define MENU_ICON_API_YTOP       104  // term row 13
-#define MENU_ICON_USB_YTOP       136  // term row 17
+#define MENU_ICON_GEMDRIVE_YTOP  (MENU_GEMDRIVE_ROW * DISPLAY_TERM_CHAR_HEIGHT)
+#define MENU_ICON_ADV_YTOP       (MENU_ADV_ROW * DISPLAY_TERM_CHAR_HEIGHT)
+#define MENU_ICON_API_YTOP       (MENU_API_ROW * DISPLAY_TERM_CHAR_HEIGHT)
+#define MENU_ICON_USB_YTOP       (MENU_USBCDC_ROW * DISPLAY_TERM_CHAR_HEIGHT)
 #define MENU_ICON_GLYPH_COG          0x42
 #define MENU_ICON_GLYPH_LIGHTBULB    0x4D
 #define MENU_ICON_GLYPH_HARD_DRIVE   0x4C
@@ -892,9 +927,8 @@ static void drawIconCell(uint16_t x, uint16_t y_top, uint8_t glyph,
   // box would leave that row untouched and a hide→show
   // transition would expose a residual top edge of the prior
   // glyph. The four icon positions in this menu all have an
-  // unused pixel row directly above (the hrules at y=76/100/132
-  // sit further up still), so the +1 row of erase margin is
-  // safe.
+  // unused pixel row directly above (the dividers sit 4 px above
+  // each header row), so the +1 row of erase margin is safe.
   u8g2_SetDrawColor(ref, 0);
   u8g2_DrawBox(ref, x, y_top - 1, 8, 9);
   if (visible) {
@@ -962,9 +996,9 @@ static void drawCountdownBar(int sec_left, int sec_total) {
   // clip windows + colours so each half of the bar reads
   // correctly. SetClipWindow takes (x0, y0, x1, y1) — y1/x1 are
   // exclusive upper bounds.
-  char msg[40];
-  int n = snprintf(msg, sizeof(msg),
-                   "Booting in %d s — any key halts", sec_left);
+  char msg[48];
+  int n = snprintf(msg, sizeof(msg), "Booting %s in %d s — any key halts",
+                   bootModeIsGemdrive() ? "GEMDRIVE" : "Runner", sec_left);
   if (n < 0) msg[0] = '\0';
   u8g2_SetFont(ref, u8g2_font_squeezed_b7_tr);
 
@@ -1383,6 +1417,10 @@ static void menu(void) {
   }
   term_printString(memtopLine);
 
+  // The GEMDRIVE Runner: what [G] launches. Toggled with [N].
+  term_printString(gemdriveRunnerEnabled() ? "\n  Ru[n]ner    : on"
+                                           : "\n  Ru[n]ner    : off");
+
   // Phystop row — read-only display of TOS' _phystop ($42E) value in
   // hex, with a `(!)` marker when it disagrees with the silicon's MMU
   // bank-config reading. The marker means a reset-resistant program
@@ -1525,8 +1563,8 @@ static void showCounter(int cdown) {
 
 // --- Command handlers (single-key dispatch) ----------------------------
 
-// [G]EMDRIVE — drops straight into GEMDRIVE-only on the Atari ST
-// without activating the Runner control surface.
+// [G]EMDRIVE — GEMDRIVE on the Atari ST. With the GEMDRIVE Runner on
+// ([N]), also the Runner, served from the GEM desktop by DEVOPS.ACC.
 // [G] and [U] make the m68k install GEMDRIVE at the address the RP computed
 // from the ST's HELLO, which the ST sends only at cold boot. After the RP
 // reboots while the ST keeps running (a crash, SELECT, a flash) no HELLO
@@ -1565,10 +1603,29 @@ void cmdGemdrive(const char *arg) {
   showTitle();
   term_printString("\n\n");
   term_printString("Launching DevOps on the Atari ST...\n");
+  rememberBootMode("G");
+  unsigned int start = DISPLAY_COMMAND_START;
+  if (gemdriveRunnerEnabled()) {
+    // The GEMDRIVE Runner: the Runner's interrupt hook stays resident too,
+    // the ST boots on through the AUTO folder to the desktop, and
+    // DEVOPS.ACC serves the foreground commands from there. Written before
+    // the ST boots GEM, which loads accessories once, at startup.
+    if (!runner_installAccessory()) {
+      term_printString("Could not write " RUNNER_ACC_NAME
+                       " to the GEMDRIVE folder.\n");
+    }
+    runnerActive = true;
+    runnerTsrMode = true;
+    start = DISPLAY_COMMAND_START_TSR;
+  } else {
+    // Plain GEMDRIVE: take back the accessory the GEMDRIVE Runner wrote, or
+    // GEM would load it with nothing to serve.
+    runner_removeAccessory();
+  }
   // commit firmware mode (debug-byte filter starts
   // accepting captures from this point on).
   emul_enterFirmwareMode();
-  SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START);
+  SEND_COMMAND_TO_DISPLAY(start);
 }
 
 // [U] launches Runner mode. Same shape as cmdGemdrive but sends
@@ -1588,6 +1645,7 @@ void cmdRunner(const char *arg) {
   // "active": true even though the m68k Runner can't write a
   // handshake into the read-only cartridge area.
   runnerActive = true;
+  rememberBootMode("U");
   // commit firmware mode (enables the debug-byte
   // capture filter for the rest of the session).
   emul_enterFirmwareMode();
@@ -1707,6 +1765,7 @@ void cmdGemdriveDrive(const char *arg) {
   settings_put_string(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_DRIVE,
                       driveBuffer);
   (void)saveAppSettings();
+  gemdrive_publishSettings();
   menu();
 }
 
@@ -1742,6 +1801,7 @@ void cmdGemdriveRelocAddr(const char *arg) {
   settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR,
                        (int)value);
   (void)saveAppSettings();
+  gemdrive_publishSettings();
   menu();
 }
 
@@ -1775,15 +1835,14 @@ void cmdGemdriveMemtop(const char *arg) {
   settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_DEVOPS_MEMTOP,
                        (int)value);
   (void)saveAppSettings();
+  gemdrive_publishSettings();
   menu();
 }
 
 // Advanced Runner hook-vector toggle. Single keypress
 // cycles between "vbl" and "etv_timer" — no data-input flow because
-// only two values are valid. Effective on the next ST cold reset
-// (the m68k reads slot 16 once at runner_post_reloc); the menu
-// reflects the *new* setting immediately so the user knows the
-// toggle worked.
+// only two values are valid. The m68k reads slot 16 once at
+// runner_post_reloc, so the new value is published straight away.
 void cmdAdvHookVector(const char *arg) {
   (void)arg;
   haltCountdown = true;
@@ -1796,6 +1855,18 @@ void cmdAdvHookVector(const char *arg) {
       (strcmp(current, "etv_timer") == 0) ? "vbl" : "etv_timer";
   settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ADV_HOOK_VECTOR,
                       next);
+  (void)saveAppSettings();
+  gemdrive_publishSettings();
+  menu();
+}
+
+// [N] turns the GEMDRIVE Runner on or off: whether [G] also serves the
+// Runner's commands from the desktop, through DEVOPS.ACC.
+void cmdGemdriveRunner(const char *arg) {
+  (void)arg;
+  haltCountdown = true;
+  settings_put_bool(aconfig_getContext(), ACONFIG_PARAM_GEMDRIVE_RUNNER,
+                    !gemdriveRunnerEnabled());
   (void)saveAppSettings();
   menu();
 }
@@ -2000,6 +2071,9 @@ void emul_start() {
   // RUNNER_CMD_DONE_EXECUTE (and future report-back commands) the
   // m68k Runner publishes via send_sync.
   runner_init();
+
+  // Publish the rom4 area before the ST can look for it.
+  rom4_init();
 
   // After this point, the remote computer can execute the code
 
@@ -2265,8 +2339,10 @@ void emul_start() {
     if (runnerRelaunchAtMs != 0 && runnerActive) {
       uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
       if ((int32_t)(now_ms - runnerRelaunchAtMs) >= 0) {
-        DPRINTF("emul: relaunch tick — firing DISPLAY_COMMAND_START_RUNNER\n");
-        SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START_RUNNER);
+        unsigned int start = runnerTsrMode ? DISPLAY_COMMAND_START_TSR
+                                           : DISPLAY_COMMAND_START_RUNNER;
+        DPRINTF("emul: relaunch tick — firing start command %u\n", start);
+        SEND_COMMAND_TO_DISPLAY(start);
         runnerRelaunchAtMs = now_ms + 500;  // try again in 500 ms
       }
     }
@@ -2300,12 +2376,16 @@ void emul_start() {
         display_refresh();
         if (countdown <= 0) {
           haltCountdown = true;
-          // Autoboot expired — launch DevOps Runner on the Atari ST. Same
-          // path as pressing [U]. Runner is the more useful default:
-          // it includes the [G] GEMDRIVE behaviour AND the
-          // workstation-driven Runner control surface.
+          // Autoboot expired — launch the mode launched last, by the same
+          // path as pressing its key. [U] until [G] is first used: Runner
+          // is the more useful default, as it includes the [G] GEMDRIVE
+          // behaviour AND the workstation-driven Runner control surface.
           countdownLaunching = true;
-          cmdRunner(NULL);
+          if (bootModeIsGemdrive()) {
+            cmdGemdrive(NULL);
+          } else {
+            cmdRunner(NULL);
+          }
           countdownLaunching = false;
         }
       }

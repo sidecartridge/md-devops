@@ -61,6 +61,23 @@ def binary_to_c_array(input_source, output_file, array_name, endian_format="litt
     print(f"{output_file} generated successfully!")
 
 
+def binary_to_c_byte_array(input_source, output_file, array_name):
+    # Every byte as it is, trailing zeros included, for a file the RP writes
+    # out verbatim: a TOS executable ends with its relocation table's zero.
+    data = read_binary_from_file(input_source)
+
+    content = f"static const uint8_t {array_name}[] = {{\n"
+    for i in range(0, len(data), 2 * MAX_WORDS_PER_LINE):
+        chunk = data[i : i + 2 * MAX_WORDS_PER_LINE]
+        content += "    " + ", ".join(f"0x{byte:02X}" for byte in chunk) + ",\n"
+    content = content.rstrip(",\n") + "\n};\n"
+
+    with open(output_file, "w") as f:
+        f.write(content)
+
+    print(f"{output_file} generated successfully!")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Generate a C array from a binary file, trimming trailing zeros."
@@ -84,6 +101,11 @@ if __name__ == "__main__":
         help="Name of the array to be generated.",
     )
     parser.add_argument(
+        "--byte_array",
+        action="store_true",
+        help="Write every byte as a uint8_t array, without trimming trailing zeros.",
+    )
+    parser.add_argument(
         "--endian_format",
         required=False,
         default="little",
@@ -96,4 +118,7 @@ if __name__ == "__main__":
     input_source = args.input
     endian_format = args.endian_format
 
-    binary_to_c_array(input_source, output_file, array_name, endian_format)
+    if args.byte_array:
+        binary_to_c_byte_array(input_source, output_file, array_name)
+    else:
+        binary_to_c_array(input_source, output_file, array_name, endian_format)

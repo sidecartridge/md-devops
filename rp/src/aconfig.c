@@ -3,6 +3,7 @@
 static SettingsConfigEntry defaultEntries[] = {
     {ACONFIG_PARAM_FOLDER, SETTINGS_TYPE_STRING, "/devops"},
     {ACONFIG_PARAM_MODE, SETTINGS_TYPE_INT, "255"},  // 255: Menu mode
+    {ACONFIG_PARAM_BOOT_MODE, SETTINGS_TYPE_STRING, "U"},
     // GEMDRIVE — RELOC_ADDR / DEVOPS_MEMTOP "0" = auto
     // (screen_base - 16 KB, computed from the screen_base the m68k
     // publishes at boot). DEVOPS_MEMTOP is a microfirmware-global
@@ -13,6 +14,7 @@ static SettingsConfigEntry defaultEntries[] = {
     {ACONFIG_PARAM_GEMDRIVE_DRIVE, SETTINGS_TYPE_STRING, "C"},
     {ACONFIG_PARAM_GEMDRIVE_RELOC_ADDR, SETTINGS_TYPE_INT, "0"},
     {ACONFIG_PARAM_DEVOPS_MEMTOP, SETTINGS_TYPE_INT, "0"},
+    {ACONFIG_PARAM_GEMDRIVE_RUNNER, SETTINGS_TYPE_BOOL, "true"},
     // Advanced Runner — default "vbl" ($70 hardware VBL exception
     // vector). The full feature set (adv jump / adv load) only
     // works on this vector because we need a stable trap-frame

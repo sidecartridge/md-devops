@@ -138,6 +138,7 @@ target_sources(${PROJECT_NAME} PRIVATE
         hw_config.c
         network.c
         reset.c
+        rom4.c
         romemul.c
         runner.c
         sd_timeouts.c

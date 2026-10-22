@@ -51,7 +51,7 @@ TRANSTABLE		equ APP_BUFFERS_ADDR				; high-res translation table
 ;   $0000..$07FF  main.s     2 KB   boot + dispatch + terminal
 ;   $0800..$1BFF  gemdrive.s 5 KB   GEMDRIVE blob (relocated to RAM)
 ;   $1C00..$27FF  runner.s   3 KB   Runner foreground loop
-; On mode-commit (rom_function or runner_function reached from the
+; On mode-commit (rom_function, runner_function or tsr_function reached from the
 ; setup-menu polling), gemdrive_install copies GEMDRIVE_BLOB_SIZE
 ; bytes from GEMDRIVE_BLOB into a configurable RAM address (default
 ; screen_base - 16 KB) so the resident GEMDRIVE code can survive
@@ -95,6 +95,7 @@ CMD_BOOT_GEM		equ 2		; Boot GEM command
 CMD_TERMINAL		equ 3		; Terminal command
 CMD_START			equ 4		; Hand control to GEMDRIVE (rom_function)
 CMD_START_RUNNER	equ 5		; Hand control to the Runner (runner_function)
+CMD_START_TSR		equ 6		; Install resident and boot on (tsr_function)
 
 ; GEMDRIVE app namespace. Wire-format compatible with md-drives-emulator:
 ; APP_GEMDRVEMUL keeps the same value; CMD_GEMDRVEMUL_* values that exist
@@ -132,7 +133,6 @@ SHARED_VARIABLES:         equ (RESERVED_SLOT_ADDR + 4)       ; $FA2810 (60 index
 ROMCMD_START_ADDR:        equ $FB0000					  ; We are going to use ROM3 address
 CMD_MAGIC_NUMBER    	  equ ($ABCD) 					  ; Magic number header to identify a command
 CMD_RETRIES_COUNT	  	  equ 3							  ; Number of retries for the command
-CMD_SET_SHARED_VAR		  equ 1							  ; This is a fake command to set the shared variables
 														  ; Used to store the system settings
 ; App commands for the terminal
 APP_TERMINAL 				equ $0 ; The terminal app
@@ -228,6 +228,8 @@ check_commands		macro
 					beq rom_function			; If it is, jump to the user firmware dispatcher
 					cmp.l #CMD_START_RUNNER, d6	; Check if the command hands over to the Runner
 					beq runner_function			; If it is, jump to the Runner blob entry
+					cmp.l #CMD_START_TSR, d6	; Check if the command installs TSR mode
+					beq tsr_function			; If it is, install and let TOS boot on
 
 					; If we are here, the command is a NOP
 					; If the command is a NOP, check the shift keys to bypass the command
@@ -407,6 +409,19 @@ runner_function:
     jsr gemdrive_install
     jmp RUNNER_BLOB
 
+; Dispatcher invoked on CMD_START_TSR — the user pressed [G] with the
+; GEMDRIVE Runner on. Installs
+; GEMDRIVE and the Runner's interrupt hook, then lets TOS boot on through
+; the AUTO folder to the desktop, where DEVOPS.ACC serves the foreground
+; Runner commands. runner_entry tells this from [U] by d6, which still
+; holds the sentinel value that dispatched us (gemdrive_install preserves
+; it), and returns instead of entering its poll loop. The GEMDRIVE banner
+; at +4 then returns to TOS, as on the [G] path.
+tsr_function:
+    jsr gemdrive_install
+    jsr RUNNER_BLOB
+    jmp GEMDRIVE_BLOB+4
+
 ; Shared functions included at the end of the file
 ; Don't forget to include the macros for the shared functions at the top of file
 ;
@@ -447,6 +462,28 @@ end_rom_code:
 ; cartridge ROM and is never re-entered.
 gemdrive_handshake:
 	movem.l d0-d7/a0-a3, -(sp)
+
+	; A Mega STE's cache answers the cartridge's reads from copies it
+	; made before, and the command channel breaks with it on; a reset
+	; leaves it as it was. Turn it off before the first command (the
+	; speed is kept), and send the _MCH cookie with HELLO: the modules
+	; check it before they touch the register, which is not there on
+	; other machines.
+	moveq	#0, d6
+	move.l	_p_cookies.w, d0
+	beq.s	.hs_machine
+	move.l	d0, a0
+.hs_cookie:
+	move.l	(a0)+, d0
+	beq.s	.hs_machine
+	move.l	(a0)+, d1
+	cmp.l	#'_MCH', d0
+	bne.s	.hs_cookie
+	move.l	d1, d6
+	cmp.l	#COOKIE_JAR_MEGASTE, d6
+	bne.s	.hs_machine
+	bclr	#0, MEGASTE_SPEED_CACHE_REG.w
+.hs_machine:
 
 	; Logbase (XBIOS fn 2) → d0.l = screen base
 	move.w #2, -(sp)
@@ -495,17 +532,17 @@ gemdrive_handshake:
 	move.l #4096, d5
 .ph_decoded:
 
-	; Publish (screen_base, phystop, total_ram_kb). RP applies
+	; Publish (screen_base, phystop, total_ram_kb, _MCH). RP applies
 	; aconfig overrides + flags phystop mismatch + writes effective
 	; reloc/memtop back into shared variables.
-	send_sync CMD_GEMDRIVE_HELLO, 12
+	send_sync CMD_GEMDRIVE_HELLO, 16
 
 	movem.l (sp)+, d0-d7/a0-a3
 	rts
 
 ; gemdrive_install — deferred GEMDRIVE relocation + trap-#1 install.
 ; -----------------------------------------------------------------------
-; Called from rom_function and runner_function once the user has
+; Called from rom_function, runner_function and tsr_function once the user has
 ; committed a mode at the setup menu (or the autoboot countdown
 ; elapsed). Reads the effective reloc + memtop that gemdrive_handshake
 ; published into shared variables, copies the GEMDRIVE blob to the
@@ -518,8 +555,8 @@ gemdrive_handshake:
 ; relocated print-loop reach this routine via absolute-long jsr.
 ;
 ; Called exactly once per ST cold reset: each user mode-commit fires
-; one of the two dispatchers, which calls this routine, after which
-; either the diagnostic (rom_function) or runner_entry
+; one of the three dispatchers, which calls this routine, after which
+; the diagnostic (rom_function, tsr_function) or runner_entry
 ; (runner_function) takes over and never returns to the menu.
 gemdrive_install:
 	movem.l d0-d7/a0-a3, -(sp)
@@ -570,11 +607,64 @@ gemdrive_install:
 	move.l (a0)+, (a1)+
 	dbf d2, .gd_install_copy_loop
 
-	; Lower _memtop so TOS won't allocate over the resident blob on
-	; subsequent Pexec calls. We're still inside CA_INIT bit 27
-	; (pre_auto hasn't returned to TOS yet for the GEMDRIVE-only path,
-	; or the Runner is about to take over and never return), so the
-	; patch lands before any TPA computations.
+	; Take the zone out of GEMDOS's free memory. GEMDOS built its pool
+	; from _memtop before CA_INIT bit 27, so lowering _memtop now is too
+	; late for that: a program could still be given the zone, and every
+	; program's stack started inside it. Allocate the free memory below
+	; the zone, then the zone itself, which then belongs to the initial
+	; process for good, and free what was below. GEMDOS hands out the
+	; lowest free memory that fits, so this finds the zone when it sits
+	; in the largest free block, ending at _memtop. Otherwise, as when
+	; [R] puts it outside GEMDOS's memory, everything is given back.
+	move.l d0, d5				; d5 = zone start
+	move.l d1, d6				; d6 = the _memtop to publish
+	moveq #0, d7				; d7 = the block below, once taken
+	move.l memtop.w, d3			; d3 = top of GEMDOS's pool
+	move.l #-1, -(sp)
+	move.w #Malloc, -(sp)
+	trap #1
+	addq.l #6, sp				; d0 = largest free block
+	move.l d3, d4
+	sub.l d0, d4				; d4 = its start, if it ends at the top
+	cmp.l d4, d5
+	bcs.s .gd_reserved			; zone below it: not GEMDOS's
+	move.l d5, d0
+	add.l #RELOC_DANGER_ZONE_SIZE, d0
+	cmp.l d3, d0
+	bhi.s .gd_reserved			; zone above the pool: not GEMDOS's
+	move.l d5, d0
+	sub.l d4, d0				; d0 = free memory below the zone
+	beq.s .gd_take_zone
+	move.l d0, -(sp)
+	move.w #Malloc, -(sp)
+	trap #1
+	addq.l #6, sp
+	move.l d0, d7
+.gd_take_zone:
+	move.l #RELOC_DANGER_ZONE_SIZE, -(sp)
+	move.w #Malloc, -(sp)
+	trap #1
+	addq.l #6, sp
+	tst.l d0
+	beq.s .gd_free_below
+	cmp.l d5, d0
+	beq.s .gd_free_below			; the zone is ours
+	move.l d0, -(sp)			; somewhere else: give it back
+	move.w #Mfree, -(sp)
+	trap #1
+	addq.l #6, sp
+.gd_free_below:
+	tst.l d7
+	beq.s .gd_reserved
+	move.l d7, -(sp)
+	move.w #Mfree, -(sp)
+	trap #1
+	addq.l #6, sp
+.gd_reserved:
+	move.l d5, d0
+	move.l d6, d1
+
+	; Lower _memtop too, for programs that size themselves by it.
 	move.l d1, memtop.w
 
 	; Call into the relocated install_entry (offset 0 of the blob:

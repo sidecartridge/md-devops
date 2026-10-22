@@ -4,9 +4,9 @@
 _p_cookies                              equ $5a0    ; pointer to the system Cookie-Jar
 
 COOKIE_JAR_MEGASTE                      equ $00010010 ; Mega STE computer
+MEGASTE_SPEED_CACHE_REG                 equ $FFFF8E21 ; Mega STE: bit 0 the cache, bit 1 16 MHz
 SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE   equ 16      ; Size of the shared variables for the shared functions
 SHARED_VARIABLE_HARDWARE_TYPE           equ 0       ; Hardware type of the Atari ST computer
-SHARED_VARIABLE_SVERSION                equ 1       ; TOS version from Sversion
 
 COMMAND_SYNC_CODE_SIZE                  equ (4 + _end_sync_code_in_stack - _start_sync_code_in_stack)
 COMMAND_SYNC_WRITE_CODE_SIZE            equ (4 + _end_sync_write_code_in_stack - _start_sync_write_code_in_stack)
@@ -16,75 +16,6 @@ COMMAND_SYNC_USE_DSKBUF                 equ 0       ; Use different disk buffers
                                                     ; 1: Use the disk buffer to store the code. Safe
                                                     ; 0: Use the ROM address to store the code. Safe
 
-
-; Detect the hardware of the computer we are running on
-; This code checks for the cookie-jar and reads the _MCH cookie to determine the hardware
-; If the cookie-jar is not present, we assume it's an old machine before 1.06
-; It writes the value in the shared variable SHARED_VARIABLE_HARDWARE_TYPE
-;
-; Inputs:
-;   None
-;
-; Outputs:
-;   d0.l contains the hardware type as stored in the shared variable SHARED_VARIABLE_HARDWARE_TYPE
-detect_hw:
-	move.l _p_cookies.w,d0      ; Check the cookie-jar to know what type of machine we are running on
-	beq _old_hardware           ; No cookie-jar, so it's a TOS <= 1.04
-	movea.l d0,a0               ; Get the address of the cookie-jar
-_loop_cookie:
-	move.l (a0)+,d0             ; The cookie jar value is zero, so old hardware again
-	beq _old_hardware
-	cmp.l #'_MCH',d0            ; Is it the _MCH cookie?
-	beq.s _found_cookie         ; Yes, so we found the machine type
-	addq.w #4,a0                ; No, so skip the cookie name
-	bra.s _loop_cookie          ; And try the next cookie
-_found_cookie:
-	move.l	(a0)+,d4            ; Get the cookie value
-	bra.s	_save_hw
-_old_hardware:
-    clr.l d4                    ; 0x0000	0x0000	Atari ST (260 ST,520 ST,1040 ST,Mega ST,...)
-_save_hw:
-    move.l d4, -(sp)            ; Save the hardware type    
-    move.l #SHARED_VARIABLE_HARDWARE_TYPE, d3   ; D3 Variable index
-                                                ; D4 Variable value
-    send_sync CMD_SET_SHARED_VAR, 8
-    tst.w d0
-    bne.s _detect_hw_timeout
-    move.l (sp)+, d0            ; Restore the hardware type in d0.l as result
-    rts
-_detect_hw_timeout
-    move.l (sp)+, d4            ; Restore the hardware type in d4.l to retry
-    bra.s _save_hw
-
-; Get the TOS version
-; This code reads the TOS version from the ROM and writes it in the shared variable SHARED_VARIABLE_SVERSION
-;
-; Inputs:
-;   None
-; Outputs:
-;   None
-get_tos_version:
-    gemdos Sversion, 2
-    and.l #$FFFF,d0
-    cmp.w #$FC, $4.w            ; Check if the TOS version is a 192Kb or 256Kb
-    bne.s .get_tos_version_is_256k
-.get_tos_version_is_192k:
-    move.w $FC0002, d1          ; Read the TOS version from the ROM
-    bra.s .exit_get_tos_version
-.get_tos_version_is_256k:
-    move.w $E00002, d1          ; Read the TOS version from the ROM
-
-.exit_get_tos_version:
-    and.l #$FFFF,d1             ; Mask the upper word
-    swap d1
-    or.l d1, d0                 ; Set the TOS version in the upper word of d0
-    move.l #SHARED_VARIABLE_SVERSION, d3    ; Variable index
-    move.l d0, d4                           ; Variable value
-    send_sync CMD_SET_SHARED_VAR, 8
-    tst.w d0                    ; d0 holds error code: 0 = success, nonzero = failure
-    ; Do not retry indefinitely here; rely on send_sync's internal retry logic.
-    ; If the command failed, return with the error code in d0 instead of hard-locking boot.
-    rts
 
 ; Send an sync command to the Sidecart
 ; Wait until the command sets a response in the memory with a random number used as a token

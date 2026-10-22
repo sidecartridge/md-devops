@@ -334,7 +334,8 @@ class Smoke:
         name = "3+5 Runner load, exec, unload with a debug tail"
         _, st = self.json("GET", "/runner")
         if not st.get("active"):
-            ok = self.ask("Runner is not active. Press [U] on the ST (or let the countdown launch it), "
+            ok = self.ask("Runner is not active. Press [U] on the ST (the countdown launches it only if [U] "
+                          "was the last mode launched), "
                           "wait for [READY], then answer y")
             if not ok:
                 self.record(name, "skip", "Runner not active")

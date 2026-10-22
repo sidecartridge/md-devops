@@ -33,6 +33,7 @@ SOURCES_DIR = ./src
 BUILD_DIR = ./build
 DIST_DIR = ./dist
 BIN = BOOT.BIN
+ACC = DEVOPS.ACC
 
 # VASM PARAMETERS
 # _DEBUG: 1 to enable debug, 0 to disable them
@@ -43,6 +44,9 @@ VASM = vasm
 VLINK =  vlink
 LINKER_SCRIPT = $(SOURCES_DIR)/devops.ld
 VLINKFLAGS = -brawbin1 -T $(LINKER_SCRIPT)
+# The desk accessory is an ordinary TOS executable, not part of the
+# cartridge image: vasm writes it directly, relocation table included.
+VASMFLAGS_ACC = $(subst -Faout,-Ftos,$(VASMFLAGS))
 
 .PHONY: all
 all: prepare dist
@@ -69,11 +73,16 @@ runner.o: prepare
 build: main.o gemdrive.o runner.o
 	$(VLINK) $(addprefix $(BUILD_DIR)/,$^) $(VLINKFLAGS) -o $(BUILD_DIR)/$(BIN)
 
+.PHONY: acc
+acc: prepare
+	$(VASM) $(VASMFLAGS_ACC) $(SOURCES_DIR)/devops_acc.s -o $(BUILD_DIR)/$(ACC)
+
 
 .PHONY: dist
-dist: build
+dist: build acc
 	mkdir -p $(DIST_DIR)
 	cp $(BUILD_DIR)/$(BIN) $(DIST_DIR) 	
+	cp $(BUILD_DIR)/$(ACC) $(DIST_DIR)
 
 .PHONY: clean
 clean:

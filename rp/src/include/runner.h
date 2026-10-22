@@ -11,6 +11,8 @@
 #ifndef RUNNER_H
 #define RUNNER_H
 
+#include <stdbool.h>
+
 #include "chandler.h"
 
 // Runner sub-region inside APP_FREE. Positioned past GEMDRIVE's
@@ -118,6 +120,9 @@
 #define RUNNER_CMD_DONE_LOAD (APP_RUNNER + 0x87)     // payload: i32 (>0 basepage; <0 -errno)
 #define RUNNER_CMD_DONE_EXEC (APP_RUNNER + 0x88)     // payload: i32 exit code
 #define RUNNER_CMD_DONE_UNLOAD (APP_RUNNER + 0x89)   // payload: i32 Mfree result (0 OK, <0 errno)
+// Sent by DEVOPS.ACC when GEM starts it in TSR mode: from then on the
+// foreground commands above have something on the ST to serve them.
+#define RUNNER_CMD_DONE_ACC_HELLO (APP_RUNNER + 0x8A)  // no payload
 
 // RP-side state machine mirror. cmdRunner sets ACTIVE; per-command
 // handlers update last_command. Used by GET /api/v1/runner.
@@ -142,10 +147,32 @@ typedef struct {
   uint32_t memtop;     // _memtop   ($436)
   uint32_t phystop;    // _phystop  ($42E)
   uint32_t screenmem;  // _v_bas_ad ($44E) logical screen base
-  uint32_t basepage;   // _run      ($4F2) — 0 on TOS < 1.04
+  uint32_t basepage;   // _run      — running process (via the OS header)
   uint16_t bank0_kb;   // 0 = unknown / unrecognised MMU config
   uint16_t bank1_kb;
 } runner_meminfo_t;
+
+// File name of the TSR-mode desk accessory. GEM loads accessories from
+// the root of the boot drive, which with GEMDRIVE on C: is the GEMDRIVE
+// folder.
+#define RUNNER_ACC_NAME "DEVOPS.ACC"
+
+/**
+ * @brief Write the DEVOPS.ACC this firmware was built with to the root
+ *        of the GEMDRIVE folder, unless an identical copy is already
+ *        there, so the accessory always speaks this firmware's protocol.
+ *        Called when [G] starts with the GEMDRIVE Runner on (TSR mode),
+ *        before the ST boots GEM.
+ * @return false if the file could not be written.
+ */
+bool runner_installAccessory(void);
+
+/**
+ * @brief Delete DEVOPS.ACC from the root of the GEMDRIVE folder, whatever
+ *        firmware wrote it, so GEM does not load an accessory with nothing
+ *        to serve. Called when [G] starts with the GEMDRIVE Runner off.
+ */
+void runner_removeAccessory(void);
 
 /**
  * @brief Register the Runner's chandler callback for m68k → RP

@@ -64,3 +64,4 @@ docs/epics/
 cli/__pycache__/
 tools/dev/logs/
 tools/dev/builds/
+.DS_Store

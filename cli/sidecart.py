@@ -28,6 +28,9 @@ Subcommands:
     gemdrive mvdir FROM TO                        POST /api/v1/gemdrive/folders/<from>/rename
     runner …                                      /api/v1/runner/*    (see docs/api.md)
     debug …                                       /api/v1/debug, /api/v1/debug/log
+    rom4 info                                     GET  /api/v1/rom4
+    rom4 read [-o FILE]                           GET  /api/v1/rom4/data
+    rom4 write OFFSET HEX... | -f FILE            PUT  /api/v1/rom4?offset=N
 
 Exit codes:
     0  success
@@ -50,6 +53,7 @@ Examples:
     python3 cli/sidecart.py gemdrive mvdir OLDNAME NEWNAME
     python3 cli/sidecart.py runner run /HELLODBG.TOS
     python3 cli/sidecart.py debug status
+    python3 cli/sidecart.py rom4 write 0x10 01 02 03
 """
 
 from __future__ import annotations
@@ -657,6 +661,21 @@ def cmd_runner_unload(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _parse_number(raw: str) -> int:
+    """Parse decimal, $hex or 0xhex. Raises ValueError.
+
+    Shell gotcha: bash/zsh expand `$78000` as a variable reference, so
+    `$hex` arguments must be single-quoted: `'$78000'`. The `0x78000`
+    form needs no quoting.
+    """
+    s = raw.strip()
+    if s.startswith("$"):
+        return int(s[1:], 16)
+    if s.startswith(("0x", "0X")):
+        return int(s, 16)
+    return int(s, 10)
+
+
 def _parse_adv_jump_address(raw: str) -> int:
     """Parse a jump-target address from CLI input.
 
@@ -669,15 +688,9 @@ def _parse_adv_jump_address(raw: str) -> int:
     so `$hex` arguments MUST be single-quoted on the command line:
     `'$78000'`. Use the `0x78000` form to avoid quoting altogether.
     """
-    s = raw.strip()
-    if not s:
+    if not raw.strip():
         raise ValueError("address is empty")
-    if s.startswith("$"):
-        value = int(s[1:], 16)
-    elif s.startswith(("0x", "0X")):
-        value = int(s, 16)
-    else:
-        value = int(s, 10)
+    value = _parse_number(raw)
     if value < 0 or value > 0xFFFFFF:
         raise ValueError(
             f"address 0x{value:X} out of 24-bit range ($0..$FFFFFF)")
@@ -731,22 +744,11 @@ def cmd_runner_adv_load(args: argparse.Namespace) -> int:
     cap: int | None = None
     if args.size is not None:
         try:
-            cap = _parse_adv_jump_address(args.size)
+            cap = _parse_number(args.size)
         except ValueError:
-            # _parse_adv_jump_address enforces even+24bit which doesn't
-            # apply to a byte count. Fall back to a plain int parse.
-            s = args.size.strip()
-            try:
-                if s.startswith("$"):
-                    cap = int(s[1:], 16)
-                elif s.startswith(("0x", "0X")):
-                    cap = int(s, 16)
-                else:
-                    cap = int(s, 10)
-            except ValueError:
-                print(f"error: cannot parse size: {args.size!r}",
-                      file=sys.stderr)
-                return EXIT_BAD_REQUEST
+            print(f"error: cannot parse size: {args.size!r}",
+                  file=sys.stderr)
+            return EXIT_BAD_REQUEST
         if cap <= 0:
             print(f"error: size must be > 0", file=sys.stderr)
             return EXIT_BAD_REQUEST
@@ -792,6 +794,27 @@ def cmd_runner_adv_load(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _print_meminfo(parsed: dict) -> None:
+    """The meminfo snapshot, with the ST sysvar each field is read from."""
+    print(f"membottom [$432]  : 0x{parsed.get('membottom', 0):08X}")
+    print(f"memtop    [$436]  : 0x{parsed.get('memtop', 0):08X}")
+    print(f"phystop   [$42E]  : 0x{parsed.get('phystop', 0):08X}")
+    print(f"screenmem [$44E]  : 0x{parsed.get('screenmem', 0):08X}")
+    bp = parsed.get('basepage', 0)
+    if bp:
+        print(f"basepage  [_run]  : 0x{bp:08X}")
+    else:
+        print(f"basepage  [_run]  : 0 (unset)")
+    b0 = parsed.get('bank0_kb', 0)
+    b1 = parsed.get('bank1_kb', 0)
+    if parsed.get('decoded'):
+        print(f"bank 0    [$FF8001 nibble] : {b0} KB")
+        print(f"bank 1    [$FF8001 nibble] : {b1} KB")
+        print(f"total RAM         : {b0 + b1} KB")
+    else:
+        print(f"banks     [$FF8001 nibble] : (unrecognised MMU config)")
+
+
 def cmd_runner_adv_meminfo(args: argparse.Namespace) -> int:
     """POST /api/v1/runner/adv/meminfo — meminfo from inside the VBL ISR."""
     url = base_url(args.host) + "/api/v1/runner/adv/meminfo"
@@ -812,23 +835,7 @@ def cmd_runner_adv_meminfo(args: argparse.Namespace) -> int:
     if args.quiet:
         return EXIT_OK
 
-    print(f"membottom [$432]  : 0x{parsed.get('membottom', 0):08X}")
-    print(f"memtop    [$436]  : 0x{parsed.get('memtop', 0):08X}")
-    print(f"phystop   [$42E]  : 0x{parsed.get('phystop', 0):08X}")
-    print(f"screenmem [$44E]  : 0x{parsed.get('screenmem', 0):08X}")
-    bp = parsed.get('basepage', 0)
-    if bp:
-        print(f"basepage  [$4F2]  : 0x{bp:08X}")
-    else:
-        print(f"basepage  [$4F2]  : 0 (TOS < 1.04 or unset)")
-    b0 = parsed.get('bank0_kb', 0)
-    b1 = parsed.get('bank1_kb', 0)
-    if parsed.get('decoded'):
-        print(f"bank 0    [$FF8001 nibble] : {b0} KB")
-        print(f"bank 1    [$FF8001 nibble] : {b1} KB")
-        print(f"total RAM         : {b0 + b1} KB")
-    else:
-        print(f"banks     [$FF8001 nibble] : (unrecognised MMU config)")
+    _print_meminfo(parsed)
     return EXIT_OK
 
 
@@ -961,6 +968,129 @@ def cmd_debug_status(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_rom4_info(args: argparse.Namespace) -> int:
+    """GET /api/v1/rom4 — where the rom4 area is and how to find it."""
+    url = base_url(args.host) + "/api/v1/rom4"
+    try:
+        status, parsed, raw = request_json("GET", url)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200 or parsed is None or parsed.get("ok") is not True:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        json.dump(parsed, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return EXIT_OK
+    if args.quiet:
+        return EXIT_OK
+
+    magic = parsed.get("magic", 0)
+    text = magic.to_bytes(4, "big").decode("ascii", errors="replace")
+    print(f"address: ${parsed.get('address', 0):06X}")
+    print(f"size   : {parsed.get('size', 0)} bytes")
+    print(f"magic  : ${magic:08X} ('{text}')")
+    return EXIT_OK
+
+
+def cmd_rom4_read(args: argparse.Namespace) -> int:
+    """GET /api/v1/rom4/data — the whole area as a hex dump or to a file."""
+    url = base_url(args.host) + "/api/v1/rom4/data"
+    try:
+        status, parsed, raw = request_json(
+            "GET", url, headers={"Accept": "application/octet-stream"})
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.output:
+        try:
+            with open(args.output, "wb") as out:
+                out.write(raw)
+        except OSError as exc:
+            print(f"error: cannot write {args.output}: {exc}",
+                  file=sys.stderr)
+            return EXIT_GENERIC
+        if args.json:
+            json.dump({"ok": True, "local": args.output, "size": len(raw)},
+                      sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+        elif not args.quiet:
+            print(f"ok  rom4 -> {args.output}  ({len(raw)} bytes)")
+        return EXIT_OK
+
+    if args.json:
+        json.dump({"ok": True, "size": len(raw), "hex": raw.hex()},
+                  sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return EXIT_OK
+    if args.quiet:
+        return EXIT_OK
+    for off in range(0, len(raw), 16):
+        row = raw[off:off + 16]
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+        print(f"{off:04X}  {row.hex(' ').upper():<47}  {text}")
+    return EXIT_OK
+
+
+def cmd_rom4_write(args: argparse.Namespace) -> int:
+    """PUT /api/v1/rom4?offset=N — write bytes into the area."""
+    try:
+        offset = _parse_number(args.offset)
+    except ValueError:
+        print(f"error: cannot parse offset: {args.offset!r}", file=sys.stderr)
+        return EXIT_USAGE
+
+    if args.file is not None:
+        if args.hex:
+            print("error: give HEX bytes or -f FILE, not both",
+                  file=sys.stderr)
+            return EXIT_USAGE
+        try:
+            with open(args.file, "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            print(f"error: cannot read {args.file}: {exc}", file=sys.stderr)
+            return EXIT_BAD_REQUEST
+    else:
+        if not args.hex:
+            print("error: give HEX bytes or -f FILE", file=sys.stderr)
+            return EXIT_USAGE
+        try:
+            data = bytes.fromhex(" ".join(args.hex))
+        except ValueError:
+            print("error: HEX must be pairs of hex digits, e.g. 01 02 0A0B",
+                  file=sys.stderr)
+            return EXIT_USAGE
+
+    url = base_url(args.host) + f"/api/v1/rom4?offset={offset}"
+    headers = {"Content-Type": "application/octet-stream"}
+    try:
+        status, parsed, raw = request_json(
+            "PUT", url, body=data, headers=headers)
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach {url}: {exc.reason}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    if status != 200 or parsed is None or parsed.get("ok") is not True:
+        render_error(parsed, raw, status)
+        return status_to_exit_code(status)
+
+    if args.json:
+        json.dump(parsed, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+    elif not args.quiet:
+        print(f"ok  {len(data)} bytes at offset {offset} (${offset:03X})")
+    return EXIT_OK
+
+
 def cmd_runner_meminfo(args: argparse.Namespace) -> int:
     """GET /api/v1/runner/meminfo — synchronous system memory snapshot."""
     url = base_url(args.host) + "/api/v1/runner/meminfo"
@@ -981,24 +1111,7 @@ def cmd_runner_meminfo(args: argparse.Namespace) -> int:
     if args.quiet:
         return EXIT_OK
 
-    # ST sysvar addresses each field is read from (TOS docs).
-    print(f"membottom [$432]  : 0x{parsed.get('membottom', 0):08X}")
-    print(f"memtop    [$436]  : 0x{parsed.get('memtop', 0):08X}")
-    print(f"phystop   [$42E]  : 0x{parsed.get('phystop', 0):08X}")
-    print(f"screenmem [$44E]  : 0x{parsed.get('screenmem', 0):08X}")
-    bp = parsed.get('basepage', 0)
-    if bp:
-        print(f"basepage  [$4F2]  : 0x{bp:08X}")
-    else:
-        print(f"basepage  [$4F2]  : 0 (TOS < 1.04 or unset)")
-    b0 = parsed.get('bank0_kb', 0)
-    b1 = parsed.get('bank1_kb', 0)
-    if parsed.get('decoded'):
-        print(f"bank 0    [$FF8001 nibble] : {b0} KB")
-        print(f"bank 1    [$FF8001 nibble] : {b1} KB")
-        print(f"total RAM         : {b0 + b1} KB")
-    else:
-        print(f"banks     [$FF8001 nibble] : (unrecognised MMU config)")
+    _print_meminfo(parsed)
     return EXIT_OK
 
 
@@ -1098,7 +1211,8 @@ def cmd_runner_status(args: argparse.Namespace) -> int:
 
     active = parsed.get("active", False)
     if not active:
-        print("Runner mode is not active. Boot via [U] to enable.")
+        print("Runner is not active. Boot via [U], or [G] with the GEMDRIVE "
+              "Runner on.")
         return EXIT_OK
 
     busy = parsed.get("busy", False)
@@ -1108,6 +1222,9 @@ def cmd_runner_status(args: argparse.Namespace) -> int:
     last_exit = parsed.get("last_exit_code")
     last_cd_errno = parsed.get("last_cd_errno")
     print(f"active   : true")
+    if parsed.get("tsr", False):
+        accessory = "loaded" if parsed.get("accessory", False) else "not loaded yet"
+        print(f"mode     : GEMDRIVE Runner (DEVOPS.ACC {accessory})")
     print(f"busy     : {'yes' if busy else 'no'}")
     print(f"cwd      : {cwd}")
     last_res_errno = parsed.get("last_res_errno")
@@ -1433,6 +1550,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stream debug bytes as the device emits them. "
              "Like `tail -f` for the m68k debug output. Runs "
              "until Ctrl-C, server close, or network drop.")
+
+    rom4 = sub.add_parser(
+        "rom4",
+        help="The rom4 area: 1 KB of the cartridge window that ST "
+             "programs read and the workstation writes.")
+    rom4_sub = rom4.add_subparsers(dest="rom4_cmd", required=True)
+    rom4_sub.add_parser(
+        "info", help="Show the area's ST address, size and magic.")
+    rom4_read = rom4_sub.add_parser(
+        "read", help="Hex-dump the whole area, or save it raw with -o.")
+    rom4_read.add_argument("-o", "--output", default=None,
+                           help="Write the raw 1024 bytes to this file.")
+    rom4_write = rom4_sub.add_parser(
+        "write",
+        help="Write bytes at an offset into the area. Offset: decimal, "
+             "0xhex, or $hex (single-quote it in the shell).")
+    rom4_write.add_argument("offset", help="Offset into the area (0-1023).")
+    rom4_write.add_argument("hex", nargs="*",
+                            help="Bytes as hex, e.g. 01 02 03 or 010203.")
+    rom4_write.add_argument("-f", "--file", default=None,
+                            help="Write this file's bytes instead.")
     return p
 
 
@@ -1503,6 +1641,17 @@ def main(argv: list[str] | None = None) -> int:
         handler = debug_handlers.get(args.debug_cmd)
         if handler is None:
             parser.error(f"unknown debug subcommand: {args.debug_cmd}")
+            return EXIT_USAGE
+        return handler(args)
+    if args.cmd == "rom4":
+        rom4_handlers = {
+            "info": cmd_rom4_info,
+            "read": cmd_rom4_read,
+            "write": cmd_rom4_write,
+        }
+        handler = rom4_handlers.get(args.rom4_cmd)
+        if handler is None:
+            parser.error(f"unknown rom4 subcommand: {args.rom4_cmd}")
             return EXIT_USAGE
         return handler(args)
     handler = handlers.get(args.cmd)

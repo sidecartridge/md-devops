@@ -726,6 +726,7 @@ The 64 KB `ROM_IN_RAM` region is mirrored 1:1 into the Atari ST address space at
 | `$FA2810` | `0x20032810` | 240 B      | **SHARED_VARIABLES** — 60 indexed 4-byte slots |
 | `$FA2900` | `0x20032900` | 512 B      | **TRANSTABLE** — high-res mask table written by `display_setupU8g2()` |
 | `$FA2B00` | `0x20032B00` | ~46 KB     | **APP_FREE** — free arena for app-specific buffers |
+| `$FA8B00` | `0x20038B00` | 1 KB       | **rom4 area**, inside APP_FREE — the workstation writes it over HTTP, ST programs read it; found through shared variables 20–22 (`rp/src/include/rom4.h`) |
 | `$FAE0C0` | `0x2003E0C0` | 8000 B     | **FRAMEBUFFER** (320×200 monochrome)      |
 | `$FAFFFF` | `0x2003FFFF` | —          | end of region                             |
 

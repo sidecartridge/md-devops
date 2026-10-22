@@ -72,6 +72,22 @@ void emul_start();
 bool emul_isRunnerActive(void);
 
 /**
+ * @brief Whether [G] launched TSR mode, which the menu calls the GEMDRIVE
+ *        Runner (Ru[n]ner on). The Runner is active as well, but its
+ *        foreground commands are served by DEVOPS.ACC on the GEM desktop
+ *        rather than by the cartridge's poll loop. Stays set for the RP
+ *        power cycle, like emul_isRunnerActive().
+ */
+bool emul_isRunnerTsrMode(void);
+
+/**
+ * @brief Whether DEVOPS.ACC has reported in (RUNNER_CMD_DONE_ACC_HELLO)
+ *        since the ST last booted. Cleared by emul_resetRunnerSession().
+ */
+bool emul_isRunnerAccessoryAttached(void);
+void emul_recordRunnerAccessoryAttached(void);
+
+/**
  * @brief Whether a Runner command is in flight (only EXECUTE for
  *        now). Cleared by emul_recordRunnerExecuteDone when the
  *        runner_command_cb chandler hook receives RUNNER_CMD_DONE.

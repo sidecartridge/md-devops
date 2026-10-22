@@ -27,6 +27,7 @@
 #include "lwip/tcp.h"
 #include "pico/cyw43_arch.h"
 #include "pico/time.h"
+#include "rom4.h"
 #include "runner.h"
 #include "sdcard.h"
 #include "select.h"
@@ -371,6 +372,20 @@ static void http_spinTick(void) {
   usbcdc_drain();
 }
 
+// Where a buffered request body goes, and how much of one fits. A rom4 PUT
+// can fill the whole area, more than c->body holds, so it is gathered in
+// c->resp, which nothing uses until the response is written.
+_Static_assert(ROM4_SIZE <= HTTP_RESPONSE_BUF_BYTES,
+               "c->resp must hold a whole rom4 PUT body");
+static char *body_buffer(http_conn_t *c, size_t *cap) {
+  if (c->method == HM_PUT && strcmp(c->path, "/api/v1/rom4") == 0) {
+    *cap = ROM4_SIZE;
+    return c->resp;
+  }
+  *cap = sizeof(c->body);
+  return c->body;
+}
+
 // Traffic in either direction keeps a connection alive for the sweeper.
 static void conn_touch(http_conn_t *c) {
   c->last_activity_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
@@ -529,8 +544,10 @@ static err_t __not_in_flash_func(srv_recv_cb)(void *arg, struct tcp_pcb *pcb, st
   } else if (c->state == HC_READ_BODY) {
     size_t need = c->content_length - c->body_received;
     size_t take = (p->tot_len < need) ? p->tot_len : need;
+    size_t cap;
     if (take > 0) {
-      pbuf_copy_partial(p, c->body + c->body_received, (u16_t)take, 0);
+      pbuf_copy_partial(p, body_buffer(c, &cap) + c->body_received, (u16_t)take,
+                        0);
       c->body_received += take;
     }
     pbuf_free(p);
@@ -881,7 +898,9 @@ static void parse_and_dispatch(http_conn_t *c, struct pbuf *seg,
   // first segment).
   bool body_bearing = (c->method == HM_POST) || (c->method == HM_PUT);
   if (body_bearing && c->content_length > 0) {
-    if (c->content_length > HTTP_REQUEST_BODY_BUF_BYTES) {
+    size_t cap;
+    char *body = body_buffer(c, &cap);
+    if (c->content_length > cap) {
       write_error(c, 413, "Payload Too Large", "payload_too_large",
                   "Body too large for this route");
       return;
@@ -889,7 +908,7 @@ static void parse_and_dispatch(http_conn_t *c, struct pbuf *seg,
     size_t leftover = body_leftover;
     if (leftover > c->content_length) leftover = c->content_length;
     if (leftover > 0) {
-      pbuf_copy_partial(seg, c->body, (u16_t)leftover, (u16_t)body_off);
+      pbuf_copy_partial(seg, body, (u16_t)leftover, (u16_t)body_off);
       c->body_received = leftover;
     }
     if (c->body_received >= c->content_length) {
@@ -1362,6 +1381,8 @@ static const char *runner_last_command_str(runner_last_command_t cmd) {
 // commands land.
 static void handle_runner_status(http_conn_t *c) {
   bool active = emul_isRunnerActive();
+  bool tsr = emul_isRunnerTsrMode();
+  bool accessory = emul_isRunnerAccessoryAttached();
   bool busy = emul_isRunnerBusy();
   const char *last_cmd = runner_last_command_str(emul_getRunnerLastCommand());
   const char *last_path = emul_getRunnerLastPath();
@@ -1432,10 +1453,11 @@ static void handle_runner_status(http_conn_t *c) {
     snprintf(last_load_errno_buf, sizeof(last_load_errno_buf), "null");
   }
 
-  static char body[640];
+  static char body[704];
   int n = snprintf(
       body, sizeof(body),
-      "{\"ok\":true,\"active\":%s,\"busy\":%s,\"cwd\":\"%s\","
+      "{\"ok\":true,\"active\":%s,\"tsr\":%s,\"accessory\":%s,"
+      "\"busy\":%s,\"cwd\":\"%s\","
       "\"last_command\":%s%s%s,"
       "\"last_path\":%s%s%s,"
       "\"last_exit_code\":%s,"
@@ -1445,6 +1467,8 @@ static void handle_runner_status(http_conn_t *c) {
       "\"last_load_errno\":%s,"
       "\"last_started_at_ms\":%s,\"last_finished_at_ms\":%s}\n",
       active ? "true" : "false",
+      tsr ? "true" : "false",
+      accessory ? "true" : "false",
       busy ? "true" : "false",
       (cwd != NULL) ? cwd : "",
       (last_cmd != NULL) ? "\"" : "",
@@ -1558,6 +1582,54 @@ static void runner_write_cmdline(const char *cmdline) {
   }
 }
 
+// The Runner's preconditions, one helper each, so every handler refuses with
+// the same code and words. Each writes the error and returns false.
+static bool runner_require_active(http_conn_t *c) {
+  if (emul_isRunnerActive()) return true;
+  write_error(c, 409, "Conflict", "runner_inactive",
+              "Runner is not active; boot via [U], or [G] with the "
+              "GEMDRIVE Runner on");
+  return false;
+}
+
+// In TSR mode the foreground Runner commands are served by DEVOPS.ACC,
+// which GEM only starts once the ST has booted to the desktop. Until it
+// reports in there is nothing on the ST to pick a command up.
+static bool runner_require_accessory(http_conn_t *c) {
+  if (!emul_isRunnerTsrMode() || emul_isRunnerAccessoryAttached()) {
+    return true;
+  }
+  write_error(c, 409, "Conflict", "accessory_not_loaded",
+              "GEMDRIVE Runner: DEVOPS.ACC has not reported in yet; GEM "
+              "starts it once the ST reaches the desktop");
+  return false;
+}
+
+static bool runner_require_idle(http_conn_t *c) {
+  if (!emul_isRunnerBusy()) return true;
+  write_error(c, 503, "Service Unavailable", "busy",
+              "Runner is busy with another command");
+  return false;
+}
+
+// Every foreground command: a Runner, something on the ST to serve the
+// command, and no other command in flight.
+static bool runner_require_foreground(http_conn_t *c) {
+  return runner_require_active(c) && runner_require_accessory(c) &&
+         runner_require_idle(c);
+}
+
+// A synchronous command that timed out is still in the sentinel, and the
+// ST would run it whenever it next looks: in TSR mode, as soon as the
+// accessory gets a turn again. Withdraw it, unless an Advanced Runner
+// command has replaced it since. If the ST picked it up just before, its
+// late reply still updates the state.
+static void runner_withdraw_command(uint32_t command) {
+  if (READ_AND_SWAP_LONGWORD(display_getCommandAddress(), 0) == command) {
+    SEND_COMMAND_TO_DISPLAY(0);
+  }
+}
+
 // POST /api/v1/runner/run —
 //
 // JSON body: {"path": "<rel>", "cmdline": "<≤127>"}.
@@ -1568,19 +1640,7 @@ static void runner_write_cmdline(const char *cmdline) {
 // sentinel. The m68k's Pexec result is reported asynchronously via
 // the chandler RUNNER_CMD_DONE_EXECUTE callback (runner.c).
 static void handle_runner_run(http_conn_t *c) {
-  if (!emul_isRunnerActive()) {
-    write_error(c, 409, "Conflict", "runner_inactive",
-                "Runner mode is not active; boot via [U] first");
-    return;
-  }
-  if (emul_isRunnerBusy()) {
-    write_response_ex(c, 503, "Service Unavailable", "application/json",
-                      "Retry-After: 1\r\n",
-                      "{\"ok\":false,\"code\":\"busy\","
-                      "\"message\":\"Runner is busy with another command\"}\n",
-                      0);
-    return;
-  }
+  if (!runner_require_foreground(c)) return;
   if (c->content_length == 0) {
     write_error(c, 411, "Length Required", "length_required",
                 "JSON body required");
@@ -1710,19 +1770,7 @@ static void handle_runner_run(http_conn_t *c) {
 // outer timeout as a generous worst-case.
 #define RUNNER_LOAD_TIMEOUT_US 10000000
 static void handle_runner_load(http_conn_t *c) {
-  if (!emul_isRunnerActive()) {
-    write_error(c, 409, "Conflict", "runner_inactive",
-                "Runner mode is not active; boot via [U] first");
-    return;
-  }
-  if (emul_isRunnerBusy()) {
-    write_response_ex(c, 503, "Service Unavailable", "application/json",
-                      "Retry-After: 1\r\n",
-                      "{\"ok\":false,\"code\":\"busy\","
-                      "\"message\":\"Runner is busy with another command\"}\n",
-                      0);
-    return;
-  }
+  if (!runner_require_foreground(c)) return;
   if (emul_isRunnerLoadPending()) {
     write_error(c, 409, "Conflict", "program_already_loaded",
                 "A program is already loaded; exec it or reset Runner first");
@@ -1835,6 +1883,7 @@ static void handle_runner_load(http_conn_t *c) {
       // errno so the RP-side state stays consistent (busy=false,
       // pendingBasepage=0, load errno populated).
       emul_recordRunnerLoadDone(0, fail_ms);
+      runner_withdraw_command(RUNNER_CMD_LOAD);
       write_error(c, 504, "Gateway Timeout", "gateway_timeout",
                   "Runner did not respond within 10 s");
       return;
@@ -1876,19 +1925,7 @@ static void handle_runner_load(http_conn_t *c) {
 // arrives asynchronously via DONE_EXEC and surfaces on the
 // next /runner/status as last_exit_code.
 static void handle_runner_exec(http_conn_t *c) {
-  if (!emul_isRunnerActive()) {
-    write_error(c, 409, "Conflict", "runner_inactive",
-                "Runner mode is not active; boot via [U] first");
-    return;
-  }
-  if (emul_isRunnerBusy()) {
-    write_response_ex(c, 503, "Service Unavailable", "application/json",
-                      "Retry-After: 1\r\n",
-                      "{\"ok\":false,\"code\":\"busy\","
-                      "\"message\":\"Runner is busy with another command\"}\n",
-                      0);
-    return;
-  }
+  if (!runner_require_foreground(c)) return;
   if (!emul_isRunnerLoadPending()) {
     write_error(c, 409, "Conflict", "no_program_loaded",
                 "No program is loaded; call /runner/load first");
@@ -1929,19 +1966,7 @@ static void handle_runner_exec(http_conn_t *c) {
 // no_program_loaded if nothing to free.
 #define RUNNER_UNLOAD_TIMEOUT_US 5000000
 static void handle_runner_unload(http_conn_t *c) {
-  if (!emul_isRunnerActive()) {
-    write_error(c, 409, "Conflict", "runner_inactive",
-                "Runner mode is not active; boot via [U] first");
-    return;
-  }
-  if (emul_isRunnerBusy()) {
-    write_response_ex(c, 503, "Service Unavailable", "application/json",
-                      "Retry-After: 1\r\n",
-                      "{\"ok\":false,\"code\":\"busy\","
-                      "\"message\":\"Runner is busy with another command\"}\n",
-                      0);
-    return;
-  }
+  if (!runner_require_foreground(c)) return;
   if (!emul_isRunnerLoadPending()) {
     write_error(c, 409, "Conflict", "no_program_loaded",
                 "No program is loaded; nothing to unload");
@@ -1963,6 +1988,7 @@ static void handle_runner_unload(http_conn_t *c) {
       // Synthetic timeout failure — keeps state consistent
       // (busy=false, load errno populated, basepage preserved).
       emul_recordRunnerUnloadDone(-1, fail_ms);
+      runner_withdraw_command(RUNNER_CMD_UNLOAD);
       write_error(c, 504, "Gateway Timeout", "gateway_timeout",
                   "Runner did not respond within 5 s");
       return;
@@ -2002,19 +2028,7 @@ static void handle_runner_unload(http_conn_t *c) {
 // m68k's Dsetpath result lands asynchronously via the chandler
 // RUNNER_CMD_DONE_CD callback (runner.c).
 static void handle_runner_cd(http_conn_t *c) {
-  if (!emul_isRunnerActive()) {
-    write_error(c, 409, "Conflict", "runner_inactive",
-                "Runner mode is not active; boot via [U] first");
-    return;
-  }
-  if (emul_isRunnerBusy()) {
-    write_response_ex(c, 503, "Service Unavailable", "application/json",
-                      "Retry-After: 1\r\n",
-                      "{\"ok\":false,\"code\":\"busy\","
-                      "\"message\":\"Runner is busy with another command\"}\n",
-                      0);
-    return;
-  }
+  if (!runner_require_foreground(c)) return;
   if (c->content_length == 0) {
     write_error(c, 411, "Length Required", "length_required",
                 "JSON body required");
@@ -2147,19 +2161,14 @@ static void runner_write_rez(uint16_t rez) {
 // with the requested rez. Errno (i32) returns via RUNNER_CMD_DONE_RES
 // and surfaces as `last_res_errno` in the status envelope.
 static void handle_runner_res(http_conn_t *c) {
-  if (!emul_isRunnerActive()) {
-    write_error(c, 409, "Conflict", "runner_inactive",
-                "Runner mode is not active; boot via [U] first");
+  if (!runner_require_active(c)) return;
+  if (emul_isRunnerTsrMode()) {
+    write_error(c, 409, "Conflict", "unsupported_in_tsr",
+                "GEMDRIVE Runner: changing resolution under GEM is not "
+                "supported");
     return;
   }
-  if (emul_isRunnerBusy()) {
-    write_response_ex(c, 503, "Service Unavailable", "application/json",
-                      "Retry-After: 1\r\n",
-                      "{\"ok\":false,\"code\":\"busy\","
-                      "\"message\":\"Runner is busy with another command\"}\n",
-                      0);
-    return;
-  }
+  if (!runner_require_idle(c)) return;
   if (c->content_length == 0) {
     write_error(c, 411, "Length Required", "length_required",
                 "JSON body required");
@@ -2238,11 +2247,7 @@ static void handle_runner_res(http_conn_t *c) {
 //
 // No busy-lock gate — escaping wedged state is the whole point.
 static void handle_runner_adv_jump(http_conn_t *c) {
-  if (!emul_isRunnerActive()) {
-    write_error(c, 409, "Conflict", "runner_inactive",
-                "Runner mode is not active; boot via [U] first");
-    return;
-  }
+  if (!runner_require_active(c)) return;
   if (emul_getRunnerAdvHookVector() != RUNNER_HOOK_VECTOR_VBL) {
     write_error(c, 409, "Conflict", "wrong_hook",
                 "adv jump requires the VBL hook ($70). Switch "
@@ -2337,6 +2342,10 @@ static void handle_runner_adv_jump(http_conn_t *c) {
 //   - Target range must lie above 0x800 (system area) and below
 //     the snapshot's phystop (writable RAM only).
 #define ADV_LOAD_CHUNK_SIZE   8192u
+#define ADV_LOAD_BUF_OFFSET   0x4000u  // in APP_FREE
+_Static_assert(CHANDLER_APP_FREE_OFFSET + ADV_LOAD_BUF_OFFSET +
+                       ADV_LOAD_CHUNK_SIZE <= ROM4_OFFSET,
+               "the adv load staging buffer runs into the rom4 area");
 #define ADV_LOAD_TIMEOUT_US   1000000
 
 static uint8_t *adv_load_buf_base(void) {
@@ -2344,7 +2353,7 @@ static uint8_t *adv_load_buf_base(void) {
   // 0x4000; APP_FREE is 46 KB so 0x4000..0x6000 (8 KB) is comfortably
   // inside the arena and clear of the GEMDRIVE / Runner-meta block
   // (which ends below 0x1A00).
-  return (uint8_t *)(runner_app_free_address() + 0x4000u);
+  return (uint8_t *)(runner_app_free_address() + ADV_LOAD_BUF_OFFSET);
 }
 
 // Byte-pair-swapped append: drop `n` bytes from `p` (starting at
@@ -2444,11 +2453,7 @@ static void adv_load_finish_ok(http_conn_t *c) {
 // already written).
 static bool handle_runner_adv_load_init(http_conn_t *c, struct pbuf *seg,
                                         size_t body_off, size_t leftover) {
-  if (!emul_isRunnerActive()) {
-    write_error(c, 409, "Conflict", "runner_inactive",
-                "Runner mode is not active; boot via [U] first");
-    return false;
-  }
+  if (!runner_require_active(c)) return false;
   if (emul_getRunnerAdvHookVector() != RUNNER_HOOK_VECTOR_VBL) {
     write_error(c, 409, "Conflict", "wrong_hook",
                 "adv load requires the VBL hook ($70). Switch "
@@ -2581,11 +2586,7 @@ static bool handle_runner_adv_load_init(http_conn_t *c, struct pbuf *seg,
 // Intentionally skips the busy-lock gate — the busy state is what
 // we want to escape (a wedged Pexec'd program holds it set forever).
 static void handle_runner_adv_meminfo(http_conn_t *c) {
-  if (!emul_isRunnerActive()) {
-    write_error(c, 409, "Conflict", "runner_inactive",
-                "Runner mode is not active; boot via [U] first");
-    return;
-  }
+  if (!runner_require_active(c)) return;
 
   uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
   emul_recordRunnerMeminfoSubmit(now_ms);
@@ -2785,6 +2786,142 @@ static void handle_debug_log(http_conn_t *c) {
   stream_debug_drive(c);
 }
 
+// --- rom4 area ---
+//
+// 1 KB of the cartridge window that the workstation writes and any ST
+// program reads (rom4.h). No mode, Runner or busy gate: the area is
+// there from RP boot in every mode.
+
+// One frame's header: [u16 offset][u16 length], big-endian.
+static void rom4_frame_header(const uint8_t *p, uint32_t *offset,
+                              uint32_t *len) {
+  *offset = ((uint32_t)p[0] << 8) | p[1];
+  *len = ((uint32_t)p[2] << 8) | p[3];
+}
+
+// PUT /api/v1/rom4?offset=N  — the body is one write at offset N.
+// PUT /api/v1/rom4           — the body is frames
+//                               [u16 offset][u16 length][length bytes],
+//                               applied in order.
+// Offsets are relative to the area. The body, gathered in c->resp (see
+// body_buffer), is checked whole before any of it is written, so a bad
+// request changes nothing.
+static void handle_rom4_put(http_conn_t *c) {
+  const uint8_t *body = (const uint8_t *)c->resp;
+  size_t len = c->content_length;
+  uint32_t writes = 0;
+  char offset_str[24];
+  if (!c->has_content_length) {
+    write_error(c, 411, "Length Required", "length_required",
+                "Content-Length required");
+    return;
+  }
+  if (query_get(c->query, "offset", offset_str, sizeof(offset_str))) {
+    char *endp = NULL;
+    unsigned long offset = strtoul(offset_str, &endp, 0);
+    if (offset_str[0] == '\0' || *endp != '\0') {
+      write_error(c, 400, "Bad Request", "bad_request",
+                  "Could not parse `offset` as integer");
+      return;
+    }
+    if (!rom4_write((uint32_t)offset, body, (uint32_t)len)) {
+      write_error(c, 400, "Bad Request", "out_of_range",
+                  "offset + body length is past the end of the area");
+      return;
+    }
+    writes = 1;
+  } else {
+    uint32_t offset = 0, n = 0;
+    for (size_t pos = 0; pos < len; pos += 4 + n, writes++) {
+      if (len - pos < 4) {
+        write_error(c, 400, "Bad Request", "bad_request",
+                    "Truncated frame header");
+        return;
+      }
+      rom4_frame_header(body + pos, &offset, &n);
+      if (n > len - pos - 4) {
+        write_error(c, 400, "Bad Request", "bad_request",
+                    "Frame length runs past the end of the body");
+        return;
+      }
+      if (offset > ROM4_SIZE || n > ROM4_SIZE - offset) {
+        write_error(c, 400, "Bad Request", "out_of_range",
+                    "Frame runs past the end of the area");
+        return;
+      }
+    }
+    for (size_t pos = 0; pos < len; pos += 4 + n) {
+      rom4_frame_header(body + pos, &offset, &n);
+      rom4_write(offset, body + pos + 4, n);
+    }
+  }
+  char resp[64];
+  int n = snprintf(resp, sizeof(resp), "{\"ok\":true,\"writes\":%lu}\n",
+                   (unsigned long)writes);
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", resp, (size_t)n);
+}
+
+// GET /api/v1/rom4 —
+//   {"ok":true,"address":<ST address>,"size":<bytes>,"magic":<slot 20>}
+// PUT /api/v1/rom4 — handle_rom4_put.
+static void handle_rom4(http_conn_t *c) {
+  if (c->method == HM_PUT) {
+    handle_rom4_put(c);
+    return;
+  }
+  char body[96];
+  int n = snprintf(body, sizeof(body),
+                   "{\"ok\":true,\"address\":%lu,\"size\":%u,"
+                   "\"magic\":%lu}\n",
+                   (unsigned long)rom4_getAddress(), (unsigned)ROM4_SIZE,
+                   (unsigned long)ROM4_MAGIC);
+  if (n < 0) n = 0;
+  write_response(c, 200, "OK", "application/json", body, (size_t)n);
+}
+
+// GET /api/v1/rom4/data — the whole area, ROM4_SIZE bytes in ST order.
+//
+// Headers and body together are more than c->resp holds, so they go to
+// lwIP as two copied writes. An idle connection's send buffer takes both;
+// a fuller one gets a 503 rather than a body cut short.
+static void handle_rom4_data(http_conn_t *c) {
+  if (c->is_head) {
+    write_response(c, 200, "OK", "application/octet-stream", NULL, ROM4_SIZE);
+    return;
+  }
+  int n = snprintf(c->resp, sizeof(c->resp),
+                   "HTTP/1.1 200 OK\r\n"
+                   "Server: md-devops/%s\r\n"
+                   "Connection: close\r\n"
+                   "Content-Type: application/octet-stream\r\n"
+                   "Content-Length: %u\r\n"
+                   "\r\n",
+                   RELEASE_VERSION, (unsigned)ROM4_SIZE);
+  if (n < 0 || (size_t)n >= sizeof(c->resp)) {
+    conn_close(c);
+    return;
+  }
+  if (tcp_sndbuf(c->pcb) < (size_t)n + ROM4_SIZE ||
+      tcp_write(c->pcb, c->resp, (u16_t)n,
+                TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE) != ERR_OK) {
+    write_error(c, 503, "Service Unavailable", "busy", "Send buffer full");
+    return;
+  }
+  rom4_read((uint8_t *)c->resp);
+  if (tcp_write(c->pcb, c->resp, (u16_t)ROM4_SIZE, TCP_WRITE_FLAG_COPY) !=
+      ERR_OK) {
+    conn_close(c);  // the headers are already queued
+    return;
+  }
+  tcp_output(c->pcb);
+  // Close once the peer has acknowledged both writes (srv_sent_cb).
+  c->resp_len = (size_t)n + ROM4_SIZE;
+  c->resp_sent = 0;
+  c->resp_queued = true;
+  c->state = HC_WRITE_RESPONSE;
+}
+
 // GET /api/v1/runner/meminfo —
 //
 // Synchronous: writes RUNNER_CMD_MEMINFO to the cartridge sentinel,
@@ -2798,23 +2935,14 @@ static void handle_debug_log(http_conn_t *c) {
 // config), and a simple "decoded" boolean derived from the banks.
 #define RUNNER_MEMINFO_TIMEOUT_US 1000000
 static void handle_runner_meminfo(http_conn_t *c) {
-  if (!emul_isRunnerActive()) {
-    write_error(c, 409, "Conflict", "runner_inactive",
-                "Runner mode is not active; boot via [U] first");
-    return;
-  }
-  if (emul_isRunnerBusy()) {
-    write_response_ex(c, 503, "Service Unavailable", "application/json",
-                      "Retry-After: 1\r\n",
-                      "{\"ok\":false,\"code\":\"busy\","
-                      "\"message\":\"Runner is busy with another command\"}\n",
-                      0);
-    return;
-  }
+  if (!runner_require_active(c)) return;
+  if (!runner_require_idle(c)) return;
 
   uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
   emul_recordRunnerMeminfoSubmit(now_ms);
-  SEND_COMMAND_TO_DISPLAY(RUNNER_CMD_MEMINFO);
+  // TSR mode has no poll loop; the interrupt hook sends the same reply.
+  SEND_COMMAND_TO_DISPLAY(emul_isRunnerTsrMode() ? RUNNER_ADV_CMD_MEMINFO
+                                                 : RUNNER_CMD_MEMINFO);
 
   absolute_time_t deadline =
       delayed_by_us(get_absolute_time(), RUNNER_MEMINFO_TIMEOUT_US);
@@ -2870,11 +2998,7 @@ static void handle_runner_meminfo(http_conn_t *c) {
 // we want to escape. 409 runner_inactive when the user hasn't
 // picked [U] at boot.
 static void handle_runner_reset(http_conn_t *c) {
-  if (!emul_isRunnerActive()) {
-    write_error(c, 409, "Conflict", "runner_inactive",
-                "Runner mode is not active; boot via [U] first");
-    return;
-  }
+  if (!runner_require_active(c)) return;
   uint32_t now_ms = (uint32_t)to_ms_since_boot(get_absolute_time());
   emul_recordRunnerCommand(RUNNER_LAST_RESET, now_ms);
   SEND_COMMAND_TO_DISPLAY(RUNNER_ADV_CMD_RESET);
@@ -3700,13 +3824,8 @@ static void handle_file_download(http_conn_t *c,
   // Body-stream lock. A streaming GET counts as a body request; if
   // another download or upload is already in flight, return 503.
   if (g_body_stream_busy) {
-    char body[160];
-    int n = snprintf(body, sizeof(body),
-                     "{\"ok\":false,\"code\":\"busy\","
-                     "\"message\":\"Another body request is in progress\"}\n");
-    if (n < 0) n = 0;
-    write_response_ex(c, 503, "Service Unavailable", "application/json",
-                      "Retry-After: 1\r\n", body, (size_t)n);
+    write_error(c, 503, "Service Unavailable", "busy",
+                "Another body request is in progress");
     return;
   }
 
@@ -3965,13 +4084,8 @@ static bool handle_file_upload_init(http_conn_t *c, struct pbuf *seg,
                                     size_t body_off, size_t leftover) {
   // Single-streamer lock.
   if (g_body_stream_busy) {
-    char body[160];
-    int n = snprintf(body, sizeof(body),
-                     "{\"ok\":false,\"code\":\"busy\","
-                     "\"message\":\"Another body request is in progress\"}\n");
-    if (n < 0) n = 0;
-    write_response_ex(c, 503, "Service Unavailable", "application/json",
-                      "Retry-After: 1\r\n", body, (size_t)n);
+    write_error(c, 503, "Service Unavailable", "busy",
+                "Another body request is in progress");
     return false;
   }
 
@@ -4308,6 +4422,8 @@ static const route_t g_routes[] = {
     {"/api/v1/runner", M_GET | M_HEAD, handle_runner_status},
     {"/api/v1/debug", M_GET | M_HEAD, handle_debug_status},
     {"/api/v1/debug/log", M_GET | M_HEAD, handle_debug_log},
+    {"/api/v1/rom4", M_GET | M_HEAD | M_PUT, handle_rom4},
+    {"/api/v1/rom4/data", M_GET | M_HEAD, handle_rom4_data},
     {"/api/v1/system/health", M_GET | M_HEAD, handle_system_health},
 #if defined(_DEBUG) && (_DEBUG != 0)
     {"/api/v1/debug/test/panic", M_POST, handle_debug_test},
@@ -4656,7 +4772,10 @@ static void write_error(http_conn_t *c, int status, const char *reason,
   if (n < 0) {
     n = 0;
   }
-  write_response(c, status, reason, "application/json", body, (size_t)n);
+  // Everything that answers 503 is worth retrying, and says so.
+  write_response_ex(c, status, reason, "application/json",
+                    (status == 503) ? "Retry-After: 1\r\n" : NULL, body,
+                    (size_t)n);
 }
 
 // A FatFs call failed. With the malloc panic off FatFs can

@@ -108,3 +108,17 @@ echo "Copied $target_firmware to rp/src/include/$target_firmware"
 
 rm $target_firmware
 echo "Removed $target_firmware"
+
+# The TSR-mode desk accessory, embedded so the RP can write it to the
+# GEMDRIVE folder when [G] starts with the GEMDRIVE Runner on. Byte for byte: a TOS executable
+# ends with a zero that the word-array conversion above would trim.
+acc_header="devops_acc.h"
+rm -f "$acc_header"
+"$python_bin" firmware.py --input=dist/DEVOPS.ACC --output=$acc_header --array_name=devops_acc --byte_array
+if [ ! -s "$acc_header" ]; then
+    echo "ERROR: firmware.py did not produce $acc_header"
+    exit 7
+fi
+cp $acc_header ../../rp/src/include/$acc_header
+echo "Copied $acc_header to rp/src/include/$acc_header"
+rm $acc_header

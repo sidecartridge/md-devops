@@ -45,6 +45,7 @@
 #define GEMDRIVE_CMD_FATTRIB_CALL (0x43 + GEMDRIVE_APP)
 #define GEMDRIVE_CMD_DGETPATH_CALL (0x47 + GEMDRIVE_APP)
 #define GEMDRIVE_CMD_PEXEC_CALL (0x4B + GEMDRIVE_APP)
+#define GEMDRIVE_CMD_PTERM_CALL (0x4C + GEMDRIVE_APP)
 #define GEMDRIVE_CMD_FSETDTA_CALL (0x1A + GEMDRIVE_APP)
 #define GEMDRIVE_CMD_FSFIRST_CALL (0x4E + GEMDRIVE_APP)
 #define GEMDRIVE_CMD_FSNEXT_CALL (0x4F + GEMDRIVE_APP)
@@ -160,7 +161,8 @@ void gemdrive_setWriteStall(uint16_t chunks, uint16_t deciseconds);
 //   screen_base − 11 KB ($2C00)  end of GEMDRIVE_BLOB
 //   screen_base − 10 KB ($2800)  RUNNER_BLOB    (3 KB) — $400 slack above
 //   screen_base −  7 KB ($1C00)  end of RUNNER_BLOB
-//   screen_base −  7 KB .. screen_base — 7 KB safety buffer to framebuffer
+//   screen_base −  7 KB .. screen_base — GEMDRIVE's own stack, growing down
+//                                        from screen_base (gemdrive.s)
 //
 // User-facing label in the setup menu is "auto (screen-16KB)".
 #define GEMDRIVE_DEFAULT_OFFSET_BYTES 0x4000
@@ -172,6 +174,14 @@ void gemdrive_init(void);
 
 // chandler callback. Public so emul.c can register it via chandler_addCB.
 void gemdrive_command_cb(TransmissionProtocol *protocol, uint16_t *payload);
+
+// Publish the settings the m68k reads when the user picks a mode: the
+// reloc and memtop it installs GEMDRIVE at, the Advanced Runner hook
+// vector and the drive. HELLO publishes them before the menu paints, so
+// a menu command that changes one must call this too, or [G] and [U]
+// use the value from boot. Does nothing until HELLO has landed, or
+// while GEMDRIVE is disabled.
+void gemdrive_publishSettings(void);
 
 // Read the cached phystop value from the most recent GEMDRIVE_CMD_HELLO.
 // Returns false if no HELLO has landed yet (handshake hasn't completed —

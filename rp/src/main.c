@@ -15,6 +15,7 @@
 #include "hardware/vreg.h"
 #include "pico/stdlib.h"
 #include "reset.h"
+#include "select.h"
 
 // This is the main.c file for the app or microfirmware. It is the entry point
 // for the application. It is the first file that is executed when the
@@ -95,6 +96,16 @@ int main() {
           (unsigned int)&__rom_in_ram_start__, romInRamLength);
 
 #endif
+
+  // SELECT held at power-on: straight to the Booster, before any config is
+  // read or the emulation starts, so the way out works however broken this
+  // app's settings or startup are. The app's own SELECT handling only runs
+  // once emul_start() is in its main loop.
+  select_configure();
+  if (select_detectPush()) {
+    DPRINTF("SELECT held at power-on. Jump to Booster application\n");
+    reset_jump_to_booster();
+  }
 
   // Load the global configuration parameters
   int err = gconfig_init(CURRENT_APP_UUID_KEY);

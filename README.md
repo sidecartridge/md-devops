@@ -48,6 +48,9 @@ HTTP-management surface stitched on top.
   m68k (`*(volatile char *)(0xFBFF00 + c)`), captured RP-side and
   streamed to either an HTTP `tail -f` endpoint or USB CDC. No
   framing, no overhead, byte-exact.
+- **rom4 area** — 1 KB of the cartridge window that the
+  workstation writes over HTTP and any running ST program reads:
+  live parameters, scripted input for a test, a driver's state.
 - **Live setup menu** — graphical status icons (Wi-Fi / SD / USB
   CDC / Adv Vector), animated countdown bar, USB CDC attach state
   refreshed live as you plug / unplug.
@@ -97,15 +100,17 @@ seconds. From there you have four top-level commands:
 | Key | Action |
 | --- | --- |
 | `[U]` | **Runner mode** (recommended). GEMDRIVE comes up, plus the Runner control surface for `runner run` / `load` / `exec` / etc. |
-| `[G]` | GEMDRIVE-only — ST drops straight into the emulated drive but does **not** activate the Runner. Use this if you only want file emulation and don't need the workstation to drive the ST. |
+| `[G]` | **GEMDRIVE**. The ST boots on through the AUTO folder to the GEM desktop with the emulated drive. With the **GEMDRIVE Runner** on (`Ru[n]ner`, the default), the Runner comes too: its interrupt hook stays resident and the `DEVOPS.ACC` desk accessory serves `runner run` / `load` / `exec` from the desktop. See [GEMDRIVE Runner](#gemdrive-runner--runner-commands-from-the-gem-desktop). With it off, `[G]` is plain file emulation. |
 | `[X]` | Return to the Booster menu (e.g. to install another app). |
 | any key | Halt the auto-launch countdown so the menu stays up indefinitely while you read it. |
 
-If you don't press anything within ~20 s, the firmware **auto-fires
-[U]Runner** — Runner is the more useful default for unattended
-boots.
+If you don't press anything within ~20 s, the firmware **launches
+the mode you launched last**, so a power cycle comes back the way it
+went. Until you first use `[G]` that is `[U]` Runner, the more useful
+default for unattended boots. The countdown bar names the mode it
+will launch.
 
-### SELECT button — Pico-side reset / factory-reset
+### SELECT button — Booster, reset, factory reset
 
 The cartridge's physical **SELECT** button is wired so a press
 on the Pico itself can recover the device without needing the
@@ -113,6 +118,7 @@ ST's keyboard:
 
 | Press | Action |
 | --- | --- |
+| Held while the ST is switched on | **Booster.** The Pico goes straight to the Booster app instead of starting DevOps, the same as `[X]` in the setup menu, and works even when DevOps cannot reach its menu. |
 | Short tap (< 10 s) | **Soft reset** of the Pico. The cartridge boots back into the setup menu. The ST's TOS state is unaffected, but on the next ST cold reset the firmware re-handshakes from scratch. |
 | Long press (≥ 10 s, hold steady) | **Factory reset.** The Pico erases its flash-stored aconfig (drive letter, reloc address, hook vector, etc.) and reboots. Use this if a setting got the device into a state where the menu won't come up — power-cycle the ST afterwards so it sees the cleared cartridge. |
 
@@ -191,6 +197,7 @@ GEMDRIVE                                   💾
   [D]rive     : C:
   [R]eloc addr: auto (screen-16KB)
   Mem[t]op    : auto (matches reloc)
+  Ru[n]ner    : on
   Phystop     : 0x100000
   Screenmem   : 0x078000
 
@@ -211,12 +218,12 @@ Select an option: ▌
 
 | Section | What it shows | Keys |
 | --- | --- | --- |
-| **GEMDRIVE** | Which microSD folder is mounted as the emulated drive, the drive letter assigned to it, the GEMDRIVE relocation address (`auto` = `screen_base − 16 KB`), the patched `_memtop` value, the read-only `_phystop` value (`$42E`) the ST reports, and the read-only screen-memory base (`_v_bas_ad`, `$44E`). A `(!)` marker on the Phystop line means TOS' phystop disagrees with the silicon's MMU bank-config — a reset-resistant program lowered phystop and survived warm reset; **only a power-cycle restores it**. The hard-drive icon appears whenever the section is live. | `[o]` change folder, `[d]` change drive letter, `[r]` change reloc addr, `[t]` change `_memtop`. (Phystop and Screenmem are read-only.) |
+| **GEMDRIVE** | Which microSD folder is mounted as the emulated drive, the drive letter assigned to it, the GEMDRIVE relocation address (`auto` = `screen_base − 16 KB`), the patched `_memtop` value, whether `[G]` brings the GEMDRIVE Runner, the read-only `_phystop` value (`$42E`) the ST reports, and the read-only screen-memory base (`_v_bas_ad`, `$44E`). A `(!)` marker on the Phystop line means TOS' phystop disagrees with the silicon's MMU bank-config — a reset-resistant program lowered phystop and survived warm reset; **only a power-cycle restores it**. The hard-drive icon appears whenever the section is live. | `[o]` change folder, `[d]` change drive letter, `[r]` change reloc addr, `[t]` change `_memtop`, `[n]` turn the GEMDRIVE Runner on or off. (Phystop and Screenmem are read-only.) |
 | **Adv [V]ector** | Which interrupt vector the Advanced Runner installs its hook into — `vbl ($70)` or `etv_timer ($400)`. See *Picking a hook vector* below for the trade-off. The cog icon appears whenever the section is live. | `[V]` toggle between `vbl` / `etv_timer`. |
 | **API Endpoint** | mDNS hostname and the IP DHCP leased. The Wi-Fi icon appears once the network is up; if there's no IP yet (Wi-Fi still associating) the icon is hidden. | (read-only) |
 | **USB CDC (Debug serial)** | `connected` / `disconnected` — live-refreshed as you plug or unplug a USB cable into the Pico. The lightbulb icon flips in lock-step. | (read-only) |
 | **Bottom navigation strip** | Top-level command keys + a one-character prompt area for typing them. | `[G]` / `[U]` / `[X]`. |
-| **Animated countdown bar** | Shrinking white bar; the message "Booting in N s — any key halts" is overlaid in inverted colour so it stays readable both halves. Becomes "Countdown stopped. Press [G], [U] or [X] to continue." once any key has been pressed. | (passive — but pressing any key halts the countdown) |
+| **Animated countdown bar** | Shrinking white bar; the message "Booting Runner in N s — any key halts" (or "Booting GEMDRIVE …", whichever mode it will launch) is overlaid in inverted colour so it stays readable both halves. Becomes "Countdown stopped. Press [G], [U] or [X] to continue." once any key has been pressed. | (passive — but pressing any key halts the countdown) |
 
 ### Picking a hook vector
 
@@ -309,7 +316,7 @@ resolving on your workstation. The API is the **single
 control surface** for every remote operation in this firmware
 — file management, program execution, debug streaming. Everything
 the rest of this README documents (`ping`, `gemdrive`, `runner`,
-`debug`) is a thin wrapper around HTTP calls to this service.
+`debug`, `rom4`) is a thin wrapper around HTTP calls to this service.
 
 | Family | HTTP endpoints | CLI prefix |
 | --- | --- | --- |
@@ -317,6 +324,7 @@ the rest of this README documents (`ping`, `gemdrive`, `runner`,
 | GEMDRIVE | `GET/PUT/DELETE/POST /api/v1/gemdrive/{volume,files,folders}/…` | `sidecart gemdrive …` |
 | Runner | `GET/POST /api/v1/runner/…` | `sidecart runner …` |
 | Debug | `GET /api/v1/debug`, `GET /api/v1/debug/log` | `sidecart debug …` |
+| rom4 | `GET /api/v1/rom4`, `GET /api/v1/rom4/data`, `PUT /api/v1/rom4` | `sidecart rom4 …` |
 
 You can drive the API directly from any HTTP client (`curl`,
 `wget`, `httpie`, a browser, a shell script, your editor's
@@ -644,7 +652,9 @@ Runner mode is the foreground execution path the firmware ships
 with. The user picks `[U]` at the setup menu to launch it; the
 m68k Runner stays in a poll loop waiting for commands from the
 RP, while GEMDRIVE keeps servicing TOS file I/O so launched
-programs can use the emulated drive normally.
+programs can use the emulated drive normally. The same commands
+work from the GEM desktop when `[G]` starts with the GEMDRIVE Runner
+on; see [GEMDRIVE Runner](#gemdrive-runner--runner-commands-from-the-gem-desktop).
 
 The Runner exposes its own subset of the HTTP API
 (`/api/v1/runner/*`) and CLI (`sidecart runner …`) for
@@ -662,9 +672,10 @@ The surface splits into three behavioural buckets:
   report `active : no`.
 - **Foreground commands** — `runner cd` / `res` / `meminfo` /
   `run` / `load` / `exec` / `unload`. These speak to the m68k
-  Runner poll loop. They return `409 runner_inactive` if `[U]`
-  wasn't picked, and `503 busy` if another foreground command
-  is already in flight. Cannot reach a wedged ST.
+  Runner poll loop, or with the GEMDRIVE Runner to `DEVOPS.ACC`.
+  They return `409 runner_inactive` if the Runner isn't running,
+  and `503 busy` if another foreground command is already in
+  flight. Cannot reach a wedged ST.
 - **VBL-driven commands** — `runner reset` plus the entire
   `runner adv` family (`jump` / `load` / `meminfo`). These
   ride the m68k's VBL ISR (`$70`, or `$400` if you switched
@@ -693,7 +704,7 @@ loaded   : basepage 0x00078000
 ```
 
 If Runner mode hasn't been entered yet, prints
-`Runner mode is not active. Boot via [U] to enable.` and exits
+`Runner is not active. Boot via [U], or [G] with the GEMDRIVE Runner on.` and exits
 0. `--json` returns the full envelope (`last_command` /
 `last_path` / `last_exit_code` / `last_cd_errno` /
 `last_res_errno` / `loaded_basepage` / `last_load_errno`).
@@ -756,7 +767,7 @@ membottom [$432]  : 0x00006A04
 memtop    [$436]  : 0x00080000
 phystop   [$42E]  : 0x00080000
 screenmem [$44E]  : 0x00078000
-basepage  [$4F2]  : 0x00078000
+basepage  [_run]  : 0x00078000
 bank 0    [$FF8001 nibble] : 512 KB
 bank 1    [$FF8001 nibble] : 0 KB
 total RAM         : 512 KB
@@ -865,7 +876,7 @@ membottom [$432]  : 0x00006A04
 memtop    [$436]  : 0x00080000
 phystop   [$42E]  : 0x00080000
 screenmem [$44E]  : 0x00078000
-basepage  [$4F2]  : 0x00078000
+basepage  [_run]  : 0x00078000
 bank 0    [$FF8001 nibble] : 512 KB
 bank 1    [$FF8001 nibble] : 0 KB
 total RAM         : 512 KB
@@ -919,6 +930,96 @@ Synchronous — the workstation file is chunked through
 when `LOCAL` has a header you don't want landing on the ST.
 Same shell-quoting rule as `adv jump`.
 
+### GEMDRIVE Runner — Runner commands from the GEM desktop
+
+> Tested on a Mega STE with TOS 2.06, with and without an ACSI2STM
+> hard disk, and in Hatari with EmuTOS. Other machines and TOS
+> versions have not been tried.
+
+`[U]` runs the Runner from the cartridge's boot hook, before the
+AUTO folder, the desk accessories and GEM have loaded, so a program
+it launches finds none of them — no driver from the AUTO folder (an
+Xpad provider, say), and on TOS 1.0x no cookie jar. `[G]` with the
+GEMDRIVE Runner on installs GEMDRIVE and the Runner's interrupt hook,
+then lets the ST boot on to the desktop as usual. The foreground
+commands are served from there by a desk accessory, `DEVOPS.ACC`.
+The code and the API call this TSR mode.
+
+The GEMDRIVE Runner is on unless you turn it off: `Ru[n]ner` in the
+GEMDRIVE section of the setup menu shows it, and `[N]` toggles it.
+With it off, `[G]` is plain GEMDRIVE: no accessory, no interrupt
+hook, no Runner. It also deletes `DEVOPS.ACC` from the root of the
+GEMDRIVE folder, so GEM does not load an accessory with nothing to
+serve. The name is the firmware's: with the Runner on, `[G]` replaces
+any `DEVOPS.ACC` there that differs from its own.
+
+Press `[G]` at the setup menu. The firmware carries the accessory
+it was built with and writes it to the root of the GEMDRIVE folder
+first, unless an identical copy is already there, so it always
+matches the firmware. Once GEM has started it, `runner status` shows
+it:
+
+```
+active   : true
+mode     : GEMDRIVE Runner (DEVOPS.ACC loaded)
+```
+
+On the ST, the accessory adds **DevOps Runner** to the Desk menu. It
+opens an alert with the Runner's current directory and the last
+command the accessory ran, with its exit code or result.
+
+The accessory only runs when GEM gives it a turn, so its commands
+wait while the desktop is busy: while this alert or any other dialog
+is open, a menu is pulled down, or something is being dragged.
+`runner status` shows `busy` until then. `load` and `unload` give up
+after their timeout and are withdrawn, so they do not run later; `run`,
+`exec` and `cd` wait as long as it takes. `runner meminfo`,
+`runner reset` and the `adv` commands come from the interrupt hook and
+are not held up.
+
+With GEMDRIVE as `C:`, GEM starts the accessory from `C:\`, whether
+or not there is another hard disk. With another drive letter, `[G]`
+still writes `DEVOPS.ACC` to the root of the GEMDRIVE folder: copy it
+from there to the root of your boot drive. Until you do, you get plain
+GEMDRIVE plus `runner reset`, `runner meminfo` and the `runner adv`
+commands.
+
+TOS runs the AUTO folder from the boot drive. With GEMDRIVE as `C:`
+and no other hard disk, that is `C:`, so AUTO programs go in an
+`AUTO` folder inside the GEMDRIVE folder. A hard-disk driver that
+loads after the cartridge can take the boot drive for its own first
+drive: with an ACSI2STM, which moves itself to `D:`, TOS runs
+`D:\AUTO` instead, so AUTO programs go there.
+
+| Command | With the GEMDRIVE Runner |
+| --- | --- |
+| `runner run` / `load` / `exec` / `unload` / `cd` | Served by `DEVOPS.ACC`. `409 accessory_not_loaded` until it has started. |
+| `runner meminfo` | Answered by the interrupt hook, as `runner adv meminfo` is. |
+| `runner reset`, `runner adv …` | Unchanged. After a reset the ST boots back into GEMDRIVE with the Runner; wait for `DEVOPS.ACC loaded` again before the next foreground command. |
+| `runner res` | `409 unsupported_in_tsr` — changing the resolution under GEM would leave the desktop drawn for the old one. |
+
+To launch a program the accessory does what the desktop does for a
+TOS program: it locks the screen, hides the mouse and clears the
+screen. When the program exits it puts back the resolution, screen
+address and palette and has the desktop redraw itself. Its
+`[RUN  ]` / `[EXIT n]` trace lines go to the
+[debug stream](#debug-traces) — `sidecart debug tail` or the USB
+serial port — rather than the screen.
+
+Limits:
+
+- **Plain TOS programs only** — `.TOS`, `.TTP`, games, demos, and
+  `.PRG` files that don't use GEM. On single-tasking TOS a GEM
+  program started from an accessory would run inside the
+  accessory's AES slot.
+- **The accessory only runs while the foreground program waits for
+  GEM events.** While a program it launched is running, only the
+  interrupt-hook commands work: `runner reset` and
+  `runner adv meminfo` / `jump` / `load`.
+- **It shares the desktop's process**, so the desktop can change the
+  current directory between commands. The accessory keeps the
+  Runner's own and sets it again before every command.
+
 ## Debug traces
 
 The firmware exposes a lightweight debug-byte capture surface
@@ -935,10 +1036,10 @@ discarded.
 > DPRINTF), it boots *before* the Atari ST. Two side effects:
 > 1. The setup-menu countdown starts running with no ST
 >    attached, and once it elapses (~20 s by default) the
->    firmware auto-commits Runner mode. When you subsequently
->    power the ST, it sees the cartridge already in Runner
->    state and skips the menu — you never get a chance to
->    press `[U]` / `[G]`.
+>    firmware auto-commits the mode launched last (Runner until
+>    you first use `[G]`). When you subsequently power the ST,
+>    it sees the cartridge already in that mode and skips the
+>    menu — you never get a chance to press `[U]` / `[G]`.
 > 2. Any Runner state the Pico accumulated before the ST booted
 >    (a previously-loaded program, a stale cwd, etc.) survives
 >    into the new ST session — the Pico has no way to detect
@@ -1030,7 +1131,7 @@ usbcdc_dropped : 0
 ```
 
 `firmware_mode` flips to `yes` once the user has committed a
-mode at the menu (`[U]` / `[G]`) — the capture is
+mode at the menu (`[U]` or `[G]`) — the capture is
 gated on this so menu activity never pollutes the stream.
 `ring used / capacity` is the snapshot fill of the in-RAM
 debug ring at the moment of the request. `bytes_dropped` and
@@ -1093,6 +1194,43 @@ python3 cli/sidecart.py runner run /HELLODBG.TOS
 Full endpoint reference + multi-consumer model is in
 [`docs/api.md`](docs/api.md#debug-traces).
 
+## rom4 area
+
+The other direction from debug traces: 1 KB of the cartridge
+window (`$FA8B00`–`$FA8EFF`) that the workstation writes and any
+program on the ST reads, whatever mode the firmware is in. DevOps
+gives the bytes no meaning; what they say is up to the program.
+They are zeroed when the Pico boots, survive an ST reset, and are
+lost when the Pico resets.
+
+Programs find the area through shared variable 20 at `$FA2860`:
+the long there is `'R4A1'` when the area exists, and the next two
+longs are its address and size. Read it in C or assembly as shown
+in [`docs/api.md`](docs/api.md#rom4-area); the ST cannot write
+it.
+
+```sh
+$ python3 cli/sidecart.py rom4 info
+address: $FA8B00
+size   : 1024 bytes
+magic  : $52344131 ('R4A1')
+
+$ python3 cli/sidecart.py rom4 write 0x10 01 02 03
+ok  3 bytes at offset 16 ($010)
+
+$ python3 cli/sidecart.py rom4 write 0 -f params.bin
+$ python3 cli/sidecart.py rom4 read            # hex dump
+$ python3 cli/sidecart.py rom4 read -o rom4.bin
+```
+
+Offsets are relative to the area (`0`–`1023`). Each 16-bit word
+changes in one store, so the ST never reads half of one, but a
+longer write can be seen part done; `PUT /api/v1/rom4` without an
+offset takes several ranges in one request, written in order, for
+programs that flip a flag after filling a buffer.
+`target/atarist/test/rom4/` builds `ROM4CHK.TOS`, which shows the
+first 32 bytes of the area and sends them to the debug stream.
+
 ## Project internals
 
 This section documents the on-cartridge memory map and module
@@ -1112,7 +1250,8 @@ mirrored at RP `0x20030000`. Layout:
   `RANDOM_TOKEN`, `RANDOM_TOKEN_SEED`, 60 × 4-byte indexed
   shared variables) sits at `$FA2800`.
 - The **`APP_FREE`** arena (~46 KB at `$FA2B00`) is the
-  contiguous space the app uses for its own buffers.
+  contiguous space the app uses for its own buffers. The 1 KB
+  **rom4 area** at `$FA8B00` is part of it.
 - The **framebuffer** (8000 B for 320×200 monochrome) sits at
   the very top of the region (`$FAE0C0`), so an overrun walks
   off the end of the 64 KB window instead of corrupting the
@@ -1143,7 +1282,11 @@ into three sections:
 sentinel and hands control to the right blob: `CMD_START = 4`
 jumps into `GEMDRIVE_BLOB+4` (diagnostic + memtop verify), and
 `CMD_START_RUNNER = 5` jumps into `RUNNER_BLOB` (the Runner's
-poll loop). Adding a new module follows the same pattern: place
+poll loop). `CMD_START_TSR = 6`, which `[G]` sends when the GEMDRIVE
+Runner is on, calls `RUNNER_BLOB` with the
+command still in `d6`, so the Runner installs its interrupt hook
+and returns, then goes through `GEMDRIVE_BLOB+4` back to TOS, which
+boots on. Adding a new module follows the same pattern: place
 a new `.text_<name>` section in `devops.ld`, mirror the offset
 with an `equ` in `main.s`, and add the `.o` target to
 `target/atarist/Makefile`.
@@ -1156,6 +1299,11 @@ resolve locally inside their own object files. No `xref` /
 outside-module symbols (except the entry-point `jmp` from
 `main.s`'s dispatch). See `CLAUDE.md` for the full editing
 guardrails.
+
+`devops_acc.s` is not part of the cartridge image: it builds
+`DEVOPS.ACC`, the GEMDRIVE Runner's desk accessory, an ordinary TOS
+executable that GEM loads and relocates. It shares the protocol
+includes and the Runner's command codes.
 
 ### Building from source
 

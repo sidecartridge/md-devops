@@ -85,12 +85,12 @@ python3 cli/sidecart.py gemdrive rm SWITCHER.TOS
 | `201 Created` | New folder or new file via `PUT`. Carries `Location:`. |
 | `204 No Content` | Successful delete. |
 | `206 Partial Content` | `Range:` download. Carries `Content-Range:`. |
-| `400 Bad Request` | `bad_request` / `bad_path` / `bad_query` / `name_too_long`. |
+| `400 Bad Request` | `bad_request` / `bad_path` / `bad_query` / `name_too_long` / `out_of_range`. |
 | `404 Not Found` | `not_found`; `is_directory` / `is_file` when path resolves to the other namespace. |
 | `405 Method Not Allowed` | Always carries `Allow:`. |
 | `409 Conflict` | Target exists, non-empty folder delete, root delete, file open elsewhere, read-only. |
 | `411 Length Required` | `PUT` without `Content-Length`. |
-| `413 Payload Too Large` | Upload body > 4 MB. |
+| `413 Payload Too Large` | Upload body > 4 MB, or a `rom4` body > 1024 bytes. |
 | `415 Unsupported Media Type` | Wrong request `Content-Type` on a JSON route. |
 | `416 Range Not Satisfiable` | Range outside file bounds. Carries `Content-Range: bytes */<size>`. |
 | `422 Unprocessable Entity` | Malformed JSON body, missing required field, listing-on-file, rename-into-own-descendant. |
@@ -109,7 +109,8 @@ Clients can switch on `code` reliably. All defined symbols:
 `too_many_open_files`, `disk_error`,
 `insufficient_memory`, `internal_error`, `runner_inactive`, `gateway_timeout`, `no_snapshot`,
 `wrong_hook`, `ram_overflow`, `pexec_failed`, `mfree_failed`,
-`program_already_loaded`, `no_program_loaded`.
+`program_already_loaded`, `no_program_loaded`, `accessory_not_loaded`,
+`unsupported_in_tsr`, `out_of_range`.
 
 `too_many_open_files` — FatFs's lock table is full. It is shared with GEMDRIVE
 (`FF_FS_LOCK`, 28 entries: 8 GEMDRIVE files, 16 GEMDRIVE searches and 2 HTTP
@@ -125,7 +126,17 @@ inserting a working card clears it within a few seconds with no reset, and the
 setup menu shows `SD: NO CARD` meanwhile and refuses `[G]` and `[U]`.
 
 Runner-specific codes (see *Runner mode* below):
-- `runner_inactive` — the user didn't pick `[U]` at boot.
+- `runner_inactive` — the Runner isn't running: the user picked neither
+  `[U]` nor `[G]` with the GEMDRIVE Runner on.
+- `accessory_not_loaded` — TSR mode (`[G]` with the GEMDRIVE Runner
+  on): `DEVOPS.ACC` has not
+  reported in yet, so nothing on the ST serves `run`, `cd`, `load`,
+  `exec` or `unload`. It reports in when GEM starts it at the end of
+  the boot. `[G]` writes it to the root of the GEMDRIVE folder, where
+  GEM finds it when GEMDRIVE is `C:`; with another drive letter it
+  has to be copied to the boot drive by hand.
+- `unsupported_in_tsr` — `runner res` in TSR mode: changing the
+  resolution under GEM would leave the desktop drawn for the old one.
 - `busy` — another foreground Runner command is in flight. Every
   m68k-bound foreground verb gates on this lock: `run`, `cd`,
   `res`, `meminfo`, `load`, `exec`, and `unload`. `reset` and the
@@ -134,13 +145,17 @@ Runner-specific codes (see *Runner mode* below):
 - `gateway_timeout` — the Atari ST didn't reply within the
   endpoint's spin-wait deadline (10 s for `runner load`, 5 s for
   `runner unload`, 1 s for `runner meminfo` / `runner adv/meminfo`
-  / per-chunk `runner adv/load`).
+  / per-chunk `runner adv/load`). A timed-out `load` or `unload` is
+  withdrawn, so the ST does not run it later.
 - `no_snapshot` — the m68k handshake completed but no snapshot was
   recorded (should not happen in practice).
 - `wrong_hook` — Advanced Runner command requires the VBL hook (`$70`)
   but `ADV_HOOK_VECTOR` is set to `etv_timer` (`$400`).
 - `ram_overflow` — `runner adv load`: the requested target range
   `[address, address+size)` doesn't fit inside `[membottom, phystop)`.
+
+`out_of_range` — a `rom4` write runs past the end of the 1024-byte area
+(see *rom4 area* below). Nothing is written.
 
 ---
 
@@ -536,15 +551,16 @@ fall into three behavioural buckets:
   `exec` / `unload`. `run` / `cd` / `res` / `exec` are
   fire-and-forget (`202 Accepted`); `meminfo` / `load` / `unload`
   are synchronous. Every one of these gates on `409
-  runner_inactive` when `[U]` wasn't picked, and on `503 busy`
+  runner_inactive` when the Runner isn't running, and on `503 busy`
   (with `Retry-After: 1`) when another foreground command is
-  already in flight.
+  already in flight. In TSR mode `DEVOPS.ACC` serves them instead of
+  the poll loop; see *TSR mode* below.
 
 - **VBL-ISR-driven commands** — `reset` plus the entire
   `/api/v1/runner/adv/*` surface. These ride the m68k's VBL
   ISR (`$70`, or `$400` if `ADV_HOOK_VECTOR = etv_timer` in the
-  setup menu). They return `409 runner_inactive` when `[U]`
-  wasn't picked, but **do not** gate on the busy lock —
+  setup menu). They return `409 runner_inactive` when the Runner isn't
+  running, but **do not** gate on the busy lock —
   escaping wedged state is their job. `adv jump` and `adv load`
   additionally require the VBL hook specifically (`409
   wrong_hook` otherwise); `reset` and `adv meminfo` work on
@@ -557,6 +573,41 @@ menu's `ADV_HOOK_VECTOR` choice). VBL-driven commands keep working
 when the foreground poll loop is blocked — wedged programs, bombs
 already painted, traps disabled. See the *Advanced Runner* section
 below the foreground endpoints.
+
+### TSR mode
+
+TSR mode is what the setup menu calls the GEMDRIVE Runner: `[G]` with
+`Ru[n]ner` on, which is the default (`[N]` toggles it). It installs
+GEMDRIVE and the Advanced Runner hook, then lets the ST boot on through
+the AUTO folder to the GEM desktop instead of entering the poll loop.
+The foreground commands are served by the desk accessory `DEVOPS.ACC`,
+which GEM starts from `C:\` when GEMDRIVE is `C:`. `[G]` first writes
+the copy built into the firmware to the root of the GEMDRIVE folder,
+unless an identical one is there. With the GEMDRIVE Runner off, `[G]`
+deletes `DEVOPS.ACC` from there instead, whichever firmware wrote it.
+The API is the same, with these differences:
+
+- `run`, `cd`, `load`, `exec` and `unload` answer `409
+  accessory_not_loaded` until the accessory has reported in.
+- `meminfo` is answered by the Advanced Runner hook, as `adv/meminfo`
+  is.
+- `res` answers `409 unsupported_in_tsr`.
+- The accessory only runs when GEM gives it a turn, so the commands it
+  serves wait, with the Runner `busy`, while a dialog or alert is open,
+  a menu is pulled down or something is being dragged on the desktop.
+  `load` and `unload` then time out (`504 gateway_timeout`) and are
+  withdrawn; `run`, `exec` and `cd` wait until GEM lets the accessory
+  run.
+- `GET /api/v1/runner` reports `"tsr": true`, and `"accessory"` once
+  the accessory has reported in.
+- After `reset` the ST boots back into TSR mode, and the foreground
+  commands answer `409 accessory_not_loaded` again until the accessory
+  has reported in, so a script should wait for `"accessory": true`.
+
+The accessory can only launch plain TOS programs (`.TOS`, `.TTP`, and
+`.PRG` files that don't use GEM). It sends its `[RUN  ]` / `[EXIT n]`
+trace lines to the [debug stream](#debug-traces) rather than the
+screen.
 
 > **Shell-quoting note** — several Advanced commands accept a
 > `$hex` legacy form (e.g. `$78000`, equivalent to `0x78000`). Bash
@@ -583,6 +634,8 @@ curl http://sidecart.local/api/v1/runner
 {
   "ok": true,
   "active": true,
+  "tsr": false,
+  "accessory": false,
   "busy": false,
   "cwd": "/GAMES/ARKANOID",
   "last_command": "EXECUTE",
@@ -596,6 +649,10 @@ curl http://sidecart.local/api/v1/runner
   "last_finished_at_ms": 13002
 }
 ```
+
+`tsr` is `true` when `[G]` started with the GEMDRIVE Runner on; `accessory` is `true` once
+`DEVOPS.ACC` has reported in since the ST last booted (always `false`
+outside TSR mode).
 
 `last_command` is one of `null`, `RESET`, `EXECUTE`, `CD`, `RES`,
 `MEMINFO`, `JUMP`, `LOAD`, `PEXEC_LOAD`, `PEXEC_EXEC`, or
@@ -690,7 +747,7 @@ do pass `--`, it lands in `cmdline` literally.)
 
 Common error codes: `404 not_found` (program file doesn't exist),
 `400 bad_path` (rejected name), `400 bad_request` (cmdline too
-long), `409 runner_inactive`, `503 busy`.
+long), `409 runner_inactive`, `409 accessory_not_loaded`, `503 busy`.
 
 ---
 
@@ -749,8 +806,9 @@ Response 200:
 Common error codes: `200 OK` (success — basepage in body), `422
 pexec_failed` (GEMDOS errno in `gemdos_errno` field — file too
 big, out of memory, etc.), `404 not_found`, `409
-runner_inactive`, `409 program_already_loaded`, `503 busy`,
-`504 gateway_timeout` (m68k didn't respond within 10 s).
+runner_inactive`, `409 accessory_not_loaded`, `409
+program_already_loaded`, `503 busy`, `504 gateway_timeout` (m68k
+didn't respond within 10 s).
 
 #### `POST /api/v1/runner/exec` — `Pexec(4)` just-go
 
@@ -776,7 +834,8 @@ Response 202:
 ```
 
 Common error codes: `202 Accepted`, `409 no_program_loaded` (no
-prior `load`), `409 runner_inactive`, `503 busy`.
+prior `load`), `409 runner_inactive`, `409 accessory_not_loaded`,
+`503 busy`.
 
 #### `POST /api/v1/runner/unload` — release the basepage
 
@@ -802,7 +861,7 @@ Response 200:
 Common error codes: `200 OK`, `422 mfree_failed` (GEMDOS errno
 in `gemdos_errno` — rare, typically means the basepage was
 already freed), `409 no_program_loaded`, `409 runner_inactive`,
-`503 busy`, `504 gateway_timeout`.
+`409 accessory_not_loaded`, `503 busy`, `504 gateway_timeout`.
 
 #### Full lifecycle example
 
@@ -841,7 +900,8 @@ python3 cli/sidecart.py runner cd ARKANOID         # relative to current cwd
 ```
 
 Common error codes: `404 not_found`, `400 bad_path` (rejected name
-or "not a directory"), `409 runner_inactive`, `503 busy`.
+or "not a directory"), `409 runner_inactive`, `409
+accessory_not_loaded`, `503 busy`.
 
 ---
 
@@ -869,7 +929,7 @@ python3 cli/sidecart.py runner res med
 ```
 
 Common error codes: `400 bad_request` (unknown rez), `409
-runner_inactive`, `503 busy`.
+runner_inactive`, `409 unsupported_in_tsr`, `503 busy`.
 
 ---
 
@@ -879,6 +939,8 @@ Synchronous read of the ST's TOS memory cookies and the MMU
 bank-config register. The handler fires `RUNNER_CMD_MEMINFO` and
 spins on the chandler loop until the m68k replies, with a 1-second
 timeout (returned as `504 gateway_timeout` if the m68k is wedged).
+In TSR mode the Advanced Runner hook answers instead, with the same
+reply.
 
 Reported addresses:
 
@@ -888,7 +950,7 @@ Reported addresses:
 | `memtop`    | `$436`       | `_memtop` — top of TPA memory available to processes. |
 | `phystop`   | `$42E`       | `_phystop` — top of physical RAM. |
 | `screenmem` | `$44E`       | `_v_bas_ad` — logical screen base. |
-| `basepage`  | `$4F2`       | `_run` — current process basepage (TOS ≥ 1.04; 0 on older TOS). |
+| `basepage`  | `_run`       | Basepage of the running process. Found through the OS header that `_sysbase` (`$4F2`) points to: its `p_run` field on TOS 1.02 and later, `$602C` (`$873C` in the Spanish version) on TOS 1.00. |
 | `bank0_kb`, `bank1_kb` | `$FFFF8001` lower nibble | MMU bank sizes in KB. `0/0` when the nibble is unrecognised. |
 | `decoded`   | derived | `true` when at least one bank size is non-zero. |
 
@@ -1112,7 +1174,7 @@ One cartridge cycle per byte. The 8-bit read result is undefined
 and MUST be discarded.
 
 The capture is gated on the firmware-mode flag — it goes live
-the moment the user picks `[U]` / `[G]` in the setup
+the moment the user picks `[U]` or `[G]` in the setup
 menu and the device commits to firmware mode. Pre-commit reads
 in the debug window are dropped at the RP filter so menu-mode
 activity never pollutes the diagnostic stream.
@@ -1142,7 +1204,7 @@ bytes; safe to poll at any cadence.
 
 | Field | Meaning |
 | --- | --- |
-| `firmware_mode` | `true` once `[U]` / `[G]` has committed; until then, debug emits are dropped at the RP filter. |
+| `firmware_mode` | `true` once `[U]` or `[G]` has committed; until then, debug emits are dropped at the RP filter. |
 | `ring_used` | Bytes currently in the producer's ring (capped at `ring_capacity`). |
 | `ring_capacity` | Ring size (8192 today). |
 | `bytes_dropped` | Producer-side drops. Always 0 in the current design (the producer overwrites; per-consumer drops are reported separately). |
@@ -1242,6 +1304,175 @@ screen /dev/tty.usbmodem*  115200
 
 `runner status` should report `last_exit_code: 0` once the
 program exits.
+
+---
+
+## rom4 area
+
+1 KB of the cartridge window that the workstation writes over HTTP and
+any program on the ST reads. It is the other direction from *Debug
+traces*: data for a program that is already running, such as live
+parameters, scripted input for an unattended test, or a driver's state.
+DevOps gives the bytes no meaning.
+
+The area is at `$FA8B00`–`$FA8EFF`. Programs should not hard-code that:
+they find it through three shared variables, so the one fixed address
+is slot 20, `$FA2860`.
+
+| Slot | Address | Holds |
+| --- | --- | --- |
+| 20 | `$FA2860` | Magic `'R4A1'` (`$52344131`) |
+| 21 | `$FA2864` | ST address of the area |
+| 22 | `$FA2868` | Size in bytes (1024) |
+
+The RP publishes them when it boots, so the area is there in the setup
+menu and in `[G]` and `[U]`, before the ST has booted. A program
+that does not find the magic is running without a cartridge, or with
+firmware that has no rom4 area, and should carry on without it.
+
+**C**:
+
+```c
+#define ROM4_SLOT 0xFA2860UL                        /* shared variable 20 */
+
+const volatile unsigned long *slot = (const volatile unsigned long *)ROM4_SLOT;
+if (slot[0] == 0x52344131UL) {                     /* 'R4A1' */
+  const volatile unsigned char *area =
+      (const volatile unsigned char *)slot[1];
+  unsigned long size = slot[2];
+  /* read area[0] .. area[size - 1] */
+}
+```
+
+**m68k**:
+
+```asm
+ROM4_SLOT   equ $FA2860                 ; shared variable 20
+
+        cmp.l   #$52344131,ROM4_SLOT    ; 'R4A1'
+        bne.s   .no_rom4
+        move.l  ROM4_SLOT+4,a0          ; area
+        move.l  ROM4_SLOT+8,d0          ; size in bytes
+```
+
+Reads work in user mode. The ST cannot write the area: the cartridge
+port is read-only, and a write is a bus error.
+
+**Contents.** All zeros when the RP boots; after that only the
+endpoints below change them. They survive an ST reset and are lost when
+the RP resets. Each 16-bit word changes in one store, so the ST never
+reads half of a word, but a longer write can be seen part done. A
+program that needs several bytes to change together runs its own
+protocol on top, such as two buffers and a word saying which one is
+current, written last.
+
+Offsets in the API are relative to the area, `0`–`1023`, never ST
+addresses. None of these endpoints wait for the ST or the Runner.
+
+### `GET /api/v1/rom4` — where the area is
+
+**Response 200**:
+```json
+{ "ok": true, "address": 16419584, "size": 1024, "magic": 1379156273 }
+```
+
+**`curl`**:
+```sh
+curl http://sidecart.local/api/v1/rom4
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py rom4 info
+```
+
+### `GET /api/v1/rom4/data` — read the area
+
+The whole area: 1024 bytes of `application/octet-stream`, in the order
+the ST reads them.
+
+**`curl`**:
+```sh
+curl -o rom4.bin http://sidecart.local/api/v1/rom4/data
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py rom4 read              # hex dump
+python3 cli/sidecart.py rom4 read -o rom4.bin  # raw
+```
+
+Errors: `503 busy` in the unlikely case that the connection's send
+buffer cannot take the whole response.
+
+### `PUT /api/v1/rom4?offset=<n>` — write bytes
+
+The body (`Content-Type` ignored) is written at offset `n`, which can
+be decimal or `0x` hex. The body is at most 1024 bytes, and
+`offset + length` must not pass 1024.
+
+**`curl`**:
+```sh
+printf 'ROM4 OK!' | curl -X PUT --data-binary @- \
+     'http://sidecart.local/api/v1/rom4?offset=0x18'
+```
+
+**Response 200**:
+```json
+{ "ok": true, "writes": 1 }
+```
+
+**`sidecart`**:
+```sh
+python3 cli/sidecart.py rom4 write 0x18 52 4F 4D 34 20 4F 4B 21
+python3 cli/sidecart.py rom4 write 0 -f params.bin
+```
+
+### `PUT /api/v1/rom4` — write several ranges in one request
+
+With no `offset`, the body is a run of frames, each a 16-bit offset, a
+16-bit length and that many bytes, big-endian:
+
+```
+[offset hi][offset lo][length hi][length lo][bytes...] [next frame...]
+```
+
+The frames are written in the order they come, each from its lowest
+address up, so one request can fill a buffer and then flip the word
+that tells the ST to use it. The body is at most 1024 bytes, frame
+headers included.
+
+```sh
+# 4 bytes at 0x100, then the word at 0x000.
+printf '\x01\x00\x00\x04\xde\xad\xbe\xef\x00\x00\x00\x02\x00\x01' | \
+  curl -X PUT --data-binary @- http://sidecart.local/api/v1/rom4
+{"ok":true,"writes":2}
+```
+
+The whole body is checked before any of it is written: a frame that
+runs past the end of the body or of the area fails the request and
+changes nothing.
+
+Errors for both `PUT` forms: `400 bad_request` (unparseable `offset`,
+truncated frame), `400 out_of_range`, `411 length_required`,
+`413 payload_too_large`.
+
+### Verifying the path end-to-end
+
+`target/atarist/test/rom4/` builds `ROM4CHK.TOS`, which finds the area,
+shows its first 32 bytes on screen for three seconds, sends the same
+lines to the debug stream and exits with `0`, or with `1` when the
+magic is missing:
+
+```sh
+target/atarist/test/rom4/build.sh
+python3 cli/sidecart.py rom4 write 0 52 4F 4D 34 20 4F 4B 21
+python3 cli/sidecart.py gemdrive put target/atarist/test/rom4/dist/ROM4CHK.TOS
+python3 cli/sidecart.py debug tail              # in another shell
+python3 cli/sidecart.py runner run /ROM4CHK.TOS
+```
+
+It runs from the desktop too, in `[G]`.
 
 ---
 
