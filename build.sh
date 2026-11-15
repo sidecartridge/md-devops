@@ -24,8 +24,8 @@ cp version.txt rp/
 cp version.txt target/
 
 # Display the version information
-# Not exported: the stcmd installed by atarist-toolkit-docker's installer
-# (as in CI) uses $VERSION as its Docker image tag, and v1.1.0 is no image.
+# Not exported: the stcmd from atarist-toolkit-docker installers before
+# v1.2.1 used $VERSION as its Docker image tag, and v1.1.0 is no image.
 VERSION=$(cat version.txt)
 echo "Version: $VERSION"
 
